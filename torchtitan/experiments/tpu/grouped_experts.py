@@ -131,6 +131,11 @@ class TpuGroupedExperts(GroupedExperts):
             tuple[int, int, int] | None
         ) = None
         use_kernel_native_weight_layout: bool = False
+        # Tokamax GMM-v2 (Pallas) for forward, dInput and dWeight, each with the
+        # kernel's own VMEM-aware tiling: no tile knobs, no row padding, and no
+        # VMEM overflow at large expert matrices. Takes precedence over the
+        # MegaBlox switches above.
+        use_tokamax_gmm_v2: bool = False
 
     def __init__(self, config: Config):
         if config.activation not in ("silu", "gelu_tanh"):
@@ -138,7 +143,7 @@ class TpuGroupedExperts(GroupedExperts):
                 f"Unsupported expert activation: {config.activation!r}"
             )
         if config.use_kernel_native_weight_layout:
-            if not config.use_pallas_grouped_mm:
+            if not (config.use_pallas_grouped_mm or config.use_tokamax_gmm_v2):
                 raise ValueError(
                     "Kernel-native expert weights require Pallas grouped matmul"
                 )
@@ -170,6 +175,7 @@ class TpuGroupedExperts(GroupedExperts):
             config.pallas_grouped_mm_w2_transposed_tgmm_tiling
         )
         self.use_kernel_native_weight_layout = config.use_kernel_native_weight_layout
+        self.use_tokamax_gmm_v2 = config.use_tokamax_gmm_v2
         self._use_transposed_w2_rhs = False
         self._native_sharding_applied = False
 
@@ -296,6 +302,10 @@ class TpuGroupedExperts(GroupedExperts):
         ``row_scale_R``, if given, multiplies each row's hidden activation
         before the down projection (W2).
         """
+        if self.use_tokamax_gmm_v2:
+            if row_scale_R is not None:
+                raise ValueError("row_scale_R is not supported with Tokamax GMM-v2")
+            return self._gmm_v2_forward(x_RD, num_tokens_per_expert_E)
         # The Qwen TPU recipe uses Pallas because native torch._grouped_mm mode-2
         # dWeight is incorrect at M=4096. See
         # https://github.com/google-pytorch/torch_tpu/issues/2668.
@@ -391,6 +401,37 @@ class TpuGroupedExperts(GroupedExperts):
             tgmm_tiling=w2_tgmm_tiling,
             transpose_rhs=self._use_transposed_w2_rhs,
         )[:num_rows].type_as(x_RD)
+
+    def _gmm_v2_forward(
+        self,
+        x_RD: torch.Tensor,
+        num_tokens_per_expert_E: torch.Tensor,
+    ) -> torch.Tensor:
+        """Gated experts on Tokamax GMM-v2 grouped matmuls, forward and backward."""
+        from torchtitan.experiments.tpu.kernels.gmm_v2_grouped_mm import (
+            gmm_v2_grouped_mm,
+        )
+
+        def local_tensor(tensor: torch.Tensor) -> torch.Tensor:
+            return tensor.to_local() if isinstance(tensor, DTensor) else tensor
+
+        if self.use_kernel_native_weight_layout:
+            w1_EKN = local_tensor(self.w1_EDF)
+            w2_EKN = local_tensor(self.w2_EFD)
+            w3_EKN = local_tensor(self.w3_EDF)
+        else:
+            w1_EKN = local_tensor(self.w1_EFD).transpose(-2, -1)
+            w2_EKN = local_tensor(self.w2_EDF).transpose(-2, -1)
+            w3_EKN = local_tensor(self.w3_EFD).transpose(-2, -1)
+        # Expert compute is BF16, as in the other paths; rows past the routed
+        # total (a fixed-size dispatch buffer) are not visited by the kernel.
+        x_bf16 = x_RD.bfloat16()
+        gate_RF = gmm_v2_grouped_mm(x_bf16, w1_EKN.bfloat16(), num_tokens_per_expert_E)
+        up_RF = gmm_v2_grouped_mm(x_bf16, w3_EKN.bfloat16(), num_tokens_per_expert_E)
+        hidden_RF = self._activation_fn(gate_RF) * up_RF
+        return gmm_v2_grouped_mm(
+            hidden_RF, w2_EKN.bfloat16(), num_tokens_per_expert_E
+        ).type_as(x_RD)
 
 
 class TpuGroupedExpertsConverter(ModelConfigConverter):

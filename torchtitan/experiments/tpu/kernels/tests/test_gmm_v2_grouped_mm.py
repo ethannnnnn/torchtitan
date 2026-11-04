@@ -15,9 +15,11 @@ from unittest import mock
 
 from absl.testing import absltest
 import torch
+import torch.nn.functional as F
 
 from torchtitan.experiments.tpu import accelerator_device_type as device_type
 from torchtitan.experiments.tpu import base_device_test
+from torchtitan.experiments.tpu.grouped_experts import TpuGroupedExperts
 from torchtitan.experiments.tpu.kernels import gmm_v2_grouped_mm
 
 
@@ -110,6 +112,86 @@ class GmmV2GroupedMmTest(base_device_test.BaseAcceleratorDeviceTest):
             rtol=0,
             atol=0,
         )
+
+
+class TpuGroupedExpertsGmmV2Test(base_device_test.BaseAcceleratorDeviceTest):
+    """``TpuGroupedExperts(use_tokamax_gmm_v2=True)`` vs an FP32 SwiGLU reference."""
+
+    def setUp(self):
+        super().setUp()
+        _skip_unless_tpu(self)
+
+    def _experts(self, dim, hidden, num_experts, native):
+        cfg = TpuGroupedExperts.Config(
+            dim=dim,
+            hidden_dim=hidden,
+            num_experts=num_experts,
+            use_tokamax_gmm_v2=True,
+            use_kernel_native_weight_layout=native,
+        )
+        experts = TpuGroupedExperts(cfg)
+        gen = torch.Generator().manual_seed(0)
+        names = (
+            (("w1_EDF", dim), ("w2_EFD", hidden), ("w3_EDF", dim))
+            if native
+            else (("w1_EFD", dim), ("w2_EDF", hidden), ("w3_EFD", dim))
+        )
+        with torch.no_grad():
+            for name, k in names:
+                param = getattr(experts, name)
+                param.copy_(torch.randn(param.shape, generator=gen) / k**0.5)
+        experts = experts.to(device=self.accelerator_device, dtype=torch.bfloat16)
+        return experts, [n for n, _ in names]
+
+    def test_forward_backward_matches_reference(self):
+        device = self.accelerator_device
+        dim, hidden, sizes = 512, 1024, [300, 0, 700, 1024, 24]
+        for native in (True, False):
+            experts, names = self._experts(dim, hidden, len(sizes), native)
+            gen = torch.Generator().manual_seed(1)
+            rows = sum(sizes)
+            x_cpu = torch.randn(rows, dim, generator=gen).bfloat16()
+            dout_cpu = torch.randn(rows, dim, generator=gen).bfloat16()
+            x = x_cpu.to(device).requires_grad_()
+            group_sizes = torch.tensor(sizes, dtype=torch.int32, device=device)
+            out = torch.compile(experts, backend="tpu")(x, group_sizes)
+            params = [getattr(experts, n) for n in names]
+            grads = torch.autograd.grad(out, (x, *params), dout_cpu.to(device))
+
+            ref_in = [x_cpu.float().requires_grad_()] + [
+                p.detach().cpu().float().requires_grad_() for p in params
+            ]
+            xr, w1, w2, w3 = ref_in
+            if not native:  # canonical (E, out, in) storage
+                w1, w2, w3 = (w.transpose(-2, -1) for w in (w1, w2, w3))
+            outs, start = [], 0
+            for e, n in enumerate(sizes):
+                xe = xr[start : start + n]
+                outs.append((F.silu(xe @ w1[e]) * (xe @ w3[e])) @ w2[e])
+                start += n
+            ref = torch.cat(outs)
+            ref_grads = torch.autograd.grad(ref, ref_in, dout_cpu.float())
+
+            def rel(a, b):
+                return ((a.float() - b).norm() / b.norm()).item()
+
+            self.assertLess(rel(out.detach().cpu(), ref.detach()), 1e-2)
+            for name, g, rg in zip(("dx", "dw1", "dw2", "dw3"), grads, ref_grads):
+                self.assertLess(rel(g.cpu(), rg), 2e-2, (native, name))
+
+    def test_large_expert_shapes_compile(self):
+        # 4096 x 4096 experts: full-axis MegaBlox tiles exceed the 64 MiB VMEM of a
+        # TPU7x TensorCore; the GMM-v2 heuristic tiles must compile and run.
+        device = self.accelerator_device
+        experts, _ = self._experts(4096, 4096, 4, True)
+        rows = 16384
+        x = torch.randn(rows, 4096, device=device, dtype=torch.bfloat16)
+        x.requires_grad_()
+        group_sizes = torch.tensor([4096] * 4, dtype=torch.int32, device=device)
+        out = torch.compile(experts, backend="tpu")(x, group_sizes)
+        out.float().square().mean().backward()
+        self.assertTrue(bool(torch.isfinite(out.float()).all().cpu()))
+        self.assertTrue(bool(torch.isfinite(experts.w1_EDF.grad.float()).all().cpu()))
 
 
 class GmmV2AutogradBookkeepingTest(absltest.TestCase):
