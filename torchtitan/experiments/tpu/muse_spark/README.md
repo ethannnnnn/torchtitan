@@ -145,6 +145,14 @@ An FP64 run leaves the same ~2e-5 gap: the reference computes the attention
 softmax and router logits in FP32, so the FP32 gap is rounding, not a math
 difference.
 
+On a TPU host (one TensorCore is enough),
+`python -m torchtitan.experiments.tpu.muse_spark.tests.test_attention_kernels_tpu --device=tpu`
+compares the Splash attention entry points (stock Splash patch, Tokamax
+Splash patch with default and Spark settings, splash bias-dropout kernel)
+with the Transformers attention on Spark's attention shapes, forward and
+backward, packed documents included; `tools/bench_attention_tpu.py` times them.
+These need a TPU and were not run for this change.
+
 ## Open work
 
 * Expert parallelism (`expert_parallel.py`, see Parallelism) and TP for the
