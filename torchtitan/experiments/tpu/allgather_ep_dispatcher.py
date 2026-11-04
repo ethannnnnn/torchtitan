@@ -154,6 +154,11 @@ class AllGatherEPTokenDispatcher(BaseEPTokenDispatcher):
             # Local routes first, grouped by local expert (stable: token order).
             key = torch.where(is_local, local_e, num_local_experts)
             order = torch.argsort(key, stable=True)
+            if buffer_rows > order.shape[0]:
+                # More buffer rows than gathered routes (small batches, or a
+                # large capacity_factor / buffer_multiple): the extra rows are
+                # padding, masked below like any row past the local routes.
+                order = torch.cat([order, order.new_zeros(buffer_rows - order.shape[0])])
             routes_R = order[:buffer_rows]
             counts = torch.zeros(
                 num_local_experts + 1, dtype=torch.int32, device=key.device

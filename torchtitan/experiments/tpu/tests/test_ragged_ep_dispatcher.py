@@ -200,6 +200,9 @@ _CASES = {
     2: {
         "ragged": _case("ragged", "contiguous"),
         "allgather-measured": _case("allgather", "measured"),
+        # 1024 buffer rows for the 512 routes of the whole EP group.
+        "ragged-big-buffer": _case("ragged", "contiguous", buffer_multiple=1024),
+        "allgather-big-buffer": _case("allgather", "contiguous", buffer_multiple=1024),
     },
     4: {
         "ragged": _case("ragged", "contiguous"),
