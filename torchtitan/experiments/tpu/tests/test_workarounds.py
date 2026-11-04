@@ -354,7 +354,15 @@ class WorkaroundsTest(parameterized.TestCase):
     self.assertEqual(TokamaxConfig.block_q, 512, "precondition: class default")
     sa.sa_num_stacked_q_heads = 16
     sa.use_batch_loop_fwd = True
-    for name in ("num_stacked_q_heads", "use_batch_loop_fwd"):
+    # Falsy but set: the patch must tell them apart from None (unset).
+    sa.sa_use_base2_exp = False
+    sa.sa_max_logit_const = 0.0
+    for name in (
+        "num_stacked_q_heads",
+        "use_batch_loop_fwd",
+        "use_base2_exp",
+        "max_logit_const",
+    ):
       self.addCleanup(setattr, TokamaxConfig, name, getattr(TokamaxConfig, name))
 
     workarounds.use_tokamax_splash_attention_patch(model, sa)
@@ -371,6 +379,29 @@ class WorkaroundsTest(parameterized.TestCase):
     self.assertTrue(TokamaxConfig.use_vmap_bwd)
     self.assertEqual(TokamaxConfig.num_stacked_q_heads, 16)
     self.assertTrue(TokamaxConfig.use_batch_loop_fwd)
+    self.assertIs(TokamaxConfig.use_base2_exp, False)
+    self.assertEqual(TokamaxConfig.max_logit_const, 0.0)
+
+  def test_tokamax_patch_keeps_kernel_defaults_for_unset_knobs(self):
+    """sa_use_base2_exp and sa_max_logit_const default to None: kernel defaults.
+
+    Base-2 softmax and the online row max are what Tokamax does by default, so
+    a recipe that does not set the knobs must run exactly as before.
+    """
+    from torchtitan.experiments.tpu.kernels.tokamax_splash_attention import TokamaxConfig  # pylint: disable=g-import-not-at-top
+
+    saved = {k: v for k, v in vars(TokamaxConfig).items() if not k.startswith("_")}
+    self.addCleanup(lambda: [setattr(TokamaxConfig, k, v) for k, v in saved.items()])
+    TokamaxConfig.use_base2_exp = True
+    TokamaxConfig.max_logit_const = None
+
+    model, sa = self._tokamax_patch_fixture()
+    self.assertIsNone(sa.sa_use_base2_exp)
+    self.assertIsNone(sa.sa_max_logit_const)
+    workarounds.use_tokamax_splash_attention_patch(model, sa)
+
+    self.assertIs(TokamaxConfig.use_base2_exp, True)
+    self.assertIsNone(TokamaxConfig.max_logit_const)
 
   def test_tokamax_patch_raises_when_a_splash_config_resolves_nothing(self):
     """A real splash config whose fields resolve to nothing must fail loudly."""

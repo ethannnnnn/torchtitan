@@ -2,6 +2,7 @@
 
 from collections.abc import Callable
 import functools
+import inspect
 import logging
 
 from absl.testing import absltest
@@ -98,6 +99,23 @@ class HeadTailMaskTest(parameterized.TestCase):
   def test_non_causal_mask_is_full(self):
     mask = tokamax_splash_attention._make_mask((32, 32), False, None, 2)
     self.assertTrue(np.all(mask[:, :]))
+
+
+class KernelConfigArgsTest(parameterized.TestCase):
+  """TokamaxConfig reaches the kernel as positional op arguments."""
+
+  @parameterized.parameters("jax_attention_fwd", "jax_attention_bwd")
+  def test_config_fields_follow_the_op_signature(self, op_name):
+    # _kernel_config_args() appends the fields after `scale` by position, so a
+    # field out of order would silently land in its neighbor's parameter
+    # (several of them are bools).
+    params = list(
+        inspect.signature(getattr(tokamax_splash_attention, op_name)).parameters
+    )
+    self.assertEqual(
+        tuple(params[params.index("scale") + 1 :]),
+        tokamax_splash_attention._KERNEL_CONFIG_FIELDS,
+    )
 
 
 class SplashAttentionTokamaxTest(base_device_test.BaseAcceleratorDeviceTest):

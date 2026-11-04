@@ -136,6 +136,10 @@ class SplashAttentionKernelConfig:
   sa_q_layout: str = "HEAD_DIM_MINOR"
   sa_k_layout: str = "HEAD_DIM_MINOR"
   sa_v_layout: str = "HEAD_DIM_MINOR"
+  # Tokamax-only knobs (use_tokamax_splash_attention_kernel); None keeps the
+  # kernel default. See kernels/tokamax_splash_attention.TokamaxConfig.
+  sa_use_base2_exp: bool | None = None
+  sa_max_logit_const: float | None = None
 
 
 @dataclasses.dataclass

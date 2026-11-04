@@ -264,6 +264,8 @@ def use_tokamax_splash_attention_patch(model: nn.Module, sa_config: Any) -> None
       q_layout=_sa("q_layout"),
       k_layout=_sa("k_layout"),
       v_layout=_sa("v_layout"),
+      use_base2_exp=_sa("use_base2_exp"),
+      max_logit_const=_sa("max_logit_const"),
   )
   # Guard the bug above, without rejecting a caller that deliberately passes an empty
   # config to mean "just use the kernel's defaults" (some parity tests do exactly

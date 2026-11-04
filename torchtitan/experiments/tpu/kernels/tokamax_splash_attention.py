@@ -91,6 +91,18 @@ class TokamaxConfig:
   v_layout: str = "HEAD_DIM_MINOR"
   num_stacked_q_heads: int = 1
   use_batch_loop_fwd: bool = False
+  # Softmax in base 2 (tokamax default) folds LOG2E into q in q's dtype, i.e. a
+  # second bf16 rounding of q. With large logits (e.g. QK-normed attention with
+  # a q gain, |logit| up to ~44) that rounding dominates the kernel error:
+  # natural exp (False) cuts the bf16 output error ~2.6x, to the stock splash
+  # kernel's level, for 0-6% more attention time on TPU7x (head_dim 64).
+  use_base2_exp: bool = True
+  # Constant used in place of the running row max (tokamax `max_logit_const`,
+  # in units of the softmax logits scale * q.k): skips the per-block max and
+  # rescale. Only safe when the logits are bounded so that exp(logit - const)
+  # neither overflows nor fully underflows in fp32, e.g. QK-normed attention
+  # with |logit| <= 44 and const 0. None keeps the online max.
+  max_logit_const: Optional[float] = None
 
   @classmethod
   def update(cls, **kwargs):
@@ -121,6 +133,8 @@ def _make_splash_attention_fn(
     kv_seq_len: int | None = None,
     num_stacked_q_heads: int = 1,
     use_batch_loop_fwd: bool = False,
+    use_base2_exp: bool = True,
+    max_logit_const: float | None = None,
 ):
   """Create JAX splash attention forward and backward functions using Tokamax.
 
@@ -166,6 +180,8 @@ def _make_splash_attention_fn(
       k_layout=_get_layout(k_layout),
       v_layout=_get_layout(v_layout),
       num_stacked_q_heads=num_stacked_q_heads,
+      use_base2_exp=use_base2_exp,
+      max_logit_const=max_logit_const,
   )
   if cp_size > 1 and (
       getattr(config, "qk_diag_skip", False)
@@ -352,6 +368,8 @@ def jax_attention_fwd(
     v_layout: str,
     num_stacked_q_heads: int,
     use_batch_loop_fwd: bool,
+    use_base2_exp: bool,
+    max_logit_const: float | None,
 ) -> tuple[jax.Array, jax.Array]:
   """Forward attention in JAX using Pallas.
 
@@ -399,6 +417,8 @@ def jax_attention_fwd(
       v_layout=v_layout,
       num_stacked_q_heads=num_stacked_q_heads,
       use_batch_loop_fwd=use_batch_loop_fwd,
+      use_base2_exp=use_base2_exp,
+      max_logit_const=max_logit_const,
   )
 
   # Apply scaling inside the compiled JAX pipeline
@@ -440,6 +460,8 @@ def jax_attention_bwd(
     v_layout: str,
     num_stacked_q_heads: int,
     use_batch_loop_fwd: bool,
+    use_base2_exp: bool,
+    max_logit_const: float | None,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
   """Backward attention in JAX calling direct Pallas kernel backward."""
   seq_len = q.shape[1]
@@ -483,6 +505,8 @@ def jax_attention_bwd(
       v_layout=v_layout,
       num_stacked_q_heads=num_stacked_q_heads,
       use_batch_loop_fwd=use_batch_loop_fwd,
+      use_base2_exp=use_base2_exp,
+      max_logit_const=max_logit_const,
   )
 
   default_scale = 1.0 / math.sqrt(q.shape[-1])
@@ -538,6 +562,8 @@ _KERNEL_CONFIG_FIELDS = (
     "v_layout",
     "num_stacked_q_heads",
     "use_batch_loop_fwd",
+    "use_base2_exp",
+    "max_logit_const",
 )
 
 
