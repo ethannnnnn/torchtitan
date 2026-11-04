@@ -6,6 +6,9 @@
 
 """Checkpointing utilities for large post-training runs on TPU slices.
 
+* ``lora_checkpoint``: adapter-only checkpoints for LoRA training (resume
+  state is the adapters plus their optimizer state; the frozen base is
+  re-read from the Hugging Face checkpoint) and PEFT adapter export/import.
 * ``dcp_parallel``: multi-threaded DCP writer and parallel DCP readers for a
   TorchTitan ``CheckpointManager``.
 * ``dcp_io_bench``: DCP save/load throughput benchmark against a POSIX path
