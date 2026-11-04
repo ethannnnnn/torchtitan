@@ -16,7 +16,9 @@
    the displacement of each low-precision variant regressed on fp32 AdamW's
    (same initial bf16 weights) has slope ~1 and no bias.
 4. TorchTitan integration: the container config builds, steps a module, and
-   updates DTensor parameters through their local shards.
+   updates DTensor parameters through their local shards; on two gloo ranks,
+   the state of sharded parameters goes through a distributed checkpoint
+   (``low_precision_adamw_dcp_check``).
 5. Fused TPU kernels (needs ``jax``; runs on JAX's CPU backend): in
    deterministic modes the kernels equal the eager PyTorch update bit for bit,
    except the fp32 float8 block scales, which may differ in the last bit; in
@@ -32,6 +34,7 @@ import os
 import unittest
 
 import torch
+import torch.distributed
 
 from torchtitan.experiments.tpu.low_precision_adamw import (
     LowPrecisionAdamW,
@@ -322,6 +325,22 @@ class TorchTitanIntegrationTest(unittest.TestCase):
     finally:
       if created:
         dist.destroy_process_group()
+
+  @unittest.skipUnless(torch.distributed.is_available() and torch.distributed.is_gloo_available(), "needs gloo")
+  def test_distributed_checkpoint_two_ranks(self):
+    import tempfile
+
+    import torch.multiprocessing as mp
+
+    with tempfile.TemporaryDirectory() as directory:
+      mp.spawn(_dcp_check_rank, args=(os.path.join(directory, "rendezvous"),), nprocs=2, join=True)
+
+
+def _dcp_check_rank(rank: int, store: str) -> None:
+  """One rank of ``low_precision_adamw_dcp_check`` (exits non-zero if a check fails)."""
+  from torchtitan.experiments.tpu.tests import low_precision_adamw_dcp_check
+
+  low_precision_adamw_dcp_check.main(f"file://{store}", rank, 2)
 
 
 def _has_jax() -> bool:

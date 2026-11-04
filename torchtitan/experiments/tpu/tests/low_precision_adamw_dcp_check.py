@@ -17,6 +17,7 @@ step counter at 0; restored state equals the saved state; the next step gives
 bit-identical parameters.
 
 Run: torchrun --nproc_per_node=2 -m torchtitan.experiments.tpu.tests.low_precision_adamw_dcp_check
+(``test_low_precision_adamw.py`` also runs it, on two spawned processes).
 """
 
 from __future__ import annotations
@@ -63,8 +64,9 @@ def all_ranks(flag: bool) -> bool:
   return bool(t.item())
 
 
-def main():
-  dist.init_process_group("gloo")
+def main(init_method: str = "env://", rank: int = -1, world_size: int = -1):
+  """Runs the check; the defaults take the process group from torchrun's environment."""
+  dist.init_process_group("gloo", init_method=init_method, rank=rank, world_size=world_size)
   rank = dist.get_rank()
   mesh = init_device_mesh("cpu", (dist.get_world_size(),))
   ok = True
