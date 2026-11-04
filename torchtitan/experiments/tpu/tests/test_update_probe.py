@@ -23,12 +23,14 @@ from __future__ import annotations
 
 import contextlib
 import io
+import re
 import unittest
 
 import torch
 
 from torchtitan.experiments.tpu.low_precision_adamw import LowPrecisionAdamW, low_precision_adamw_config
 from torchtitan.experiments.tpu.update_probe import (
+    DEFAULT_PATTERN,
     UpdateProbe,
     install_update_probe,
     probe_category,
@@ -103,6 +105,11 @@ class UpdateProbeTest(unittest.TestCase):
                  ("layers.5.attention.wo.weight", v)], [_adamw([w, v])])
     self.assertEqual([e.name for e in probe.probed], ["layers.0.moe.routed_experts.inner_experts.w1_EFD"])
     self.assertEqual(probe.probed[0].index[0].numel(), 4)
+    names = ["tok_embeddings.weight", "layers.0.attention.wq.weight", "layers.10.attention.wq.weight",
+             "layers.31.attention_norm.weight", "norm.weight", "output.weight", "lm_head.weight"]
+    self.assertEqual([n for n in names if re.search(DEFAULT_PATTERN, n)],
+                     ["tok_embeddings.weight", "layers.0.attention.wq.weight", "norm.weight", "output.weight",
+                      "lm_head.weight"])
     self.assertEqual(probe_category("layers.3.moe.routed_experts.inner_experts.w2_EDF"), "experts")
     self.assertEqual(probe_category("layers.3.moe.router.gate.weight"), "router")
     self.assertEqual(probe_category("layers.3.attention.qkv_linear.wq.weight"), "attention")

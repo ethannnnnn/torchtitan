@@ -46,8 +46,9 @@ import torch
 
 __all__ = ["UpdateProbe", "install_update_probe", "probe_category", "uninstall_update_probe"]
 
-DEFAULT_PATTERN = r"(^|\.)layers\.(0|31|61)\.|tok_embeddings|lm_head|(^|\.)norm\."
-"""Probed parameter names by default: three decoder layers, embeddings, head, final norm."""
+DEFAULT_PATTERN = r"(^|\.)layers\.0\.|tok_embeddings|(^|\.)(lm_head|output)\.|(^|\.)norm\."
+"""Probed parameter names by default: the first decoder layer, the embeddings, the
+output head and the final norm. Pass a pattern to probe other layers too."""
 
 
 def _local(t: torch.Tensor) -> torch.Tensor:
