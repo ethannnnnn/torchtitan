@@ -12,10 +12,31 @@ import json
 import os
 import random
 import tempfile
+import types
 import unittest
+from unittest import mock
+
+import torch
+from torch import nn
 
 from torchtitan.experiments.tpu.muse_spark import expert_parallel as ep
 from torchtitan.experiments.tpu.muse_spark import expert_placement as pl
+
+
+class _RouterCounts(nn.Module):
+  """Stands in for an MoE layer: only its routed-token counter."""
+
+  def __init__(self, counts):
+    super().__init__()
+    self.register_buffer("tokens_per_expert_E", torch.tensor(counts))
+
+
+def _two_moe_layers():
+  # Layer 0 has two hot experts (0 and 1), layer 1 routes evenly.
+  return nn.Sequential(
+      _RouterCounts([9.0, 8.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]),
+      _RouterCounts([2.0] * 8),
+  )
 
 
 class BalancedPlacementTest(unittest.TestCase):
@@ -62,6 +83,55 @@ class BalancedPlacementTest(unittest.TestCase):
     os.environ.pop("SPARK_EXPERT_PLACEMENT_OUT", None)
     sentinel = object()
     self.assertIs(pl.install_placement_writer(sentinel), sentinel)
+
+  def test_measure_and_write_balances_router_counts_once(self):
+    with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {"RANK": "0"}):
+      path = os.path.join(tmp, "new_dir", "placement.json")
+      pl._measure_and_write(_two_moe_layers(), 2, path, 2)
+      maps = ep.load_expert_placement("file:" + path, 2)
+      self.assertEqual(sorted(maps), ["0", "1"])
+      # The two hot experts of layer 0 end up on different EP ranks.
+      self.assertEqual(len({0, 1} & set(maps["0"][:4])), 1)
+      with open(path) as f:
+        written = f.read()
+      # An existing placement is kept: later measurements do not replace it.
+      pl._measure_and_write(nn.Sequential(_RouterCounts([1.0] * 7 + [50.0])), 4, path, 2)
+      with open(path) as f:
+        self.assertEqual(f.read(), written)
+
+  def test_writer_hooks_parallelize_and_metrics_logging(self):
+    from torchtitan.components.metrics import MetricsProcessor
+
+    original_log = MetricsProcessor.log
+    logged = []
+
+    def fake_log(self, step, *args, **kwargs):
+      del self, args, kwargs
+      logged.append(step)
+
+    MetricsProcessor.log = fake_log
+    try:
+      with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "placement.json")
+        env = {
+            "SPARK_EXPERT_PLACEMENT_OUT": path,
+            "SPARK_EXPERT_STATS_STEP": "3",
+            "SPARK_EXPERT_STATS_EP": "2",
+            "RANK": "0",
+        }
+        with mock.patch.dict(os.environ, env):
+          cfg = types.SimpleNamespace(
+              model_spec=types.SimpleNamespace(parallelize_fn=lambda model, **kw: None)
+          )
+          self.assertIs(pl.install_placement_writer(cfg), cfg)
+          cfg.model_spec.parallelize_fn(_two_moe_layers(), parallel_dims=None)
+          MetricsProcessor.log(None, 2)
+          self.assertFalse(os.path.exists(path))
+          MetricsProcessor.log(None, 3)
+          self.assertEqual(logged, [2, 3])
+          self.assertEqual(sorted(ep.load_expert_placement("file:" + path, 2)), ["0", "1"])
+    finally:
+      MetricsProcessor.log = original_log
 
 
 if __name__ == "__main__":
