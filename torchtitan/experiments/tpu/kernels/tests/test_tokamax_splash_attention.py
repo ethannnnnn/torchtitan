@@ -26,6 +26,19 @@ def _packed_segment_ids(document_lengths_per_row) -> torch.Tensor:
   ])
 
 
+def _rel_l2(got: torch.Tensor, want: torch.Tensor) -> float:
+  """Relative L2 (Frobenius) error of `got` against `want`."""
+  return (
+      torch.linalg.vector_norm(got - want) / torch.linalg.vector_norm(want)
+  ).item()
+
+
+# Relative L2 error bounds against an FP32 reference for bf16 QK-normed
+# attention. The Tokamax kernel measures about 2e-3 to 8e-3 on these inputs,
+# whichever exponent base and max it uses.
+_QK_NORMED_TOL = dict(out=1e-2, dq=1.5e-2, dk=1.5e-2, dv=1e-2)
+
+
 # Packed rows of 2048 tokens whose document boundaries fall inside head-tail
 # chunks and 128-token blocks.
 _DOCUMENTS = ((300, 517, 77, 1154), (1000, 48, 1000))
@@ -686,6 +699,137 @@ class SplashAttentionTokamaxTest(base_device_test.BaseAcceleratorDeviceTest):
         )
     torch.testing.assert_close(k_test.grad.cpu(), dk_ref, rtol=5e-2, atol=5e-2)
     torch.testing.assert_close(v_test.grad.cpu(), dv_ref, rtol=5e-2, atol=5e-2)
+
+  def _qk_normed_inputs(
+      self, b=2, seq_len=1024, n_heads=8, n_kv_heads=2, head_dim=64, q_gain=5.5
+  ):
+    """bf16 (B, S, H, D) q, k, v and output gradient of QK-normed attention.
+
+    q and k rows are RMS-normalized and q is multiplied by q_gain, so every
+    softmax logit is bounded: |q.k| / sqrt(head_dim) <= q_gain * sqrt(head_dim),
+    44 here. Logits this large are where the kernel's own rounding shows.
+    """
+
+    def rms_normalized(*shape):
+      x = torch.randn(*shape)
+      return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True))
+
+    q = (rms_normalized(b, seq_len, n_heads, head_dim) * q_gain).bfloat16()
+    k = rms_normalized(b, seq_len, n_kv_heads, head_dim).bfloat16()
+    v = torch.randn(b, seq_len, n_kv_heads, head_dim).bfloat16()
+    grad_out = torch.randn(b, seq_len, n_heads, head_dim).bfloat16()
+    return q, k, v, grad_out
+
+  def _causal_reference(self, q, k, v, grad_out):
+    """out, dq, dk, dv of FP32 causal SDPA on the bf16 inputs, (B, S, H, D)."""
+    n_rep = q.shape[2] // k.shape[2]
+    q_ref, k_ref, v_ref = (
+        x.float().transpose(1, 2).requires_grad_(True) for x in (q, k, v)
+    )
+    with attention.sdpa_kernel([attention.SDPBackend.MATH]):
+      out = F.scaled_dot_product_attention(
+          q_ref,
+          k_ref.repeat_interleave(n_rep, dim=1),
+          v_ref.repeat_interleave(n_rep, dim=1),
+          is_causal=True,
+      )
+    out.backward(grad_out.float().transpose(1, 2))
+    return {
+        name: t.detach().transpose(1, 2)
+        for name, t in (
+            ("out", out),
+            ("dq", q_ref.grad),
+            ("dk", k_ref.grad),
+            ("dv", v_ref.grad),
+        )
+    }
+
+  def _tokamax_causal(self, q, k, v, grad_out, **config):
+    """out, dq, dk, dv (FP32, on CPU) of the Tokamax kernel under `config`."""
+    self._set_tokamax_config(**config)
+    device = self.accelerator_device
+    q_t, k_t, v_t = (
+        x.to(device, copy=True).requires_grad_(True) for x in (q, k, v)
+    )
+    out = tokamax_splash_attention.splash_sdpa(
+        q_t, k_t, v_t, is_causal=True, enable_gqa=q.shape[2] != k.shape[2]
+    )
+    out.backward(grad_out.to(device))
+    return {
+        name: t.detach().float().cpu()
+        for name, t in (
+            ("out", out),
+            ("dq", q_t.grad),
+            ("dk", k_t.grad),
+            ("dv", v_t.grad),
+        )
+    }
+
+  def test_natural_exp_lowers_bf16_error(self):
+    """use_base2_exp=False drops the kernel's second bf16 rounding of q.
+
+    Base-2 softmax multiplies q by LOG2E in q's dtype inside the kernel. With
+    the large logits of QK-normed attention that rounding dominates the error
+    against an FP32 reference. Natural exp leaves q as it is (the
+    1/sqrt(head_dim) pre-scale is a power of two at head_dim 64), which lowers
+    the error of the output and of every gradient.
+    """
+    torch.manual_seed(5)
+    q, k, v, grad_out = self._qk_normed_inputs()
+    want = self._causal_reference(q, k, v, grad_out)
+    base2 = self._tokamax_causal(
+        q, k, v, grad_out, use_base2_exp=True, max_logit_const=None
+    )
+    natural = self._tokamax_causal(
+        q, k, v, grad_out, use_base2_exp=False, max_logit_const=None
+    )
+
+    errors = {}
+    for name, tol in _QK_NORMED_TOL.items():
+      errors[name] = (
+          _rel_l2(base2[name], want[name]),
+          _rel_l2(natural[name], want[name]),
+      )
+      logging.info(
+          "%s rel-L2 error: base 2 %.3e, natural exp %.3e", name, *errors[name]
+      )
+      self.assertLess(errors[name][0], tol, name)
+      self.assertLess(errors[name][1], tol, name)
+      self.assertLess(errors[name][1], errors[name][0], name)
+    self.assertLess(errors["out"][1], 0.6 * errors["out"][0])
+
+  @parameterized.parameters(True, False)
+  def test_max_logit_const_with_bounded_logits(self, use_base2_exp):
+    """A constant max logit can replace the online row max for bounded logits.
+
+    With |logit| <= 44, exp(logit - 0) stays far inside the FP32 range, so
+    max_logit_const=0.0 neither overflows nor underflows a whole row: output
+    and gradients stay in the error class of the online max.
+    """
+    torch.manual_seed(5)
+    q, k, v, grad_out = self._qk_normed_inputs()
+    want = self._causal_reference(q, k, v, grad_out)
+    online = self._tokamax_causal(
+        q, k, v, grad_out, use_base2_exp=use_base2_exp, max_logit_const=None
+    )
+    static = self._tokamax_causal(
+        q, k, v, grad_out, use_base2_exp=use_base2_exp, max_logit_const=0.0
+    )
+
+    # The constant reached the kernel: the softmax is accumulated differently.
+    self.assertFalse(torch.equal(static["out"], online["out"]))
+    for name, tol in _QK_NORMED_TOL.items():
+      self.assertTrue(torch.isfinite(static[name]).all(), name)
+      err_online = _rel_l2(online[name], want[name])
+      err_static = _rel_l2(static[name], want[name])
+      logging.info(
+          "%s rel-L2 error: online max %.3e, max_logit_const=0 %.3e",
+          name,
+          err_online,
+          err_static,
+      )
+      self.assertLess(err_static, tol, name)
+      self.assertLess(err_static, 2 * err_online, name)
 
 
 if __name__ == "__main__":
