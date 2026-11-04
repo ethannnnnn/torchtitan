@@ -194,6 +194,53 @@ def causal_conv_silu(
   return _CausalConvSilu.apply(x_BSC, weight_C1W, segment_ids_BS)
 
 
+def _inter_chunk_recurrence(
+    wq: torch.Tensor,
+    u: torch.Tensor,
+    qk: torch.Tensor,
+    k_decayed_t: torch.Tensor,
+    chunk_decay: torch.Tensor,
+) -> torch.Tensor:
+  """State recurrence across the chunks of ``chunked_gated_delta``.
+
+  Each step takes its chunk from one ``unbind`` per tensor, done before the
+  loop. Indexing ``t[:, :, i]`` in the loop reads the same views, but autograd
+  turns every index into a ``select_backward`` that writes a zero buffer the
+  size of all of ``t`` for one chunk and sums ``num_chunks`` such buffers, so
+  the backward would write O(seq_len^2 / chunk_size) bytes. The backward of
+  ``unbind`` is one ``stack`` of the same per-chunk gradients, without the
+  additions of zeros.
+
+  Args:
+    wq: ``(bs, n_heads, num_chunks, 2 * chunk, key_head_dim)``: the UT
+      transform's ``W`` in rows ``[:chunk]`` and the state-decayed queries in
+      rows ``[chunk:]``.
+    u: ``(bs, n_heads, num_chunks, chunk, value_head_dim)``: the UT
+      transform's ``U``.
+    qk: ``(bs, n_heads, num_chunks, chunk, chunk)`` decayed causal ``Q K^T``.
+    k_decayed_t: ``(bs, n_heads, num_chunks, key_head_dim, chunk)`` keys
+      decayed to the end of their chunk, transposed.
+    chunk_decay: ``(bs, n_heads, num_chunks, 1, 1)`` decay of the incoming
+      state over each chunk.
+
+  Returns:
+    ``(bs, n_heads, num_chunks, chunk, value_head_dim)`` output of each chunk.
+  """
+  bs, n_heads, num_chunks, chunk, d_v = u.shape
+  state = torch.zeros(
+      bs, n_heads, wq.shape[-1], d_v, dtype=wq.dtype, device=wq.device
+  )
+  wq_c, u_c, qk_c = wq.unbind(2), u.unbind(2), qk.unbind(2)
+  k_decayed_t_c, chunk_decay_c = k_decayed_t.unbind(2), chunk_decay.unbind(2)
+  outs = []
+  for i in range(num_chunks):
+    wq_state = wq_c[i] @ state
+    v_new = u_c[i] - wq_state[..., :chunk, :]
+    outs.append(wq_state[..., chunk:, :] + qk_c[i] @ v_new)
+    state = state * chunk_decay_c[i] + k_decayed_t_c[i] @ v_new
+  return torch.stack(outs, dim=2)
+
+
 def chunked_gated_delta(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -301,15 +348,8 @@ def chunked_gated_delta(
   k_decayed_t = (k * update_decay.unsqueeze(-1)).transpose(-1, -2)
   chunk_decay = chunk_decay.unsqueeze(-1)
 
-  state = torch.zeros(bs, n_heads, d_k, d_v, dtype=q.dtype, device=q.device)
-  outs = []
-  for i in range(num_chunks):
-    wq_state = wq[:, :, i] @ state
-    v_new = u[:, :, i] - wq_state[..., :chunk, :]
-    outs.append(wq_state[..., chunk:, :] + qk[:, :, i] @ v_new)
-    state = state * chunk_decay[:, :, i] + k_decayed_t[:, :, i] @ v_new
-
-  out = torch.stack(outs, dim=2).reshape(bs, n_heads, -1, d_v)[:, :, :seq_len]
+  out = _inter_chunk_recurrence(wq, u, qk, k_decayed_t, chunk_decay)
+  out = out.reshape(bs, n_heads, -1, d_v)[:, :, :seq_len]
   return out.transpose(1, 2).contiguous().to(out_dtype)
 
 
