@@ -18,8 +18,9 @@
 4. TorchTitan integration: the container config builds, steps a module, and
    updates DTensor parameters through their local shards.
 5. Fused TPU kernels (needs ``jax``; runs on JAX's CPU backend): in
-   deterministic modes the kernels equal the eager PyTorch update bit for bit;
-   in stochastic modes they are unbiased.
+   deterministic modes the kernels equal the eager PyTorch update bit for bit,
+   except the fp32 float8 block scales, which may differ in the last bit; in
+   stochastic modes they are unbiased.
 
 Run: python -m pytest -q torchtitan/experiments/tpu/tests/test_low_precision_adamw.py
 """
@@ -255,8 +256,8 @@ class RetainedUpdateTest(unittest.TestCase):
       m = v = torch.zeros(1 << 14, dtype=torch.float64)
       worst = 0.0
       for t in range(1, 60):
-        scale = torch.exp(torch.randn(1, generator=g, dtype=torch.float64) * 3)
-        grad = torch.randn(1 << 14, generator=g, dtype=torch.float64) * scale
+        noise = torch.randn(1 << 14, generator=g, dtype=torch.float64)
+        grad = noise * torch.exp(torch.randn(1, generator=g, dtype=torch.float64) * 3)
         m = b1 * m + (1 - b1) * grad
         v = b2 * v + (1 - b2) * grad * grad
         r = (m / (1 - b1**t)).abs() / (v / (1 - b2**t)).sqrt()
@@ -338,11 +339,22 @@ class FusedKernelTest(unittest.TestCase):
   @classmethod
   def setUpClass(cls):
     os.environ.setdefault("JAX_PLATFORMS", "cpu")
+    import jax
     import jax.numpy as jnp
     import numpy as np
 
     from torchtitan.experiments.tpu.kernels import low_precision_adamw_kernels as kernels
 
+    # The exact comparisons are for XLA's CPU arithmetic (TPU division and square
+    # roots may round differently), so run on JAX's CPU backend even when another
+    # backend is the default.
+    try:
+      cpu = jax.devices("cpu")[0]
+    except RuntimeError as e:  # JAX_PLATFORMS without "cpu"
+      raise unittest.SkipTest(f"needs JAX's CPU backend: {e}") from e
+    device = jax.default_device(cpu)
+    device.__enter__()
+    cls.addClassCleanup(device.__exit__, None, None, None)
     cls.jnp, cls.np, cls.K = jnp, np, kernels
     torch.manual_seed(70)
     cls.n = 1 << 14
@@ -409,6 +421,10 @@ class FusedKernelTest(unittest.TestCase):
     self.assertTrue(torch.equal(self._t(out[0]), ref))
     self.assertTrue(torch.equal(self._t(out[1]).float(), ref_st["exp_avg_f8"].view(-1, 256).float()))
     self.assertTrue(torch.equal(self._t(out[3]).float(), ref_st["exp_avg_sq_sqrt_f8"].view(-1, 256).float()))
+    # The fp32 block scales (absmax / 448) may differ in the last bit (see
+    # test_fused_update_path_matches_eager); everything else is bit-exact.
+    for i, key in ((2, "exp_avg_scale"), (4, "exp_avg_sq_sqrt_scale")):
+      torch.testing.assert_close(self._t(out[i]).view(-1), ref_st[key].view(-1), rtol=2.0**-23, atol=0.0, msg=key)
 
   def _cpu_kernels(self):
     """The registered ops' interface on top of the raw JAX functions (JAX's CPU
