@@ -67,6 +67,26 @@ spec = model_registry("tiny-hf")                   # trl-internal-testing/tiny-M
   dtype, as the reference model does; `residual_dtype="float32"` with
   `branch_dtype="bfloat16"` keeps an FP32 stream.
 
+Trainer configs (`--module torchtitan.experiments.tpu.muse_spark --config ...`):
+`muse_spark_debugmodel` (4 layers, 8 experts, random init, `c4_test`),
+`muse_spark_tiny_hf` (loads the tiny checkpoint through the HF path) and
+`muse_spark_816b_2l` (the first two released layers at real dimensions, BF16,
+SimpleFSDP, full AC, Pallas grouped experts and the TPU7x settings below).
+
+### TPU7x settings
+
+`tpu7x.py` keeps the settings measured on TPU7x with Spark's real dimensions
+in one place, and `tpu7x.apply(cfg)` puts them on a config: the Tokamax Splash
+attention kernel with Spark's blocks and knobs (natural-exponent softmax,
+`max_logit_const=0`, 4 stacked query heads, `SEQ_MINOR` layouts), Tokamax
+GMM-v2 for the routed experts (`gmm_v2=False`: MegaBlox with K and N tiled)
+and the libtpu flags (full 64 MiB scoped VMEM, `TPU7X_THROUGHPUT_P_STATE`).
+The module docstring has the measurements. The natural-exponent /
+`max_logit_const` knobs and GMM-v2 need `SplashAttentionKernelConfig` and
+`TpuGroupedExperts.Config` fields that are separate changes; without them
+`apply` keeps the kernel defaults for those two knobs or the tiled MegaBlox
+experts, and logs a warning.
+
 ### Checkpoint
 
 Point `hf_assets_path` at a folder with `config.json`,
@@ -107,6 +127,8 @@ MUSE_SPARK_CKPT_META_DIR=<dir with config.json, index, *.safetensors.header.json
 python -m pytest -q torchtitan/experiments/tpu/muse_spark/tests --ignore-glob='*_tpu.py'
 # Real dimensions (~125 GB host RAM): MUSE_SPARK_REAL_DIMS=1
 # SimpleFSDP: torchrun --nproc_per_node=2 -m torchtitan.experiments.tpu.muse_spark.tests.fsdp_cpu_check
+# Trainer: torchrun --nproc_per_node=2 -m torchtitan.experiments.tpu.train \
+#   --module torchtitan.experiments.tpu.muse_spark --config muse_spark_debugmodel --training.steps 5
 ```
 
 | check | result |
@@ -117,6 +139,7 @@ python -m pytest -q torchtitan/experiments/tpu/muse_spark/tests --ignore-glob='*
 | released checkpoint metadata (opt-in, `MUSE_SPARK_CKPT_META_DIR`) | all 1,119 text tensor names match the index and every shape matches the shard headers (measured with the original port; not re-run for this change); the text parameter count, 819,990,552,064 elements with the routing biases, is checked on every run |
 | TPU MoE converters (Pallas off) | logits within 1e-5 and gradients within 1e-4 (relative) of the plain BF16-expert model |
 | SimpleFSDP, 2 ranks | gradients identical to a single-process reference (worst relative diff 0 over 70 parameters); negative control 0.89 |
+| trainer (CPU, TPU trainer entry with the import stubs) | `muse_spark_debugmodel` 5 steps: loss 12.64 -> 8.77 on 1 rank, 12.65 -> 8.70 on 2 ranks (SimpleFSDP); `muse_spark_tiny_hf` loads the tiny checkpoint through the HF path (step-1 loss 12.216) |
 
 An FP64 run leaves the same ~2e-5 gap: the reference computes the attention
 softmax and router logits in FP32, so the FP32 gap is rounding, not a math
