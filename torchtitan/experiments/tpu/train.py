@@ -26,6 +26,7 @@ from torchtitan.experiments.tpu.graph_trainer.tpu_graph_trainer import (
 )
 import torchtitan.experiments.tpu.llama3  # trigger model registration
 import torchtitan.experiments.tpu.muse_glimmer  # trigger model registration
+import torchtitan.experiments.tpu.muse_spark  # trigger model registration
 import torchtitan.experiments.tpu.qwen3   # trigger model registration
 import torchtitan.experiments.tpu.qwen3_5  # trigger model registration
 import torchtitan.experiments.tpu.tpu_job_config as tpu_job_config_module
@@ -287,6 +288,7 @@ def start_trainer(
       if model_spec.name in (
           "llama3",
           "muse_glimmer",
+          "muse_spark",
           "qwen3",
           "qwen3_5",
           "gemma4",
