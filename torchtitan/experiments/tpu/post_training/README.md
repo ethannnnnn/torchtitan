@@ -9,7 +9,7 @@ and the CPU checks use the TPU Qwen3.5 debug model (`../qwen3_5/`).
 |---|---|---|
 | Chat rendering | `chat_template.py` | The checkpoint's own chat template, pinned `current_date`, optional `reasoning_effort`, assistant-only token masks, final-message extraction from sampled replies |
 | SFT data | `sft_data.py` | `ChatSFTDataLoader`: packed rows with document boundaries, assistant-only labels, `num_valid_tokens` for the global token denominator, resumable |
-| SFT trainer | `sft_train.py`, `sft_config.py` | `SFTTPUTrainer`: restores the chunked loss, LoRA adapter saves in the PEFT layout, per-step records |
+| SFT trainer | `sft_train.py`, `sft_config.py` | `SFTTPUTrainer`: restores the chunked loss, LoRA adapter saves in the PEFT layout, held-out loss, per-step records |
 | LoRA | `lora.py` | TorchTitan `LoRAConverter` on attention q/k/v/o by full module path; LoRA-aware state-dict adapter (load skips adapters, export merges them); merge and PEFT export helpers, including fused `wqkv` |
 | Optimizers | `optimizers.py` | AdamW, `AdamW8bit` (8-bit moments) and `AdamWBf16` (bf16 weights, stochastic rounding) |
 | Recipes | `config_registry.py` | `build_sft_config` and the registered Muse Spark SFT recipes |
@@ -84,6 +84,18 @@ every assistant turn.
 
 Runs without LoRA always use TorchTitan's saves.
 
+### Held-out loss
+
+`--sft.val-data-path` (records in the training layout) adds a held-out loss:
+before the first step, every `--sft.val-every` steps (default 10; 0: only
+before the first and after the last step) and after the last step, a
+forward-only pass over every held-out record (packed like the training data,
+each data-parallel rank a strided share; ranks with fewer microbatches add
+all-padding ones) gives the summed cross-entropy of the assistant tokens
+divided by their count. It is logged as `validate step: N loss: X` and written
+by rank 0 to `<dump_folder>/sft-val-rank0.json`. `--sft.val-max-microbatches`
+caps the microbatches per rank and pass.
+
 ### Launch
 
 ```bash
@@ -133,11 +145,12 @@ bash torchtitan/experiments/tpu/post_training/tests/run_cpu.sh --tokenizer-dir "
 ```
 
 The runner covers the unit tests (chat masks, packing, LoRA, optimizers,
-recipes) and an end-to-end SFT smoke of the real trainer on CPU (full, LoRA
-with full and adapter saves, AdamW8bit, AdamWBf16). With the Muse Spark TPU
-package installed and the tiny checkpoint's safetensors in the snapshot, the
-smoke adds Muse Spark runs. Without TorchTPU, the runner puts the import-only
-stand-in of `tests/cpu_stubs/` on `PYTHONPATH`.
+recipes, held-out loss) and an end-to-end SFT smoke of the real trainer on CPU
+(full, LoRA with full and adapter saves, AdamW8bit, AdamWBf16). With the Muse
+Spark TPU package installed and the tiny checkpoint's safetensors in the
+snapshot, the smoke and the held-out loss test add Muse Spark runs. Without
+TorchTPU, the runner puts the import-only stand-in of `tests/cpu_stubs/` on
+`PYTHONPATH`.
 
 ## Sources
 

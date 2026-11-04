@@ -26,6 +26,13 @@ Runs the upstream TPU trainer startup with ``SFTTPUTrainer``:
   PEFT layout, named through the model's state-dict adapter, to
   ``<dump_folder>/lora_adapter/step-N``. ``"full"`` keeps TorchTitan's DCP save
   of the whole model; ``"none"`` saves nothing.
+* Held-out loss (``sft.val_data_path``, e.g. the dataset's ``sft/val.jsonl``):
+  before the first step, every ``sft.val_every`` steps and after the last
+  step, a forward-only pass over every held-out record (packed like the
+  training data, each data-parallel rank a strided share) gives the summed
+  cross-entropy of the assistant tokens divided by their count. It is logged
+  as ``validate step: N loss: X`` and ``[sft] validation ...`` and written by
+  rank 0 to ``<dump_folder>/sft-val-rank0.json``.
 
 Launch with torchrun, module torchtitan.experiments.tpu.post_training.sft_train,
 ``--module torchtitan.experiments.tpu.post_training.config_registry`` and an
@@ -34,9 +41,11 @@ SFT recipe; see README.md.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 import os
+import time
 from pathlib import Path
 from typing import Any
 
@@ -47,6 +56,7 @@ from torch.distributed.tensor import DTensor
 
 from torchtitan.components.checkpointer.base import ModelWrapper
 from torchtitan.components.loss import ChunkedLossWrapper
+from torchtitan.distributed import utils as dist_utils
 from torchtitan.experiments.tpu import gmain
 from torchtitan.experiments.tpu import train as native_train
 from torchtitan.experiments.tpu.train import TPUTrainer
@@ -80,6 +90,7 @@ class SFTTPUTrainer(TPUTrainer):
         self._rank = int(os.environ.get("RANK", "0"))
         self.lora_exports: list[str] = []
         self._install_lora_save(config)
+        self._setup_validation(config)
 
     # -- LoRA adapter saves ----------------------------------------------
     def _lora_modules(self) -> list[tuple[str, torch.nn.Module]]:
@@ -139,6 +150,159 @@ class SFTTPUTrainer(TPUTrainer):
             dist.barrier()
         return out
 
+    # -- held-out loss ------------------------------------------------------
+    def _setup_validation(self, config: Any) -> None:
+        sft = getattr(config, "sft", None)
+        self._val_path = str(getattr(sft, "val_data_path", "") or "")
+        self._val_every = int(getattr(sft, "val_every", 0) or 0)
+        self._val_cap = int(getattr(sft, "val_max_microbatches", 0) or 0)
+        self._val_batches: list[dict[str, Any]] | None = None
+        self._val_info: dict[str, Any] = {}
+        self._val_started = False
+        self.val_records: list[dict[str, Any]] = []
+        if self._val_path:
+            from .sft_data import ChatSFTDataLoader
+
+            if not isinstance(self.dataloader, ChatSFTDataLoader):
+                raise ValueError("sft.val_data_path needs the ChatSFTDataLoader training data")
+            logger.info("[sft] validation on %s every %s steps", self._val_path,
+                        self._val_every or "(first and last only)")
+
+    def _dp_coords(self) -> tuple[int, int]:
+        if self.parallel_dims.dp_enabled:
+            mesh = self.parallel_dims.get_mesh("batch")
+            return mesh.size(), mesh.get_local_rank()
+        return 1, 0
+
+    def _build_val_microbatches(self) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        """This rank's packed held-out microbatches, padded to a common count.
+
+        Every rank tokenizes all held-out records and packs every rank's
+        strided share (records ``r, r + n, ...``), so the per-rank microbatch
+        counts are known on every rank without a collective. Ranks with fewer
+        microbatches append all-padding ones (no supervised token), so every
+        rank runs the same forwards and collectives.
+        """
+        from .sft_data import ChatSFTDataLoader, build_microbatch, pack_rows
+
+        dp_size, dp_rank = self._dp_coords()
+        cfg = dataclasses.replace(
+            self.config.dataloader, data_path=self._val_path, max_examples=0, shuffle_seed=None
+        )
+        loader = ChatSFTDataLoader(
+            cfg, dp_world_size=1, dp_rank=0, tokenizer=self.tokenizer,
+            max_context_length=self.config.training.max_context_length,
+            num_tokens_per_batch=self.config.training.num_tokens_per_microbatch_per_dp_rank,
+        )
+        rows, width = loader._rows, loader._width
+        num_records = len(loader._conversations)
+        docs = [loader.tokenize(i) for i in range(num_records)]
+        counts, mine = [], []
+        for rank in range(dp_size):
+            pending = [d for d in docs[rank::dp_size] if d is not None]
+            packed = []
+            while pending:
+                placed, pending = pack_rows(
+                    pending, rows=rows, width=width, max_docs_per_row=cfg.max_documents_per_row
+                )
+                packed.append(placed)
+            counts.append(len(packed))
+            if rank == dp_rank:
+                mine = packed
+        steps = max(counts) if counts else 0
+        if self._val_cap:
+            steps = min(steps, self._val_cap)
+        empty = [[] for _ in range(rows)]
+        batches = [build_microbatch(p, width=width, pad_id=loader._pad_id) for p in mine[:steps]]
+        batches += [build_microbatch(empty, width=width, pad_id=loader._pad_id)
+                    for _ in range(steps - len(batches))]
+        kept = [d for d in docs if d is not None]
+        info = {
+            "path": self._val_path, "records": num_records, "documents": len(kept),
+            "dropped": num_records - len(kept),
+            "supervised_tokens": int(sum(d.num_valid for d in kept)),
+            "tokens": int(sum(d.length for d in kept)),
+            "microbatches_per_rank": steps, "max_microbatches_needed": max(counts) if counts else 0,
+            "complete": not self._val_cap or max(counts or [0]) <= self._val_cap,
+        }
+        return batches, info
+
+    @torch.no_grad()
+    def run_validation(self, step: int) -> dict[str, Any] | None:
+        """Held-out loss of the current weights (collective; every rank calls it)."""
+        if not self._val_path:
+            return None
+        from torchtitan.experiments.tpu.unflatten_shim import set_unflatten_seq_len
+
+        t0 = time.perf_counter()
+        if self._val_batches is None:
+            self._val_batches, self._val_info = self._build_val_microbatches()
+            logger.info("[sft] validation set: %s", self._val_info)
+        model = self.model_parts[0]
+        was_training = model.training
+        model.eval()
+        seq_len = self.config.training.max_context_length
+        loss_sum = torch.zeros((), dtype=torch.float32, device=self.device)
+        valid = 0
+        try:
+            with set_unflatten_seq_len(seq_len):
+                for batch in self._val_batches:
+                    valid += int(batch["num_valid_tokens"])
+                    input_dict = {
+                        k: v.to(self.device) for k, v in batch.items() if isinstance(v, torch.Tensor)
+                    }
+                    inputs, labels, extra_kwargs = model.preprocess_inputs(
+                        input_dict,
+                        parallel_dims=self.parallel_dims,
+                        parallelism=self.config.parallelism,
+                        max_num_documents=self.dataloader.max_num_documents,
+                        max_context_length=seq_len,
+                    )
+                    with self.train_context():
+                        pred = model(inputs, **extra_kwargs)
+                        loss_kwargs = {}
+                        if "positions" in extra_kwargs:
+                            loss_kwargs["positions"] = extra_kwargs["positions"]
+                        # No global token count: the loss comes back as a sum.
+                        loss, _ = self.loss_fn(pred, labels, None, **loss_kwargs)
+                        del pred
+                    loss_sum = loss_sum + loss.detach().float()
+        finally:
+            if was_training:
+                model.train()
+        totals = torch.stack([loss_sum, torch.tensor(float(valid), device=self.device)])
+        if self.parallel_dims.dp_enabled:
+            totals = dist_utils.dist_sum_tensor(totals, self.parallel_dims.get_mesh("batch"))
+        total_loss, total_valid = (float(x) for x in totals.cpu().tolist())
+        value = total_loss / max(total_valid, 1.0)
+        record = {"step": step, "loss": value, "supervised_tokens": int(total_valid),
+                  "microbatches_per_rank": len(self._val_batches),
+                  "seconds": round(time.perf_counter() - t0, 3)}
+        self.val_records.append(record)
+        logger.info("[sft] validation step=%d loss=%.5f supervised_tokens=%d seconds=%.1f",
+                    step, value, int(total_valid), record["seconds"])
+        metrics = getattr(self, "metrics_processor", None)
+        if metrics is not None and hasattr(metrics, "log_validation"):
+            # Also resets the step timer, so the next step's time excludes this pass.
+            metrics.log_validation(loss=value, step=step)
+        if self._rank == 0 and self.config.dump_folder:
+            path = Path(self.config.dump_folder) / "sft-val-rank0.json"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps({"set": self._val_info, "evals": self.val_records}, indent=2))
+        return record
+
+    def _maybe_validate(self, *, before_step: bool) -> None:
+        if not self._val_path:
+            return
+        if before_step:
+            if not self._val_started:
+                self._val_started = True
+                self.run_validation(self.step - 1)
+            return
+        last = self.step == self.config.training.steps
+        if last or (self._val_every and self.step % self._val_every == 0):
+            self.run_validation(self.step)
+
     def forward_backward_step(self, *, input_dict, global_valid_tokens):
         loss = super().forward_backward_step(
             input_dict=input_dict, global_valid_tokens=global_valid_tokens
@@ -148,6 +312,7 @@ class SFTTPUTrainer(TPUTrainer):
         return loss
 
     def train_step(self, data_iterator):
+        self._maybe_validate(before_step=True)
         if hasattr(self.dataloader, "microbatches_for_step"):
             self.gradient_accumulation_steps = self.dataloader.microbatches_for_step()
         before = getattr(self.dataloader, "stats", None)
@@ -180,6 +345,7 @@ class SFTTPUTrainer(TPUTrainer):
             path.write_text(json.dumps(
                 {"parameters": self.parameter_report, "steps": self.sft_records}, indent=2
             ))
+        self._maybe_validate(before_step=False)
         return result
 
 

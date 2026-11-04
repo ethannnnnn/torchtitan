@@ -55,7 +55,8 @@ export HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1 PYTHONDONTWRITEBYTECODE=1
 export SPARK_TEST_ASSETS="$tokenizer_dir"
 cd "$REPO_ROOT"
 PKG=torchtitan.experiments.tpu.post_training.tests
-"$CPU_PYTHON" -m unittest "$PKG.test_lora_optim" "$PKG.test_sft_data" "$PKG.test_recipes"
+"$CPU_PYTHON" -m unittest "$PKG.test_lora_optim" "$PKG.test_sft_data" "$PKG.test_recipes" \
+  "$PKG.test_sft_validation"
 if [[ "$unit_only" -eq 1 ]]; then
   exit 0
 fi

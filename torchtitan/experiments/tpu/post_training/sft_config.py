@@ -26,6 +26,21 @@ class SFTConfig:
     "full": TorchTitan's DCP save of the whole model and training state;
     "none": no saves. Runs without LoRA always use TorchTitan's saves."""
 
+    val_data_path: str = ""
+    """Held-out chat SFT records in the training data's layout (for example
+    the dataset's ``sft/val.jsonl``). Empty: no validation. The held-out loss
+    is the summed cross-entropy of the assistant tokens of every held-out
+    record divided by their count (the training loss's normalization), measured
+    before the first step, every ``val_every`` steps and after the last step."""
+
+    val_every: int = 10
+    """Validation interval in optimizer steps; 0: only before the first and
+    after the last step."""
+
+    val_max_microbatches: int = 0
+    """Cap on packed microbatches per rank per validation pass; 0: all of the
+    rank's held-out records."""
+
 
 @dataclasses.dataclass(kw_only=True, slots=True)
 class SFTTrainerConfig(TPUTrainerConfig):
@@ -38,6 +53,8 @@ class SFTTrainerConfig(TPUTrainerConfig):
 def as_sft_config(base: TPUTrainerConfig, sft: SFTConfig) -> SFTTrainerConfig:
     if sft.lora_save not in LORA_SAVE_MODES:
         raise ValueError(f"sft.lora_save must be one of {LORA_SAVE_MODES}")
+    if sft.val_every < 0 or sft.val_max_microbatches < 0:
+        raise ValueError("sft.val_every and sft.val_max_microbatches must be >= 0")
     fields = {
         field.name: getattr(base, field.name)
         for field in dataclasses.fields(base)
