@@ -17,7 +17,10 @@ and bf16 weights with AdamWBf16; with ``--spark-checkpoint`` (and the Muse
 Spark TPU package installed), the Muse Spark port loaded from the public tiny
 checkpoint, full-parameter and LoRA. Every variant must lower the training
 loss on a small repeated dataset of short templated replies; LoRA runs must
-leave every base weight bit-identical to the checkpoint.
+leave every base weight bit-identical to the checkpoint, and LoRA runs with
+adapter saves must write the adapter-only resume state (which needs
+``checkpointing/lora_checkpoint.py``; without it they write the PEFT adapter
+only, ``sft.lora_save=peft``).
 
     python -m torchtitan.experiments.tpu.post_training.tests.cpu_sft_smoke \\
         --tokenizer-dir <Muse Spark tokenizer dir> --work <new dir> \\
@@ -175,12 +178,19 @@ def main() -> int:
             ("sft_spark_tiny_smoke", "spark_tiny", spark, 0.01, False, ""),
             ("sft_spark_tiny_lora_smoke", "spark_tiny", spark, 0.0, True, "adapter"),
         ]
+    resume_state = smoke_common.has_lora_checkpoint()
+    if not resume_state:
+        print("[SFT] checkpointing.lora_checkpoint is not installed: the LoRA runs with "
+              "adapter saves write the PEFT adapter only (sft.lora_save=peft)", flush=True)
     checks: dict[str, bool] = {}
     for name, kind, assets, drop, lora, lora_save in runs:
+        extra = []
+        if lora_save == "adapter" and not resume_state:
+            lora_save, extra = "peft", ["--sft.lora-save=peft"]
         # The chat template comes from the tokenizer directory (the debug
         # checkpoint has none, see smoke_common.TOKENIZER_FILES) or the snapshot.
         template_dir = tokenizer_dir if kind == "qwen_debug" else assets
-        records = run(name, work / name, assets, data, template_dir)
+        records = run(name, work / name, assets, data, template_dir, extra)
         steps = records["steps"]
         losses = [s["loss_local"] for s in steps]
         print(f"[SFT] {name} losses {[round(x, 4) for x in losses]} parameters "
@@ -205,9 +215,17 @@ def main() -> int:
             s["valid_tokens_local"] > 0 and s["documents"] > 0 for s in steps)
         checkpoint = work / name / "dump" / "checkpoint" / "step-8"
         adapter_dir = work / name / "dump" / "lora_adapter" / "step-8"
-        adapter_mode = lora and lora_save == "adapter"
-        if adapter_mode:
-            checks[f"{name}: no full checkpoint (adapter-only saves)"] = not checkpoint.exists()
+        if lora and lora_save == "adapter":
+            # Adapter-only resume state: adapters + optimizer + LR + dataloader + step, no base.
+            checks[f"{name}: DCP checkpoint at the last step"] = checkpoint.is_dir()
+            state = dcp_model_state(checkpoint) if checkpoint.is_dir() else {}
+            model_keys = [k for k in state if not k.startswith(
+                ("optimizer", "lr_scheduler", "dataloader", "train_state"))]
+            checks[f"{name}: checkpoint holds only the adapters (adapter-only saves)"] = bool(
+                model_keys) and all(k.endswith(("lora_a.weight", "lora_b.weight")) for k in model_keys)
+            checks.update(check_adapter_export(name, kind, adapter_dir))
+        elif lora and lora_save == "peft":
+            checks[f"{name}: no DCP checkpoint (PEFT saves only)"] = not checkpoint.exists()
             checks.update(check_adapter_export(name, kind, adapter_dir))
         else:
             checks[f"{name}: DCP checkpoint at the last step"] = checkpoint.is_dir()
@@ -216,7 +234,7 @@ def main() -> int:
         params = records["parameters"]
         checks[f"{name}: only adapters train"] = (
             params["trainable"] == params["adapter"] > 0 and params["frozen"] > 0)
-        if checkpoint.is_dir():
+        if checkpoint.is_dir() and lora_save == "full":
             state = dcp_model_state(checkpoint)
             expected = expected_base_state(kind, assets, qwen_initial)
             base = {k: v for k, v in state.items() if k in expected}

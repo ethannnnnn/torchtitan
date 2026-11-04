@@ -45,6 +45,16 @@ def has_muse_spark() -> bool:
     return importlib.util.find_spec("torchtitan.experiments.tpu.muse_spark") is not None
 
 
+def has_lora_checkpoint() -> bool:
+    """True when the adapter-only checkpoint support (``sft.lora_save=adapter``)
+    of ``checkpointing/lora_checkpoint.py`` is importable."""
+    try:
+        return importlib.util.find_spec(
+            "torchtitan.experiments.tpu.checkpointing.lora_checkpoint") is not None
+    except ImportError:
+        return False
+
+
 def debug_model_spec(seq_len: int = 512):
     """The TPU Qwen3.5 debug model of the CPU recipes (no LoRA)."""
     from torchtitan.experiments.tpu.post_training.config_registry import resolve_model_spec

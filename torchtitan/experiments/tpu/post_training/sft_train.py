@@ -21,11 +21,18 @@ Runs the upstream TPU trainer startup with ``SFTTPUTrainer``:
   the packed documents, tokens, supervised tokens and this rank's loss share;
   the trainable / frozen parameter counts are logged once (LoRA runs).
 * LoRA runs save only the adapter (``sft.lora_save="adapter"``, default): at
-  every checkpoint step all ranks gather the adapter tensors (a collective over
-  the sorted adapter keys, never the frozen base) and rank 0 writes them in the
-  PEFT layout, named through the model's state-dict adapter, to
-  ``<dump_folder>/lora_adapter/step-N``. ``"full"`` keeps TorchTitan's DCP save
-  of the whole model; ``"none"`` saves nothing.
+  every checkpoint step TorchTitan's DCP save writes the adapter-only resume
+  state (adapter tensors, their optimizer state, the LR schedule, the
+  dataloader position and the step counter; never the frozen base) to
+  ``<dump_folder>/checkpoint/step-N`` (``checkpointing/lora_checkpoint.py``),
+  then all ranks gather the adapter tensors (a collective over the sorted
+  adapter keys) and rank 0 writes them in the PEFT layout, named through the
+  model's state-dict adapter, to ``<dump_folder>/lora_adapter/step-N``. Every
+  start reads the base from the Hugging Face checkpoint and then restores the
+  newest complete ``step-N``, so relaunching with the same dump folder resumes
+  a killed run. ``"peft"`` writes only the PEFT adapter (no resume state),
+  ``"full"`` keeps TorchTitan's DCP save of the whole model, ``"none"`` saves
+  nothing.
 * Held-out loss (``sft.val_data_path``, e.g. the dataset's ``sft/val.jsonl``):
   before the first step, every ``sft.val_every`` steps and after the last
   step, a forward-only pass over every held-out record (packed like the
@@ -33,6 +40,14 @@ Runs the upstream TPU trainer startup with ``SFTTPUTrainer``:
   cross-entropy of the assistant tokens divided by their count. It is logged
   as ``validate step: N loss: X`` and ``[sft] validation ...`` and written by
   rank 0 to ``<dump_folder>/sft-val-rank0.json``.
+* Resume checks: with ``SFT_RECORDS_ALL_RANKS=1`` every rank appends one JSON
+  line per step to ``<dump_folder>/sft-records/rank-NNNNN.jsonl`` (its loss
+  share, the gradient norm, the learning rate, and a SHA-256 fingerprint plus
+  the document ids of every microbatch it trained on), so two runs can be
+  compared batch by batch (``SFT_RECORDS_DIR`` moves them, e.g. to local disk
+  when the dump folder is an object-store mount). ``SFT_FAULT_KILL_STEP=N``
+  sends SIGKILL to every rank inside the forward/backward of step N (after
+  that step's batches were drawn): a hard crash for fault-tolerance tests.
 
 Launch with torchrun, module torchtitan.experiments.tpu.post_training.sft_train,
 ``--module torchtitan.experiments.tpu.post_training.config_registry`` and an
@@ -45,6 +60,7 @@ import dataclasses
 import json
 import logging
 import os
+import signal
 import time
 from pathlib import Path
 from typing import Any
@@ -90,6 +106,12 @@ class SFTTPUTrainer(TPUTrainer):
         self._rank = int(os.environ.get("RANK", "0"))
         self.lora_exports: list[str] = []
         self._install_lora_save(config)
+        self._last_grad_norm: torch.Tensor | None = None
+        self._records_all_ranks = os.environ.get("SFT_RECORDS_ALL_RANKS", "0") == "1"
+        self._fault_kill_step = int(os.environ.get("SFT_FAULT_KILL_STEP", "0") or 0)
+        if self._fault_kill_step and self._rank == 0:
+            logger.warning("[sft] fault injection: every rank is killed (SIGKILL) at step %d",
+                           self._fault_kill_step)
         self._setup_validation(config)
 
     # -- LoRA adapter saves ----------------------------------------------
@@ -114,15 +136,34 @@ class SFTTPUTrainer(TPUTrainer):
             rank=rank, alpha=float(first._lora_scaling) * rank
         )
         checkpointer = self.checkpointer
+        resumable = mode == "adapter" and getattr(checkpointer, "enable", False)
+        if resumable:
+            try:
+                from torchtitan.experiments.tpu.checkpointing.lora_checkpoint import (
+                    enable_adapter_only_checkpoints,
+                )
+            except ImportError as exc:
+                raise ImportError(
+                    "sft.lora_save='adapter' writes the adapter-only resume state through "
+                    "torchtitan.experiments.tpu.checkpointing.lora_checkpoint; without it use "
+                    "sft.lora_save='peft' (PEFT adapter only)"
+                ) from exc
+
+            # Adapter-only DCP resume state; loads read the HF base first.
+            enable_adapter_only_checkpoints(checkpointer, self.model_parts)
+        dcp_save = checkpointer.save
 
         def _save(curr_step: int, last_step: bool = False) -> bool:
             if mode == "none" or not checkpointer._should_save(curr_step, last_step):
                 return False
+            if resumable:
+                dcp_save(curr_step, last_step=last_step)
             self.export_lora_adapter(curr_step)
             return True
 
         checkpointer.save = _save
-        logger.info("[sft] LoRA run: checkpoint saves write the adapter only (sft.lora_save=%s)", mode)
+        logger.info("[sft] LoRA run: checkpoint saves write the adapter only (sft.lora_save=%s%s)",
+                    mode, ", with adapter-only resume state" if resumable else "")
 
     def export_lora_adapter(self, step: int) -> str | None:
         """Gather the adapter on every rank; rank 0 writes the PEFT files."""
@@ -303,7 +344,20 @@ class SFTTPUTrainer(TPUTrainer):
         if last or (self._val_every and self.step % self._val_every == 0):
             self.run_validation(self.step)
 
+    def _clip_grad_norm(self) -> torch.Tensor:
+        grad_norm = super()._clip_grad_norm()
+        self._last_grad_norm = grad_norm
+        return grad_norm
+
     def forward_backward_step(self, *, input_dict, global_valid_tokens):
+        if self._fault_kill_step and self.step == self._fault_kill_step:
+            # Test hook (SFT_FAULT_KILL_STEP): a hard crash on every rank after
+            # this step's batches were drawn and before any state is saved.
+            logger.warning("[sft] fault injection: SIGKILL at step %d (rank %d)",
+                           self.step, self._rank)
+            for handler in logging.getLogger().handlers:
+                handler.flush()
+            os.kill(os.getpid(), signal.SIGKILL)
         loss = super().forward_backward_step(
             input_dict=input_dict, global_valid_tokens=global_valid_tokens
         )
@@ -319,7 +373,11 @@ class SFTTPUTrainer(TPUTrainer):
         snapshot = (
             (before.documents, before.tokens, before.valid_tokens) if before else (0, 0, 0)
         )
+        batch_log = getattr(self.dataloader, "batch_log", None)
+        log_start = len(batch_log) if batch_log is not None else 0
+        lr_used = self.lr_schedulers.get_metrics() if self._records_all_ranks else {}
         self._step_loss = None
+        self._last_grad_norm = None
         result = super().train_step(data_iterator)
         stats = getattr(self.dataloader, "stats", None)
         record: dict[str, Any] = {"step": self.step}
@@ -339,6 +397,11 @@ class SFTTPUTrainer(TPUTrainer):
             )
         self.sft_records.append(record)
         logger.info("[sft] step=%d %s", self.step, record)
+        if self._records_all_ranks:
+            self._append_rank_record(record, batch_log[log_start:] if batch_log is not None else [],
+                                     lr_used)
+        if batch_log is not None:
+            del batch_log[:]
         if self._rank == 0 and self.config.dump_folder:
             path = Path(self.config.dump_folder) / "sft-records-rank0.json"
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -347,6 +410,17 @@ class SFTTPUTrainer(TPUTrainer):
             ))
         self._maybe_validate(before_step=False)
         return result
+
+    def _append_rank_record(self, record: dict[str, Any], batches: list[dict[str, Any]],
+                            lr_used: dict[str, float]) -> None:
+        line = dict(record, rank=self._rank, batches=batches, lr=lr_used)
+        if self._last_grad_norm is not None:
+            line["grad_norm"] = float(self._last_grad_norm.item())
+        root = Path(os.environ.get("SFT_RECORDS_DIR")
+                    or Path(self.config.dump_folder or ".") / "sft-records")
+        root.mkdir(parents=True, exist_ok=True)
+        with open(root / f"rank-{self._rank:05d}.jsonl", "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(line, sort_keys=True) + "\n")
 
 
 def start_trainer(train_config: Any) -> None:

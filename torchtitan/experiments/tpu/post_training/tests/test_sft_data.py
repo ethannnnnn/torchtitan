@@ -93,6 +93,15 @@ class PackingTest(unittest.TestCase):
         self.assertEqual(empty["positions"].tolist(), [0, 1, 2, 3, 0, 1, 2, 3])
         self.assertEqual(empty["num_valid_tokens"], 0)
 
+    def test_batch_fingerprint(self):
+        docs = [self._doc(i, n, 2) for i, n in enumerate([9, 7])]
+        placed, _ = sft_data.pack_rows(docs, rows=1, width=16, max_docs_per_row=2)
+        a = sft_data.build_microbatch(placed, width=16, pad_id=0)
+        b = sft_data.build_microbatch(placed, width=16, pad_id=0)
+        self.assertEqual(sft_data.batch_fingerprint(a), sft_data.batch_fingerprint(b))
+        b["labels"][7] = IGNORE_INDEX  # one supervised target fewer
+        self.assertNotEqual(sft_data.batch_fingerprint(a), sft_data.batch_fingerprint(b))
+
     def test_progress_guarantee(self):
         docs = [self._doc(i, 16, 2) for i in range(3)]
         placed, left = sft_data.pack_rows(docs, rows=1, width=16, max_docs_per_row=4)
@@ -216,6 +225,17 @@ class ChatSFTDataLoaderTest(unittest.TestCase):
         a, b = self._loader(self.path, 0, 2), self._loader(self.path, 1, 2)
         self.assertFalse(set(a._shard) & set(b._shard))
         self.assertEqual(len(a._shard), len(b._shard))
+
+    def test_batch_log(self):
+        loader = self._loader(self.path)
+        it = iter(loader)
+        batches = [next(it) for _ in range(3)]
+        self.assertEqual([e["microbatch"] for e in loader.batch_log], [1, 2, 3])
+        for entry, batch in zip(loader.batch_log, batches):
+            self.assertEqual(entry["sha256"], sft_data.batch_fingerprint(batch))
+            # One document per position reset outside the padding.
+            starts = int(((batch["positions"] == 0) & ~batch["padding_mask"]).sum())
+            self.assertEqual(len(entry["docs"]), starts)
 
     def test_resume_reproduces_batches(self):
         loader = self._loader(self.path)

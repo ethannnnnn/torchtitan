@@ -33,11 +33,15 @@ for the next microbatch. Conversations longer than a row are dropped
 assistant tokens train). Data-parallel ranks read disjoint strided shards of
 one shuffled epoch order; epochs reshuffle with ``shuffle_seed + epoch``. The
 state dict holds the epoch, the shard cursor and the pending documents, so a
-resumed run serves exactly the batches it would have served.
+resumed run serves exactly the batches it would have served. ``batch_log``
+lists, per microbatch served, a SHA-256 fingerprint of its token, label and
+position tensors and the ids of the documents packed into it (the trainer
+drains it every step), so two runs can be compared batch by batch.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import random
@@ -182,6 +186,14 @@ def build_microbatch(
     }
 
 
+def batch_fingerprint(batch: dict[str, Any]) -> str:
+    """SHA-256 (hex) of a microbatch's input, label and position tensors."""
+    digest = hashlib.sha256()
+    for key in ("input", "labels", "positions"):
+        digest.update(batch[key].numpy().tobytes())
+    return digest.hexdigest()
+
+
 @dataclass
 class SFTStats:
     epoch: int = 0
@@ -273,6 +285,7 @@ class ChatSFTDataLoader(BaseDataLoader):
         self._pending: list[SFTDocument] = []
         self._shard = self._epoch_shard(0)
         self.stats = SFTStats()
+        self.batch_log: list[dict[str, Any]] = []
         if dp_rank == 0:
             logger.info(
                 "[sft] %d conversations, %d ranks, %d rows x %d tokens per microbatch, "
@@ -346,6 +359,13 @@ class ChatSFTDataLoader(BaseDataLoader):
             "valid_tokens": batch["num_valid_tokens"],
             "padded_tokens": self._rows * self._width,
         }
+        self.batch_log.append({
+            "microbatch": self.stats.microbatches,
+            "sha256": batch_fingerprint(batch),
+            "docs": [doc.index for row in placed for doc in row],
+        })
+        if len(self.batch_log) > 4096:  # bounded when nobody drains it
+            del self.batch_log[:-4096]
         return batch
 
     def microbatches_for_step(self) -> int:

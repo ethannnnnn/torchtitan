@@ -12,7 +12,7 @@ import dataclasses
 
 from torchtitan.experiments.tpu.tpu_job_config import TPUTrainerConfig
 
-LORA_SAVE_MODES = ("adapter", "full", "none")
+LORA_SAVE_MODES = ("adapter", "peft", "full", "none")
 
 
 @dataclasses.dataclass(kw_only=True, slots=True)
@@ -20,11 +20,15 @@ class SFTConfig:
     """SFT options the native TPUTrainerConfig has no field for."""
 
     lora_save: str = "adapter"
-    """LoRA runs only. "adapter": every checkpoint save writes just the LoRA
-    adapter, in the PEFT layout, to <dump_folder>/lora_adapter/step-N (the
-    frozen base is the released checkpoint, so a full save would rewrite it);
-    "full": TorchTitan's DCP save of the whole model and training state;
-    "none": no saves. Runs without LoRA always use TorchTitan's saves."""
+    """LoRA runs only. "adapter": every checkpoint save writes the adapter-only
+    resume state (LoRA tensors, their optimizer state, LR schedule, dataloader
+    position and step; DCP, <dump_folder>/checkpoint/step-N) and the LoRA
+    adapter in the PEFT layout (<dump_folder>/lora_adapter/step-N); restarts
+    read the frozen base from the released checkpoint and resume from the
+    newest complete step-N (a full save would rewrite the 1.6 TB base);
+    "peft": only the PEFT adapter (no resume state); "full": TorchTitan's DCP
+    save of the whole model and training state; "none": no saves. Runs
+    without LoRA always use TorchTitan's saves."""
 
     val_data_path: str = ""
     """Held-out chat SFT records in the training data's layout (for example

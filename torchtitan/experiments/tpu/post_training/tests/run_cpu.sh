@@ -65,3 +65,9 @@ if compgen -G "$tokenizer_dir/*.safetensors" > /dev/null; then
   spark=(--spark-checkpoint "$tokenizer_dir")
 fi
 "$CPU_PYTHON" -m "$PKG.cpu_sft_smoke" --tokenizer-dir "$tokenizer_dir" --work "$work_root/sft" "${spark[@]}"
+if "$CPU_PYTHON" -c 'import torchtitan.experiments.tpu.checkpointing.lora_checkpoint' 2>/dev/null; then
+  "$CPU_PYTHON" -m "$PKG.cpu_sft_resume" --tokenizer-dir "$tokenizer_dir" --work "$work_root/resume" \
+    --nproc 2 --steps 6 --interval 2 --kill-step 4 --partial
+else
+  echo 'skipping cpu_sft_resume: checkpointing.lora_checkpoint (adapter-only checkpoints) is not installed'
+fi

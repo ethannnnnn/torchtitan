@@ -156,7 +156,7 @@ class SFTValidationTest(unittest.TestCase):
             work = pathlib.Path(tmp)
             val_lines = _write_data(work)
             dump = _train(work, "sft_spark_tiny_lora_smoke", pathlib.Path(ASSETS),
-                          pathlib.Path(ASSETS), [])
+                          pathlib.Path(ASSETS), ["--sft.lora-save=peft"])
             hf = MuseSparkForConditionalGeneration.from_pretrained(ASSETS, dtype=torch.float32).eval()
             total, count = _reference(val_lines, ASSETS, lambda ids: hf(input_ids=ids[None]).logits[0])
             self._check(dump, total, count)

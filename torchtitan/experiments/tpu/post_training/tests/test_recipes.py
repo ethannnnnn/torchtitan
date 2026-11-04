@@ -124,6 +124,7 @@ class BuilderTest(unittest.TestCase):
     def test_sft_config_modes(self):
         base = cpu_recipes.sft_debug_smoke()
         self.assertEqual(as_sft_config(base, SFTConfig(lora_save="none")).sft.lora_save, "none")
+        self.assertEqual(as_sft_config(base, SFTConfig(lora_save="peft")).sft.lora_save, "peft")
         with self.assertRaises(ValueError):
             as_sft_config(base, SFTConfig(lora_save="weights"))
         self.assertEqual(cpu_recipes.sft_debug_lora_smoke().sft.lora_save, "full")

@@ -8,8 +8,8 @@ and the CPU checks use the TPU Qwen3.5 debug model (`../qwen3_5/`).
 | Piece | File | What it does |
 |---|---|---|
 | Chat rendering | `chat_template.py` | The checkpoint's own chat template, pinned `current_date`, optional `reasoning_effort`, assistant-only token masks, final-message extraction from sampled replies |
-| SFT data | `sft_data.py` | `ChatSFTDataLoader`: packed rows with document boundaries, assistant-only labels, `num_valid_tokens` for the global token denominator, resumable |
-| SFT trainer | `sft_train.py`, `sft_config.py` | `SFTTPUTrainer`: restores the chunked loss, LoRA adapter saves in the PEFT layout, held-out loss, per-step records |
+| SFT data | `sft_data.py` | `ChatSFTDataLoader`: packed rows with document boundaries, assistant-only labels, `num_valid_tokens` for the global token denominator, resumable, per-microbatch fingerprints |
+| SFT trainer | `sft_train.py`, `sft_config.py` | `SFTTPUTrainer`: restores the chunked loss, LoRA adapter saves (PEFT export plus adapter-only resume state), held-out loss, per-step records, resume-check hooks |
 | LoRA | `lora.py` | TorchTitan `LoRAConverter` on attention q/k/v/o by full module path; LoRA-aware state-dict adapter (load skips adapters, export merges them); merge and PEFT export helpers, including fused `wqkv` |
 | Optimizers | `optimizers.py` | AdamW, `AdamW8bit` (8-bit moments) and `AdamWBf16` (bf16 weights, stochastic rounding) |
 | Recipes | `config_registry.py` | `build_sft_config` and the registered Muse Spark SFT recipes |
@@ -69,20 +69,35 @@ takes multi-turn and tool conversations, renders them with the checkpoint's own
 template (including template options such as `reasoning_effort`) and trains
 every assistant turn.
 
-### LoRA saves
+### LoRA saves and resume
 
 `--sft.lora-save` selects what a LoRA run writes at each checkpoint step
 (`--checkpoint.interval` and the last step):
 
-* `adapter` (default): every rank joins a gather of the adapter tensors (never
-  the frozen base) and rank 0 writes them in the PEFT layout
+* `adapter` (default): TorchTitan's DCP save of the adapter-only resume state
+  (adapter tensors, their optimizer state, the LR schedule, the dataloader
+  position and the step; never the frozen base) to
+  `<dump_folder>/checkpoint/step-N`, plus the adapter in the PEFT layout
   (`adapter_model.safetensors` + `adapter_config.json`, module names from the
-  model's state-dict adapter) to `<dump_folder>/lora_adapter/step-N`. The base
-  is the released checkpoint, so a full save would rewrite about 1.6 TB at 816B.
+  model's state-dict adapter) in `<dump_folder>/lora_adapter/step-N`. Every
+  start reads the base from the Hugging Face checkpoint and then restores the
+  newest complete `step-N`, so relaunching with the same dump folder resumes a
+  killed run. The base is the released checkpoint, so a full save would rewrite
+  about 1.6 TB at 816B. Needs the adapter-only checkpoint support of
+  `../checkpointing/lora_checkpoint.py`.
+* `peft`: only the PEFT adapter, no resume state.
 * `full`: TorchTitan's DCP save of the whole model and training state.
 * `none`: no saves.
 
 Runs without LoRA always use TorchTitan's saves.
+
+Resume checks: with `SFT_RECORDS_ALL_RANKS=1` every rank appends one JSON line
+per step to `<dump_folder>/sft-records/rank-NNNNN.jsonl` (its loss share, the
+gradient norm, the learning rate, and a SHA-256 fingerprint plus the document
+ids of every microbatch it trained on), so two runs can be compared batch by
+batch (`SFT_RECORDS_DIR` moves them). `SFT_FAULT_KILL_STEP=N` sends SIGKILL to
+every rank inside the forward/backward of step N, after that step's batches
+were drawn.
 
 ### Held-out loss
 
@@ -145,12 +160,13 @@ bash torchtitan/experiments/tpu/post_training/tests/run_cpu.sh --tokenizer-dir "
 ```
 
 The runner covers the unit tests (chat masks, packing, LoRA, optimizers,
-recipes, held-out loss) and an end-to-end SFT smoke of the real trainer on CPU
-(full, LoRA with full and adapter saves, AdamW8bit, AdamWBf16). With the Muse
-Spark TPU package installed and the tiny checkpoint's safetensors in the
-snapshot, the smoke and the held-out loss test add Muse Spark runs. Without
-TorchTPU, the runner puts the import-only stand-in of `tests/cpu_stubs/` on
-`PYTHONPATH`.
+recipes, held-out loss) and end-to-end runs of the real trainer on CPU: the SFT
+smoke (full, LoRA with full and adapter saves, AdamW8bit, AdamWBf16) and, with
+the adapter-only checkpoint support of `../checkpointing/` installed, a LoRA
+kill-and-resume check on two ranks. With the Muse Spark TPU package installed
+and the tiny checkpoint's safetensors in the snapshot, the smoke and the
+held-out loss test add Muse Spark runs. Without TorchTPU, the runner puts the
+import-only stand-in of `tests/cpu_stubs/` on `PYTHONPATH`.
 
 ## Sources
 
