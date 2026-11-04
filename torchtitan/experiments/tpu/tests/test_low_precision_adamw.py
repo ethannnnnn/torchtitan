@@ -17,6 +17,9 @@
    (same initial bf16 weights) has slope ~1 and no bias.
 4. TorchTitan integration: the container config builds, steps a module, and
    updates DTensor parameters through their local shards.
+5. Fused TPU kernels (needs ``jax``; runs on JAX's CPU backend): in
+   deterministic modes the kernels equal the eager PyTorch update bit for bit;
+   in stochastic modes they are unbiased.
 
 Run: python -m pytest -q torchtitan/experiments/tpu/tests/test_low_precision_adamw.py
 """
@@ -318,6 +321,117 @@ class TorchTitanIntegrationTest(unittest.TestCase):
     finally:
       if created:
         dist.destroy_process_group()
+
+
+def _has_jax() -> bool:
+  import importlib.util
+
+  return importlib.util.find_spec("jax") is not None
+
+
+@unittest.skipUnless(_has_jax(), "jax is not installed")
+class FusedKernelTest(unittest.TestCase):
+  """The JAX kernels behind ``tpu_kernel`` vs the eager update, on JAX's CPU backend."""
+
+  B1, B2, EPS, WD, LR = 0.9, 0.95, 1e-8, 0.1, 1e-6
+
+  @classmethod
+  def setUpClass(cls):
+    os.environ.setdefault("JAX_PLATFORMS", "cpu")
+    import jax.numpy as jnp
+    import numpy as np
+
+    from torchtitan.experiments.tpu.kernels import low_precision_adamw_kernels as kernels
+
+    cls.jnp, cls.np, cls.K = jnp, np, kernels
+    torch.manual_seed(70)
+    cls.n = 1 << 14
+    cls.p0 = _llm_like_weights(cls.n, 71)
+    cls.grads = [torch.randn(cls.n).to(torch.bfloat16) for _ in range(3)]
+
+  def _j(self, t):
+    jnp = self.jnp
+    if t.dtype == torch.bfloat16:
+      return jnp.asarray(t.view(torch.int16).numpy()).view(jnp.bfloat16)
+    if t.dtype == torch.float8_e4m3fn:
+      return jnp.asarray(t.view(torch.uint8).numpy()).view(jnp.float8_e4m3fn)
+    return jnp.asarray(t.numpy())
+
+  def _t(self, a):
+    np, jnp = self.np, self.jnp
+    a = np.asarray(a)
+    if a.dtype == jnp.bfloat16:
+      return torch.from_numpy(a.view(np.int16).copy()).view(torch.bfloat16)
+    if a.dtype == jnp.float8_e4m3fn:
+      return torch.from_numpy(a.view(np.uint8).copy()).view(torch.float8_e4m3fn)
+    return torch.from_numpy(a.copy())
+
+  def _eager(self, steps, **kw):
+    p = torch.nn.Parameter(self.p0.clone())
+    opt = LowPrecisionAdamW([p], lr=self.LR, betas=(self.B1, self.B2), eps=self.EPS, weight_decay=self.WD,
+                            tpu_kernel="off", **kw)
+    for g in self.grads[:steps]:
+      p.grad = g
+      opt.step()
+    return p.detach(), opt.state[p]
+
+  def _coef(self, step):
+    b1, b2, lr = self.B1, self.B2, self.LR
+    return self.jnp.asarray([lr, lr / (1 - b1**step), 1 / math.sqrt(1 - b2**step), lr * self.WD,
+                             lr * adam_ratio_bound(b1, b2, step)], self.jnp.float32)
+
+  def test_deterministic_modes_match_eager(self):
+    K, seed = self.K, self.jnp.asarray([1, 2, 3, 4], self.jnp.int32)
+    args = (self.B1, self.B2, self.EPS)
+    p, st = self._eager(2, param_update="nearest", state_rounding="nearest")
+    ref, ref_st = self._eager(3, param_update="nearest", state_rounding="nearest")
+    out = K._bf16_states_update(self._j(p), self._j(self.grads[2]), self._j(st["exp_avg"]), self._j(st["exp_avg_sq"]),
+                                seed, self._coef(3), *args, False, False)
+    self.assertTrue(torch.equal(self._t(out[0]), ref))
+    self.assertTrue(torch.equal(self._t(out[1]), ref_st["exp_avg"]))
+    self.assertTrue(torch.equal(self._t(out[2]), ref_st["exp_avg_sq"]))
+
+    p, st = self._eager(2, param_update="kahan", state_rounding="nearest")
+    ref, ref_st = self._eager(3, param_update="kahan", state_rounding="nearest")
+    out = K._bf16_states_kahan_update(self._j(p), self._j(self.grads[2]), self._j(st["exp_avg"]),
+                                      self._j(st["exp_avg_sq"]), self._j(st["residual"]), seed, self._coef(3),
+                                      *args, False)
+    self.assertTrue(torch.equal(self._t(out[0]), ref))
+    self.assertTrue(torch.equal(self._t(out[3]), ref_st["residual"]))
+
+    p, st = self._eager(2, param_update="nearest", state_dtype="float8", state_rounding="nearest")
+    ref, ref_st = self._eager(3, param_update="nearest", state_dtype="float8", state_rounding="nearest")
+    out = K._f8_states_update(self._j(p), self._j(self.grads[2]), self._j(st["exp_avg_f8"].view(-1, 256)),
+                              self._j(st["exp_avg_scale"].view(-1, 1)),
+                              self._j(st["exp_avg_sq_sqrt_f8"].view(-1, 256)),
+                              self._j(st["exp_avg_sq_sqrt_scale"].view(-1, 1)), seed, self._coef(3), *args, 256,
+                              False, False)
+    self.assertTrue(torch.equal(self._t(out[0]), ref))
+    self.assertTrue(torch.equal(self._t(out[1]).float(), ref_st["exp_avg_f8"].view(-1, 256).float()))
+    self.assertTrue(torch.equal(self._t(out[3]).float(), ref_st["exp_avg_sq_sqrt_f8"].view(-1, 256).float()))
+
+  def test_stochastic_kernel_unbiased(self):
+    import jax
+
+    K, np = self.K, self.np
+    p, st = self._eager(2)
+    g = self.grads[2].float()
+    m32 = st["exp_avg"].float() * self.B1 + g * (1 - self.B1)
+    v32 = st["exp_avg_sq"].float() * self.B2 + g * g * (1 - self.B2)
+    x = p.float()
+    coef = self._t(self._coef(3))
+    x_new = x - x * self.LR * self.WD - m32 / (v32.sqrt() * coef[2] + self.EPS) * coef[1]
+    f = jax.jit(K._bf16_states_update, static_argnums=(6, 7, 8, 9, 10))
+    acc = np.zeros(self.n)
+    draws = 64
+    for i in range(draws):
+      out = f(self._j(p), self._j(self.grads[2]), self._j(st["exp_avg"]), self._j(st["exp_avg_sq"]),
+              self.jnp.asarray([i, 7 * i + 1, 3 * i + 2, 11 * i + 5], self.jnp.int32), self._coef(3), self.B1, self.B2,
+              self.EPS, True, True)
+      acc += self._t(out[0]).float().numpy()
+    d = (x_new - x).numpy()
+    retained = float(((acc / draws - x.numpy()) * d).sum() / (d * d).sum())
+    self.assertAlmostEqual(retained, 1.0, delta=0.05)
 
 
 if __name__ == "__main__":

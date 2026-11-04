@@ -90,6 +90,7 @@ PARAM_UPDATES = ("stochastic", "kahan", "nearest")
 STATE_DTYPES = ("bfloat16", "float32", "float8")
 STATE_ROUNDINGS = ("stochastic", "nearest")
 SR_IMPLS = ("bits", "arith")
+TPU_KERNELS = ("auto", "on", "off")
 
 _F8 = torch.float8_e4m3fn
 _F8_MAX = 448.0
@@ -247,7 +248,12 @@ class LowPrecisionAdamW(Optimizer):
   ``state_rounding``. ``sr_impl`` selects the stochastic-rounding kernel:
   ``"bits"`` (integer add on the float32 bit pattern, exact) or ``"arith"``
   (additive noise of one bf16 spacing, no bit casts). fp32 parameters get a
-  plain fp32 AdamW update. ``foreach`` / ``fused`` arguments (passed by
+  plain fp32 AdamW update. ``tpu_kernel`` (``"auto"``, ``"on"``, ``"off"``)
+  runs the update of bf16 parameters with bf16 or float8 moments on TPU as one
+  fused program per parameter (``kernels/low_precision_adamw_kernels.py``;
+  random bits from ``jax.random`` instead of ``torch.randint``, same
+  distribution); ``"auto"`` uses it when the parameter lives on a TPU and the
+  kernel module imports. ``foreach`` / ``fused`` arguments (passed by
   TorchTitan's optimizer container) are accepted and ignored.
   """
 
@@ -264,6 +270,7 @@ class LowPrecisionAdamW(Optimizer):
       state_rounding: str = "stochastic",
       block_size: int = 256,
       sr_impl: str = "bits",
+      tpu_kernel: str = "auto",
       foreach: bool | None = None,
       fused: bool | None = None,
   ) -> None:
@@ -276,6 +283,8 @@ class LowPrecisionAdamW(Optimizer):
       raise ValueError(f"state_rounding must be one of {STATE_ROUNDINGS}, got {state_rounding!r}")
     if sr_impl not in SR_IMPLS:
       raise ValueError(f"sr_impl must be one of {SR_IMPLS}, got {sr_impl!r}")
+    if tpu_kernel not in TPU_KERNELS:
+      raise ValueError(f"tpu_kernel must be one of {TPU_KERNELS}, got {tpu_kernel!r}")
     if not 0.0 <= betas[0] < 1.0 or not 0.0 <= betas[1] < 1.0:
       raise ValueError(f"invalid betas {betas}")
     if block_size <= 0:
@@ -290,12 +299,15 @@ class LowPrecisionAdamW(Optimizer):
         state_rounding=state_rounding,
         block_size=block_size,
         sr_impl=sr_impl,
+        tpu_kernel=tpu_kernel,
     )
     super().__init__(params, defaults)
     rank = _rank()
     # Odd multipliers spread consecutive ranks over the 16- and 20-bit fields.
     self._salt16 = (rank * 0x9E37 + 0x79B9) & 0xFFFF
     self._salt20 = (rank * 0x9E3779 + 0x7F4A7) & 0xFFFFF
+    self._salt31 = (rank * 0x9E3779B1 + 0x632BE5AB) & 0x7FFFFFFF
+    self._kernels: Any = None
 
   def load_state_dict(self, state_dict: dict[str, Any]) -> None:
     """``Optimizer.load_state_dict`` without casting the states to the parameter dtype.
@@ -374,11 +386,12 @@ class LowPrecisionAdamW(Optimizer):
         lr * group["weight_decay"],
         lr * adam_ratio_bound(beta1, beta2, step),
     )
+    packed = None
     if device.type != "cpu":
       packed = torch.tensor(values, dtype=torch.float32, device=device)
       values = tuple(packed[i] for i in range(len(values)))
-    cache[key] = values
-    return values
+    cache[key] = (values, packed)
+    return cache[key]
 
   # ------------------------------------------------------------------- step
 
@@ -404,9 +417,79 @@ class LowPrecisionAdamW(Optimizer):
           continue
         state["step"] += 1
         step = int(state["step"].item())
-        coef = self._coefficients(group, step, _local(p).device, cache)
-        self._update(p, state, group, coef)
+        coef, packed = self._coefficients(group, step, _local(p).device, cache)
+        kernels = self._tpu_kernels(group, p, state) if packed is not None else None
+        if kernels is not None:
+          self._update_fused(kernels, p, state, group, packed)
+        else:
+          self._update(p, state, group, coef)
     return loss
+
+  def _tpu_kernels(self, group: dict[str, Any], p: torch.Tensor, state: dict[str, Any]) -> Any:
+    """The fused TPU kernel module when it applies to this parameter, else None."""
+    mode = group["tpu_kernel"]
+    if mode == "off" or _local(p).device.type != "tpu" or group["sr_impl"] != "bits":
+      return None
+    if _local(p).dtype != torch.bfloat16 or _state_format(state) == "float32":
+      return None
+    if self._kernels is None:
+      try:
+        from torchtitan.experiments.tpu.kernels import low_precision_adamw_kernels as kernels
+
+        if not kernels.AVAILABLE:
+          raise ImportError("torch_tpu is not importable")
+      except ImportError:
+        if mode == "on":
+          raise
+        kernels = False
+      self._kernels = kernels
+    return self._kernels or None
+
+  def _update_fused(self, kernels: Any, p: torch.Tensor, state: dict[str, Any], group: dict[str, Any],
+                    coef: torch.Tensor) -> None:
+    """The same update as ``_update`` in one fused TPU program per parameter."""
+    beta1, beta2 = group["betas"]
+    eps = float(group["eps"])
+    stochastic_states = group["state_rounding"] == "stochastic"
+    p_l = _local(p)
+    g_l = _local(p.grad)
+    seed = torch.randint(0, 0x7FFFFFFF, (4,), dtype=torch.int32, device=p_l.device)
+    seed = torch.bitwise_xor(seed, self._salt31)
+    kahan = group["param_update"] == "kahan"
+    residual = _local(state["residual"]) if kahan else None
+    if _state_format(state) == "float8":
+      bs = int(group["block_size"])
+      mq, vq = _local(state["exp_avg_f8"]), _local(state["exp_avg_sq_sqrt_f8"])
+      ms, vs = _local(state["exp_avg_scale"]), _local(state["exp_avg_sq_sqrt_scale"])
+      mq, vq = mq.view(-1, bs), vq.view(-1, bs)
+      ms, vs = ms.view(-1, 1), vs.view(-1, 1)
+      if kahan:
+        new_p, nmq, nms, nvq, nvs, new_r = kernels.f8_states_kahan_update(
+            p_l, g_l, mq, ms, vq, vs, residual, seed, coef, float(beta1), float(beta2), eps, bs,
+            stochastic_states)
+        residual.copy_(new_r)
+      else:
+        new_p, nmq, nms, nvq, nvs = kernels.f8_states_update(
+            p_l, g_l, mq, ms, vq, vs, seed, coef, float(beta1), float(beta2), eps, bs,
+            group["param_update"] == "stochastic", stochastic_states)
+      mq.copy_(nmq.view(mq.shape))
+      ms.copy_(nms.view(ms.shape))
+      vq.copy_(nvq.view(vq.shape))
+      vs.copy_(nvs.view(vs.shape))
+    else:
+      m_l = _local(state["exp_avg"])
+      v_l = _local(state["exp_avg_sq"])
+      if kahan:
+        new_p, nm, nv, new_r = kernels.bf16_states_kahan_update(
+            p_l, g_l, m_l, v_l, residual, seed, coef, float(beta1), float(beta2), eps, stochastic_states)
+        residual.copy_(new_r)
+      else:
+        new_p, nm, nv = kernels.bf16_states_update(
+            p_l, g_l, m_l, v_l, seed, coef, float(beta1), float(beta2), eps,
+            group["param_update"] == "stochastic", stochastic_states)
+      m_l.copy_(nm)
+      v_l.copy_(nv)
+    p_l.copy_(new_p)
 
   def _update(self, p: torch.Tensor, state: dict[str, Any], group: dict[str, Any], coef) -> None:
     _, step_size, inv_sqrt_bc2, lr_wd, step_bound = coef
@@ -511,6 +594,7 @@ def low_precision_adamw_config(
     state_rounding: str = "stochastic",
     block_size: int = 256,
     sr_impl: str = "bits",
+    tpu_kernel: str = "auto",
 ) -> OptimizersContainer.Config:
   """One catch-all ``LowPrecisionAdamW`` group (defaults match ``default_adamw``)."""
   group = ParamGroupConfig(
@@ -526,6 +610,7 @@ def low_precision_adamw_config(
           state_rounding=state_rounding,
           block_size=block_size,
           sr_impl=sr_impl,
+          tpu_kernel=tpu_kernel,
       ),
   )
   return LowPrecisionOptimizersContainer.Config(param_groups=[group], implementation="for-loop")
