@@ -410,6 +410,58 @@ class FusedKernelTest(unittest.TestCase):
     self.assertTrue(torch.equal(self._t(out[1]).float(), ref_st["exp_avg_f8"].view(-1, 256).float()))
     self.assertTrue(torch.equal(self._t(out[3]).float(), ref_st["exp_avg_sq_sqrt_f8"].view(-1, 256).float()))
 
+  def _cpu_kernels(self):
+    """The registered ops' interface on top of the raw JAX functions (JAX's CPU
+    backend), so that ``LowPrecisionAdamW._update_fused`` runs without TorchTPU."""
+    import types
+
+    def op(fn, num_static):
+      def call(*args):
+        tensors, static = args[:-num_static], args[-num_static:]
+        return tuple(self._t(o) for o in fn(*(self._j(a) for a in tensors), *static))
+
+      return call
+
+    K = self.K
+    return types.SimpleNamespace(
+        bf16_states_update=op(K._bf16_states_update, 5),
+        bf16_states_kahan_update=op(K._bf16_states_kahan_update, 4),
+        f8_states_update=op(K._f8_states_update, 6),
+        f8_states_kahan_update=op(K._f8_states_kahan_update, 5),
+    )
+
+  def test_fused_update_path_matches_eager(self):
+    # _update_fused (state views, copies back, seed and coefficients) with the
+    # deterministic kernels: step 3 equals the eager step 3 bit for bit, except
+    # the fp32 float8 block scales (absmax / 448), which may differ in the last
+    # bit: XLA computes the division by the constant as a multiplication by its
+    # reciprocal, PyTorch rounds the quotient.
+    kernels = self._cpu_kernels()
+    for kw in (dict(param_update="nearest"), dict(param_update="kahan"),
+               dict(param_update="nearest", state_dtype="float8"),
+               dict(param_update="kahan", state_dtype="float8")):
+      with self.subTest(**kw):
+        ref, ref_st = self._eager(3, state_rounding="nearest", **kw)
+        p = torch.nn.Parameter(self.p0.clone())
+        opt = LowPrecisionAdamW([p], lr=self.LR, betas=(self.B1, self.B2), eps=self.EPS,
+                                weight_decay=self.WD, tpu_kernel="off", state_rounding="nearest", **kw)
+        for g in self.grads[:2]:
+          p.grad = g
+          opt.step()
+        p.grad = self.grads[2]
+        state = opt.state[p]
+        state["step"] += 1
+        with torch.no_grad():  # as in step()
+          opt._update_fused(kernels, p, state, opt.param_groups[0], self._t(self._coef(3)))
+        self.assertTrue(torch.equal(p.detach(), ref))
+        self.assertEqual(sorted(state), sorted(ref_st))
+        for key, value in ref_st.items():
+          self.assertEqual(state[key].dtype, value.dtype, key)
+          if key.endswith("_scale"):
+            torch.testing.assert_close(state[key], value, rtol=2.0**-23, atol=0.0, msg=key)
+          else:
+            self.assertTrue(torch.equal(state[key].float(), value.float()), key)
+
   def test_stochastic_kernel_unbiased(self):
     import jax
 
