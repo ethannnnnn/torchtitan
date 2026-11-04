@@ -21,6 +21,7 @@
   (e.g. a Cloud Storage FUSE mount), a ``gs://`` URL (gcsfs), or local
   staging plus parallel object upload.
 * ``gcs``: Cloud Storage credentials and parallel transfer helpers.
+* ``flush``: makes every rank leave a DCP save together on TorchTPU.
 
 Nothing in this package is model specific; models plug in through their
 TorchTitan ``StateDictAdapter``.
