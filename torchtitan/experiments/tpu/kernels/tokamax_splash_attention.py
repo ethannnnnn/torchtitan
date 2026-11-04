@@ -211,12 +211,12 @@ def _make_splash_attention_fn(
     )
 
   # Static mask infos and kernel kwargs from creation time.
-  # Packed documents are masked only by the runtime segment IDs below, over the
-  # static causal/local block metadata (the batch-native masking mode of
-  # splash_attention.py). TODO: document-aware block skipping. Tokamax's
-  # MaskInfo is a compacted active-block list (active_rows/active_cols), not
-  # the block_mask grid that splash_attention._document_aware_mask_info
-  # rewrites, so skipping cross-document blocks needs a per-example recompaction.
+  # Packed documents: the runtime segment IDs mask every visited tile exactly,
+  # and tokamax >= 0.0.17 also drops the tiles whose q and kv segment-id ranges
+  # are disjoint before launching (`_refine_mask_info_with_segments`, in both
+  # the forward and the dkv pass), so cross-document tiles are skipped without
+  # anything here. Under vmap that pruning is the union over the batch;
+  # use_batch_loop_fwd runs the forward per example instead.
   fwd_mask_info = splash_kernel.fwd_mask_info
   dkv_mask_info = splash_kernel.dkv_mask_info
   _mask_value = splash_kernel.kwargs.get("mask_value", _DEFAULT_MASK_VALUE)

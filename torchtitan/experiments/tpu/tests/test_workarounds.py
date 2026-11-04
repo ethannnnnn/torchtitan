@@ -1,5 +1,7 @@
 """Unit tests for TPU workarounds in torchtitan.experiments.tpu.workarounds."""
 
+import logging
+
 from absl.testing import absltest
 from absl.testing import parameterized
 import torch
@@ -503,26 +505,32 @@ class WorkaroundsTest(parameterized.TestCase):
     torch.testing.assert_close(captured[1], expected)
     self.assertIsNone(captured[2])
 
-  def test_tokamax_patch_warns_on_unsupported_block_skipping(self):
-    """Requesting document-aware block skipping must not be silently dropped."""
+  def test_tokamax_patch_notes_that_tokamax_skips_blocks_itself(self):
+    """Requested document-aware block skipping is noted, not warned about.
+
+    Tokamax drops the tiles whose q and kv segment-id ranges are disjoint by
+    itself, so the request is not silently dropped: the patch says at INFO
+    level that Tokamax does it, and there is nothing to warn about.
+    """
     from torchtitan.experiments.tpu.kernels import tokamax_splash_attention  # pylint: disable=g-import-not-at-top
 
     config_cls = tokamax_splash_attention.TokamaxConfig
     saved = {k: v for k, v in vars(config_cls).items() if not k.startswith("_")}
     self.addCleanup(lambda: [setattr(config_cls, k, v) for k, v in saved.items()])
 
-    model, sa = self._tokamax_patch_fixture()
-    self.assertTrue(sa.sa_use_document_aware_block_skipping, "precondition")
-    with self.assertLogs(workarounds.logger, level="WARNING") as logs:
-      workarounds.use_tokamax_splash_attention_patch(model, sa)
-    self.assertTrue(
-        any("use_document_aware_block_skipping" in m for m in logs.output)
-    )
-
-    model, sa = self._tokamax_patch_fixture()
-    sa.sa_use_document_aware_block_skipping = False
-    with self.assertNoLogs(workarounds.logger, level="WARNING"):
-      workarounds.use_tokamax_splash_attention_patch(model, sa)
+    for requested in (True, False):
+      model, sa = self._tokamax_patch_fixture()
+      sa.sa_use_document_aware_block_skipping = requested
+      with self.assertLogs(workarounds.logger, level="INFO") as logs:
+        workarounds.use_tokamax_splash_attention_patch(model, sa)
+      # The flag name also appears in the dropped-kwargs note; match the note
+      # about Tokamax's own pruning.
+      notes = [m for m in logs.output if "prunes tiles" in m]
+      self.assertLen(notes, 1 if requested else 0, logs.output)
+      self.assertEqual(
+          [r.getMessage() for r in logs.records if r.levelno >= logging.WARNING],
+          [],
+      )
 
   @parameterized.parameters("ulysses", "all_gather")
   def test_splash_attention_patch_plugs_into_cp_attention(self, strategy):
