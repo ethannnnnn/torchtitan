@@ -6,9 +6,13 @@
 
 """CPU tests: the full-parameter SFT recipes resolve to consistent trainer configs.
 
-The recipes build on the post-training SFT recipe module
-(``post_training/config_registry.py``) and the Muse Spark TPU port
-(``muse_spark``); the tests skip when either is not importable.
+The recipes build on the post-training SFT layer (``config_registry``,
+``lora``, ``sft_config``, ``sft_data``) and on the Muse Spark TPU package
+(``muse_spark``: the model, expert placement and the step recipes, whose
+module imports ``checkpointing``). Building the configs imports the TPU MoE
+kernel modules, which need TorchTPU or an import-only CPU stand-in for it on
+PYTHONPATH. The tests skip, naming the missing modules, unless all of these
+are importable.
 
 Run: python -m pytest -q torchtitan/experiments/tpu/post_training/tests/test_full_param_sft.py
 """
@@ -20,20 +24,32 @@ import importlib.util
 import os
 import unittest
 
+# Modules from other changes (and TorchTPU) that the recipes import, directly or
+# through the step recipes' module.
 _DEPENDENCIES = (
+    "torch_tpu",
     "torchtitan.experiments.tpu.post_training.config_registry",
+    "torchtitan.experiments.tpu.post_training.lora",
+    "torchtitan.experiments.tpu.post_training.sft_config",
+    "torchtitan.experiments.tpu.post_training.sft_data",
     "torchtitan.experiments.tpu.muse_spark",
+    "torchtitan.experiments.tpu.muse_spark.expert_placement",
+    "torchtitan.experiments.tpu.muse_spark.spark_64chip_recipes",
+    "torchtitan.experiments.tpu.checkpointing.resume_check",
 )
 
 
 def _available(name: str) -> bool:
     try:
-        return importlib.util.find_spec(name) is not None
+        spec = importlib.util.find_spec(name)
     except ImportError:  # a parent package is missing
         return False
+    # A directory without __init__.py is found as a namespace package (origin
+    # None): sibling files without the package itself.
+    return spec is not None and spec.origin is not None
 
 
-HAVE_DEPENDENCIES = all(_available(name) for name in _DEPENDENCIES)
+MISSING_DEPENDENCIES = [name for name in _DEPENDENCIES if not _available(name)]
 
 # Recipe environment for the expert-parallel / placement recipes (paths are not read here).
 RECIPE_ENV = {
@@ -58,7 +74,7 @@ def _has_ep_grad_reduce_dtype(model_config) -> bool:
     return "ep_grad_reduce_dtype" in {f.name for f in dataclasses.fields(model_config)}
 
 
-@unittest.skipUnless(HAVE_DEPENDENCIES, "needs post_training.config_registry and muse_spark")
+@unittest.skipIf(MISSING_DEPENDENCIES, "not importable: " + ", ".join(MISSING_DEPENDENCIES))
 class FullParamSFTRecipeTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -105,7 +121,10 @@ class FullParamSFTRecipeTest(unittest.TestCase):
                 self.assertTrue(splash.use_tokamax_splash_attention_kernel)
                 self.assertEqual((splash.sa_block_q, splash.sa_block_kv, splash.sa_block_q_dkv),
                                  (512, 1024, 1024))
-                self.assertFalse(splash.sa_use_base2_exp)
+                # The Tokamax Splash knobs are config fields of a separate change;
+                # without them the TPU7x settings keep the kernel defaults.
+                if hasattr(splash, "sa_use_base2_exp"):
+                    self.assertFalse(splash.sa_use_base2_exp)
                 self.assertEqual(config.libtpu_init_flags.get("xla_tpu_dvfs_p_state"), "7")
                 self.assertTrue(config.parallelism.enable_tpu_topo_mesh)
                 self.assertEqual(config.parallelism.fsdp_reshard_after_forward, "always")
@@ -221,15 +240,24 @@ class FullParamSFTRecipeTest(unittest.TestCase):
             os.environ["SPARK_EXPERT_PLACEMENT_FILE"] = saved
 
     def test_update_probe_from_environment(self):
+        from unittest import mock
+
         from torchtitan.experiments.tpu import update_probe
 
+        name = "muse_spark_816b_a42b_ctr_sft_full_tpu7x"
         try:
-            self._build("muse_spark_816b_a42b_ctr_sft_full_tpu7x")
+            self._build(name)
             self.assertFalse(update_probe._INSTALLED)
-            self._build("muse_spark_816b_a42b_ctr_sft_full_tpu7x", SPARK_UPDATE_PROBE="16")
+            self._build(name, SPARK_UPDATE_PROBE="16")
             self.assertTrue(update_probe._INSTALLED)
         finally:
             update_probe.uninstall_update_probe()
+        # The recipe's own parameter selection unless SPARK_UPDATE_PROBE_PARAMS is set.
+        with mock.patch.object(self.fp, "install_update_probe") as install:
+            self._build(name, SPARK_UPDATE_PROBE="16")
+            self._build(name, SPARK_UPDATE_PROBE="8", SPARK_UPDATE_PROBE_PARAMS=r"layers\.1\.")
+        self.assertEqual(install.call_args_list, [mock.call(16, self.fp.SPARK_UPDATE_PROBE_PATTERN),
+                                                  mock.call(8, r"layers\.1\.")])
 
     def test_placement_and_lora_comparison_recipes(self):
         config = self.fp.muse_spark_816b_a42b_ctr_sft_measure_placement_tpu7x()

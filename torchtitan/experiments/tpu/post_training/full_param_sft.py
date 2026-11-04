@@ -25,6 +25,11 @@ weights and moments (16 bytes per parameter, about 13 TB) do not fit:
    skewed, so the expert placement is measured on the same SFT rows first
    (``muse_spark_816b_a42b_ctr_sft_measure_placement_tpu7x``).
 
+The module needs the post-training SFT layer (``config_registry``, ``lora``,
+``sft_config``, ``sft_data``) to import, and the Muse Spark TPU package
+(``muse_spark``: the model and its TPU7x settings, expert parallelism and
+placement, and the step recipes' checkpoint reader) to build its recipes.
+
 Registered recipes (``--module torchtitan.experiments.tpu.post_training.full_param_sft``),
 with bytes per parameter for weights + gradients + optimizer states:
 
@@ -66,8 +71,9 @@ constant), ``SPARK_EP`` (8), ``SPARK_EP_CAPACITY`` (receive buffer, 2.0),
 length, 8,192; 4,096 keeps 1M tokens per step on the 256 ranks of a 4x4x8
 slice), ``SPARK_GRAD_REDUCE`` / ``SPARK_EXPERT_GRAD_REDUCE``, and
 ``SPARK_UPDATE_PROBE=<n>`` (``SPARK_UPDATE_PROBE_PARAMS``: parameter-name
-regex), which samples ``n`` elements of each probed tensor and prints per step
-the fraction of fp32 AdamW's update the run keeps (``../update_probe.py``).
+regex, default ``SPARK_UPDATE_PROBE_PATTERN``), which samples ``n`` elements of
+each probed tensor and prints per step the fraction of fp32 AdamW's update the
+run keeps (``../update_probe.py``).
 The flavor comes from ``SPARK_FLAVOR`` as in ``config_registry``. The
 full-parameter recipes only load the checkpoint: a full-parameter save writes
 the weights plus the optimizer state (several TB for the full model); add
@@ -134,6 +140,10 @@ SPARK_FULL_OPTIMIZERS = {
     "fp32": FullParamOptimizer("float32"),
 }
 SPARK_FULL_SFT_LR = 1e-6
+# Parameters the update probe samples unless SPARK_UPDATE_PROBE_PARAMS is set: the
+# first, a middle and the last of the 62 decoder layers, the embeddings, the head
+# and the final norm.
+SPARK_UPDATE_PROBE_PATTERN = r"(^|\.)layers\.(0|31|61)\.|tok_embeddings|lm_head|(^|\.)norm\."
 
 
 def _env_float(name: str, default: float) -> float:
@@ -293,7 +303,7 @@ def _spark_sft_full(optimizer: str) -> SFTTrainerConfig:
     )
     install_update_probe(
         int(os.environ.get("SPARK_UPDATE_PROBE", "0") or 0),
-        os.environ.get("SPARK_UPDATE_PROBE_PARAMS", "") or None,
+        os.environ.get("SPARK_UPDATE_PROBE_PARAMS", "") or SPARK_UPDATE_PROBE_PATTERN,
     )
     return config
 
