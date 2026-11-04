@@ -33,6 +33,9 @@ Runs the upstream TPU trainer startup with ``SFTTPUTrainer``:
   a killed run. ``"peft"`` writes only the PEFT adapter (no resume state),
   ``"full"`` keeps TorchTitan's DCP save of the whole model, ``"none"`` saves
   nothing.
+* On TPU every rank leaves each checkpoint save together
+  (``checkpointing/flush.py``; ``SFT_CHECKPOINT_FLUSH=1`` forces it on any
+  device, ``0`` turns it off).
 * Held-out loss (``sft.val_data_path``, e.g. the dataset's ``sft/val.jsonl``):
   before the first step, every ``sft.val_every`` steps and after the last
   step, a forward-only pass over every held-out record (packed like the
@@ -106,6 +109,22 @@ class SFTTPUTrainer(TPUTrainer):
         self._rank = int(os.environ.get("RANK", "0"))
         self.lora_exports: list[str] = []
         self._install_lora_save(config)
+        # TorchTPU: every rank leaves each checkpoint save together, so a crash
+        # right after a save cannot strand ranks 1..N-1 in DCP's last collective
+        # (checkpointing/flush.py). SFT_CHECKPOINT_FLUSH=1 forces it on any
+        # device, 0 turns it off.
+        flush = os.environ.get("SFT_CHECKPOINT_FLUSH", "")
+        if flush == "1" or (flush != "0" and getattr(self.device, "type", "") == "tpu"):
+            try:
+                from torchtitan.experiments.tpu.checkpointing.flush import flush_after_saves
+            except ImportError as exc:
+                raise ImportError(
+                    "every rank leaves a checkpoint save together through "
+                    "torchtitan.experiments.tpu.checkpointing.flush; "
+                    "SFT_CHECKPOINT_FLUSH=0 turns this off"
+                ) from exc
+
+            flush_after_saves(self.checkpointer, self.device)
         self._last_grad_norm: torch.Tensor | None = None
         self._records_all_ranks = os.environ.get("SFT_RECORDS_ALL_RANKS", "0") == "1"
         self._fault_kill_step = int(os.environ.get("SFT_FAULT_KILL_STEP", "0") or 0)

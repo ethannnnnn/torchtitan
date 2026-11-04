@@ -89,7 +89,9 @@ every assistant turn.
 * `full`: TorchTitan's DCP save of the whole model and training state.
 * `none`: no saves.
 
-Runs without LoRA always use TorchTitan's saves.
+Runs without LoRA always use TorchTitan's saves. On TPU every rank leaves each
+save together (`../checkpointing/flush.py`; `SFT_CHECKPOINT_FLUSH=1` forces it
+on any device, `0` turns it off).
 
 Resume checks: with `SFT_RECORDS_ALL_RANKS=1` every rank appends one JSON line
 per step to `<dump_folder>/sft-records/rank-NNNNN.jsonl` (its loss share, the
