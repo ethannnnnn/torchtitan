@@ -67,10 +67,26 @@ class BaseTokenizer(ABC, Configurable):
 
             return datetime.now().strftime(fmt)
 
+        class GenerationBlock(jinja2.ext.Extension):
+            """Render ``{% generation %}...{% endgeneration %}`` as its body.
+
+            Hugging Face chat templates (e.g. Muse Spark Open) mark assistant
+            turns with this block so that Transformers can return an assistant
+            token mask; for plain rendering the block is a no-op.
+            """
+
+            tags = {"generation"}
+
+            def parse(self, parser):
+                next(parser.stream)
+                return parser.parse_statements(
+                    ("name:endgeneration",), drop_needle=True
+                )
+
         env = jinja2.sandbox.ImmutableSandboxedEnvironment(
             trim_blocks=True,
             lstrip_blocks=True,
-            extensions=[jinja2.ext.loopcontrols],
+            extensions=[jinja2.ext.loopcontrols, GenerationBlock],
         )
         env.globals["raise_exception"] = raise_exception
         env.globals["strftime_now"] = strftime_now

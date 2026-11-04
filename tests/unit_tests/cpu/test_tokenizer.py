@@ -462,6 +462,31 @@ class TestBaseTokenizerChatTemplate(unittest.TestCase):
         result = tok.apply_chat_template([])
         self.assertEqual(result, str(datetime.now().year))
 
+    def test_generation_block_renders_its_body(self):
+        """HF {% generation %} blocks render as if the tags were absent.
+
+        Transformers uses them to build assistant-token masks; without the
+        extension the template does not compile (unknown tag 'generation').
+        """
+        tagged = (
+            "{% for msg in messages %}<|im_start|>{{ msg.role }}\n"
+            "{% if msg.role == 'assistant' %}"
+            "{%- generation %}{{ msg.content }}<|im_end|>\n{% endgeneration %}"
+            "{% else %}{{ msg.content }}<|im_end|>\n{% endif %}"
+            "{% endfor %}"
+        )
+        untagged = tagged.replace("{%- generation %}", "").replace(
+            "{% endgeneration %}", ""
+        )
+        expected = (
+            "<|im_start|>user\nHello<|im_end|>\n"
+            "<|im_start|>assistant\nHi there<|im_end|>\n"
+        )
+        for template in (tagged, untagged):
+            tok = DummyTokenizer()
+            tok.set_chat_template(template)
+            self.assertEqual(tok.apply_chat_template(SAMPLE_MESSAGES), expected)
+
 
 class TestHuggingFaceChatTemplateAutoLoad(unittest.TestCase):
     """Tests for HuggingFaceTokenizer auto-loading chat_template from config."""
