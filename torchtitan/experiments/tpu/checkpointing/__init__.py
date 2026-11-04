@@ -9,6 +9,12 @@
 * ``lora_checkpoint``: adapter-only checkpoints for LoRA training (resume
   state is the adapters plus their optimizer state; the frozen base is
   re-read from the Hugging Face checkpoint) and PEFT adapter export/import.
+* ``hf_export``: streaming, layout-preserving export of trained weights to
+  the original Hugging Face safetensors layout (same shard files, same
+  tensor-to-file map, same dtypes), either from a full-parameter DCP
+  checkpoint or by merging a PEFT LoRA adapter into the base checkpoint.
+  Work is split by shard file, so many hosts can export in parallel;
+  ``hf_export_check`` checks it at full scale on a real checkpoint.
 * ``dcp_parallel``: multi-threaded DCP writer and parallel DCP readers for a
   TorchTitan ``CheckpointManager``.
 * ``dcp_io_bench``: DCP save/load throughput benchmark against a POSIX path

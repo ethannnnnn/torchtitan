@@ -560,6 +560,65 @@ class ResumeTest(unittest.TestCase):
               f"step-3 checkpoint {nbytes / 1e6:.2f} MB ({len(model_keys)} adapter tensors, "
               f"{trainable} trainable vs {frozen} frozen params)")
 
+    def test_lora_to_peft_to_merged_hf(self):
+        """TT LoRA weights -> PEFT adapter -> merged original-layout export -> transformers."""
+        from transformers import MuseSparkForConditionalGeneration
+
+        from torchtitan.experiments.tpu.checkpointing.hf_export import HfLayout, PeftSource, export_hf
+        from torchtitan.experiments.tpu.checkpointing.lora_checkpoint import (
+            load_peft_adapter,
+            save_peft_adapter,
+        )
+
+        model, adapter = _build(lora=True, init_seed=3)
+        from safetensors.torch import load_file
+
+        hf = {k: v for k, v in load_file(os.path.join(TINY_DIR, "model.safetensors")).items()
+              if k.startswith("model.language_model.") or k == "lm_head.weight"}
+        model.load_state_dict(adapter.from_hf(hf), strict=False)
+        g = torch.Generator().manual_seed(5)
+        with torch.no_grad():
+            for n, p in model.named_parameters():
+                if n.endswith("lora_b.weight"):
+                    p.copy_(0.2 * torch.randn(p.shape, generator=g))
+        adir = os.path.join(self.tmp, "adapter")
+        rep = save_peft_adapter([model], adapter, adir, rank=4, alpha=8.0,
+                                base_model_name_or_path="tiny", dtype=None)
+        self.assertEqual(rep["target_modules"], ["k_proj", "o_proj", "q_proj", "v_proj"])
+        # Round trip into a fresh LoRA model.
+        fresh, adapter2 = _build(lora=True, init_seed=4)
+        self.assertEqual(load_peft_adapter([fresh], adapter2, adir), rep["tensors"])
+        for n, p in model.named_parameters():
+            if ".lora_" in n:
+                self.assertTrue(torch.equal(p, dict(fresh.named_parameters())[n]), n)
+        out = os.path.join(self.tmp, "merged")
+        export_hf(TINY_DIR, out, PeftSource(adir, HfLayout(TINY_DIR)))
+        hf_model = MuseSparkForConditionalGeneration.from_pretrained(
+            out, dtype=torch.float32, attn_implementation="eager").eval()
+        tokens, _ = _batch(0, s=70)
+        b, s = tokens.shape
+        pos = torch.arange(s).repeat(b)
+        with torch.no_grad():
+            unmerged = model(tokens.reshape(-1), positions=pos).float()
+            # Reference: the same model with W <- bf16(W + scale * B @ A), B <- 0,
+            # i.e. exactly the weights the original-layout (bf16) export holds.
+            for name, mod in model.named_modules():
+                if hasattr(mod, "lora_a") and hasattr(mod, "lora_b"):
+                    w = mod.weight
+                    merged = w.float() + (8.0 / 4) * (mod.lora_b.weight.float() @ mod.lora_a.weight.float())
+                    w.copy_(merged.to(torch.bfloat16).float())
+                    mod.lora_b.weight.zero_()
+            want = model(tokens.reshape(-1), positions=pos).float()
+            got = hf_model(input_ids=tokens, use_cache=False).logits.float().reshape(b * s, -1)
+            base = MuseSparkForConditionalGeneration.from_pretrained(
+                TINY_DIR, dtype=torch.float32, attn_implementation="eager").eval()
+            base_logits = base(input_ids=tokens, use_cache=False).logits.float().reshape(b * s, -1)
+        err = (got - want).abs().max().item()
+        print(f"TT LoRA -> PEFT -> merged HF export: max|HF(export) - TT(merged weights)| {err:.3e}; "
+              f"adapter effect {(base_logits - unmerged).abs().max().item():.3e}; "
+              f"bf16 rounding of merged weights {(want - unmerged).abs().max().item():.3e}")
+        self.assertLess(err, 1e-5)
+
 
 if __name__ == "__main__":
     unittest.main()
