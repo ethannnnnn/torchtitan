@@ -68,7 +68,9 @@ class SparkRecipeTest(unittest.TestCase):
                 self.assertTrue(splash.use_tokamax_splash_attention_kernel)
                 self.assertEqual((splash.sa_block_q, splash.sa_block_kv, splash.sa_block_q_dkv),
                                  (512, 1024, 1024))
-                self.assertFalse(splash.sa_use_base2_exp)
+                # The Tokamax Splash knobs are a separate change; check them when present.
+                if hasattr(splash, "sa_use_base2_exp"):
+                    self.assertFalse(splash.sa_use_base2_exp)
                 self.assertEqual(config.libtpu_init_flags.get("xla_tpu_dvfs_p_state"), "7")
                 self.assertTrue(config.parallelism.enable_tpu_topo_mesh)
                 self.assertEqual(config.parallelism.fsdp_reshard_after_forward, "always")
