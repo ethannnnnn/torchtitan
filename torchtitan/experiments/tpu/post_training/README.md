@@ -168,7 +168,8 @@ the adapter-only checkpoint support of `../checkpointing/` installed, a LoRA
 kill-and-resume check on two ranks. With the Muse Spark TPU package installed
 and the tiny checkpoint's safetensors in the snapshot, the smoke and the
 held-out loss test add Muse Spark runs. Without TorchTPU, the runner puts the
-import-only stand-in of `tests/cpu_stubs/` on `PYTHONPATH`.
+shared import-only stand-in `../tests/cpu_stubs/` on `PYTHONPATH`. Each process
+uses `OMP_NUM_THREADS` threads (default 8).
 
 ## Sources
 

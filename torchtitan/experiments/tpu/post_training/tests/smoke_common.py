@@ -45,14 +45,20 @@ def has_muse_spark() -> bool:
     return importlib.util.find_spec("torchtitan.experiments.tpu.muse_spark") is not None
 
 
+LORA_CHECKPOINT_MODULE = "torchtitan.experiments.tpu.checkpointing.lora_checkpoint"
+
+
 def has_lora_checkpoint() -> bool:
     """True when the adapter-only checkpoint support (``sft.lora_save=adapter``)
-    of ``checkpointing/lora_checkpoint.py`` is importable."""
+    of ``checkpointing/lora_checkpoint.py`` is present. Only a missing module or
+    ``checkpointing`` package reads as absent: a ``checkpointing`` package that
+    fails to import raises, so the checks that need it do not skip silently."""
     try:
-        return importlib.util.find_spec(
-            "torchtitan.experiments.tpu.checkpointing.lora_checkpoint") is not None
-    except ImportError:
-        return False
+        return importlib.util.find_spec(LORA_CHECKPOINT_MODULE) is not None
+    except ModuleNotFoundError as exc:
+        if exc.name == LORA_CHECKPOINT_MODULE.rpartition(".")[0]:
+            return False
+        raise
 
 
 def debug_model_spec(seq_len: int = 512):
