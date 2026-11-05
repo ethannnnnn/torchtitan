@@ -70,7 +70,17 @@ from torchtitan.experiments.tpu.token_dispatcher import (
 from torchtitan.models.common.token_dispatcher import BaseEPTokenDispatcher
 
 # Live dispatchers, for buffer-fill monitoring (``max_buffer_fill``).
-_DISPATCHERS: "weakref.WeakSet[RaggedAllToAllTokenDispatcher]" = weakref.WeakSet()
+_DISPATCHERS: "weakref.WeakSet[BaseEPTokenDispatcher]" = weakref.WeakSet()
+
+
+def track_buffer_fill(dispatcher: BaseEPTokenDispatcher) -> None:
+    """Report a dispatcher through ``max_buffer_fill`` and ``max_dropped_fraction``.
+
+    The dispatcher keeps its largest fill in ``max_fill`` (and, if it drops
+    routes, its largest dropped fraction in ``max_drop``) as device tensors or
+    None. It is held weakly.
+    """
+    _DISPATCHERS.add(dispatcher)
 
 
 def max_dropped_fraction(reset: bool = True) -> float | None:
@@ -177,7 +187,12 @@ class _SlotTable:
         return self._cache[key]
 
 
-def _slot_of_table(slot_to_logical: list[int] | None) -> "_SlotTable | None":
+def slot_of_table(slot_to_logical: list[int] | None) -> "_SlotTable | None":
+    """The ``slot_of`` table of ``physical_expert_ids`` for an explicit placement.
+
+    ``slot_to_logical[p]`` is the logical expert in physical slot ``p``; it must
+    be a permutation. None (no explicit placement) gives None.
+    """
     return None if slot_to_logical is None else _SlotTable(slot_to_logical)
 
 
@@ -504,9 +519,9 @@ class RaggedAllToAllTokenDispatcher(BaseEPTokenDispatcher):
         self.exchange = config.exchange
         self.placement = config.placement
         self.slot_to_logical = config.slot_to_logical
-        self._slot_of = _slot_of_table(config.slot_to_logical)
+        self._slot_of = slot_of_table(config.slot_to_logical)
         self.max_fill: torch.Tensor | None = None
-        _DISPATCHERS.add(self)
+        track_buffer_fill(self)
 
     def _group(self):
         if self.ep_mesh is None:
@@ -720,4 +735,6 @@ __all__ = [
     "permute_rows",
     "plan_expert_major",
     "ragged_all_to_all",
+    "slot_of_table",
+    "track_buffer_fill",
 ]

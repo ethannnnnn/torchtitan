@@ -36,12 +36,12 @@ import torch.nn.functional as F
 
 from torchtitan.experiments.tpu.ragged_ep_dispatcher import (
     _assert_rows_fit,
-    _slot_of_table,
     a2a_plans,
     cap_to_buffer,
     logical_expert_of_slot,
     physical_expert_ids,
     plan_expert_major,
+    slot_of_table,
 )
 
 _TOP_K, _TOKENS, _DIM, _HIDDEN = 4, 64, 32, 48
@@ -290,11 +290,11 @@ def test_expert_placements_map_logical_ids_to_slots():
         assert logical.tolist() == _slot_to_logical(placement, num_experts, ep)
     permutation = _slot_to_logical("measured", num_experts, ep)
     slot = physical_expert_ids(
-        ids, num_experts, ep, "contiguous", _slot_of_table(permutation)
+        ids, num_experts, ep, "contiguous", slot_of_table(permutation)
     )
     assert torch.equal(torch.tensor(permutation)[slot], ids)
     with pytest.raises(ValueError, match="permutation"):
-        _slot_of_table([0, 0, 1, 2])
+        slot_of_table([0, 0, 1, 2])
     with pytest.raises(ValueError, match="unknown expert placement"):
         physical_expert_ids(ids, num_experts, ep, "striped")
 
