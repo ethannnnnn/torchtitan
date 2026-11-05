@@ -92,10 +92,8 @@ from torchtitan.experiments.tpu.tpu_job_config import TPUTrainerConfig
 from torchtitan.experiments.tpu.update_probe import install_update_probe
 
 from .config_registry import (
-    _base_config,
-    _spark,
-    _spark_parallel,
     apply_model_hooks,
+    base_config,
     BF16,
     MODEL_ASSETS,
     Precision,
@@ -103,6 +101,8 @@ from .config_registry import (
     SFT_DATA,
     SFT_FULL_SHAPE,
     SFT_LORA_SHAPE,
+    spark,
+    spark_parallel,
     spark_tpu_settings,
     SPARK_LORA,
     TrainShape,
@@ -234,7 +234,7 @@ def _spark_sft_base(
   """Shared base of the 64-chip Spark SFT recipes below: the SFT view
   (``ChatSFTDataLoader``, assistant-only loss, packed 8,192-token rows, one
   row per rank and step), the fast reader, no checkpoint saves."""
-  model = _spark()
+  model = spark()
   spec = spark_fast_checkpoint_reader(
       resolve_model_spec(
           model.name, model.flavor, shape.seq_len, **dict(model.kwargs)
@@ -242,7 +242,7 @@ def _spark_sft_base(
   )
   if lora is not None:
     apply_lora(spec, lora)
-  config = _base_config(
+  config = base_config(
       model_spec=spec,
       hf_assets_path=MODEL_ASSETS,
       loss=ChunkedLossWrapper.Config(
@@ -257,7 +257,7 @@ def _spark_sft_base(
       ),
       shape=shape,
       precision=precision,
-      parallel=dataclasses.replace(_spark_parallel(), expert_parallel=1),
+      parallel=dataclasses.replace(spark_parallel(), expert_parallel=1),
       num_tokens_per_train_step=-1,
       checkpoint_interval=10**9,
       seed=42,
