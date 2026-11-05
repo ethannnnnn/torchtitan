@@ -7,8 +7,9 @@
 """CPU checks of the Muse Spark trainer configs and the shared TPU7x settings.
 
 The configs apply the TPU MoE converters, whose kernel modules import
-``torch_tpu``; on a host without it, put ``tests/cpu_stubs`` first on
-``PYTHONPATH`` (see ``test_muse_spark_cpu.py``).
+``torch_tpu``; on a host without it, put its CPU import stand-in
+``torchtitan/experiments/tpu/tests/cpu_stubs`` first on ``PYTHONPATH`` (see
+``test_muse_spark_cpu.py``).
 
 Run: ``python -m pytest -q torchtitan/experiments/tpu/muse_spark/tests/test_config_registry.py``.
 """

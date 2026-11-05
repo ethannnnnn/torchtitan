@@ -13,7 +13,8 @@ all documents, and must differ from the gradient of one rank's documents
 alone (negative control).
 
 Run: ``torchrun --nproc_per_node=2 -m torchtitan.experiments.tpu.muse_spark.tests.fsdp_cpu_check``
-(on a host without ``torch_tpu``, with ``tests/cpu_stubs`` first on ``PYTHONPATH``).
+(on a host without ``torch_tpu``, with its CPU import stand-in
+``torchtitan/experiments/tpu/tests/cpu_stubs`` first on ``PYTHONPATH``).
 """
 
 import os

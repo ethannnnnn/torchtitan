@@ -31,8 +31,8 @@ Checks:
 
 Run: ``python -m pytest -q torchtitan/experiments/tpu/muse_spark/tests``. The
 package imports ``torch_tpu`` through ``tpu/muse_glimmer``; on a host without
-it, put the import stubs first on the path:
-``PYTHONPATH=torchtitan/experiments/tpu/muse_spark/tests/cpu_stubs:$PWD``.
+it, put its CPU import stand-in first on the path:
+``PYTHONPATH=torchtitan/experiments/tpu/tests/cpu_stubs:$PWD``.
 """
 
 from __future__ import annotations
@@ -417,8 +417,9 @@ class MuseSparkTpuMoEKernelsTest(unittest.TestCase):
 
   ``model_registry`` applies ``TpuTokenDispatcherConverter`` and
   ``TpuGroupedExpertsConverter``; with Pallas off they must match the plain
-  model with the same BF16 grouped experts. Needs ``torch_tpu`` or the CPU
-  import stubs (``tests/cpu_stubs`` on ``PYTHONPATH``).
+  model with the same BF16 grouped experts. Needs ``torch_tpu`` or its CPU
+  import stand-in (``torchtitan/experiments/tpu/tests/cpu_stubs`` on
+  ``PYTHONPATH``).
   """
 
   @unittest.skipUnless(_tpu_moe_kernels_importable(), "needs torch_tpu or its CPU stubs")
