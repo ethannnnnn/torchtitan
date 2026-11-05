@@ -405,6 +405,41 @@ class WorkaroundsTest(parameterized.TestCase):
     self.assertIs(TokamaxConfig.use_base2_exp, True)
     self.assertIsNone(TokamaxConfig.max_logit_const)
 
+  @parameterized.named_parameters(
+      ("default_splash_config", True),
+      ("config_without_splash_fields", False),
+  )
+  def test_tokamax_patch_does_not_keep_a_stale_max_logit_const(
+      self, splash_fields
+  ):
+    """A config that sets no constant max runs with the online row max.
+
+    None is a max_logit_const setting (the online max, Tokamax's default), not
+    "unset". TokamaxConfig is process-global and its update() skips None, so
+    without care a constant from an earlier patch in the same process would
+    carry over, and a constant max is only safe for bounded logits.
+    """
+    from torchtitan.experiments.tpu.kernels.tokamax_splash_attention import TokamaxConfig  # pylint: disable=g-import-not-at-top
+
+    saved = {k: v for k, v in vars(TokamaxConfig).items() if not k.startswith("_")}
+    self.addCleanup(lambda: [setattr(TokamaxConfig, k, v) for k, v in saved.items()])
+
+    model, sa = self._tokamax_patch_fixture()
+    sa.sa_max_logit_const = 0.0
+    workarounds.use_tokamax_splash_attention_patch(model, sa)
+    self.assertEqual(TokamaxConfig.max_logit_const, 0.0, "precondition")
+
+    class _NoSplashFields:  # "use the kernel defaults"
+      pass
+
+    model, sa = self._tokamax_patch_fixture()
+    if not splash_fields:
+      sa = _NoSplashFields()
+    self.assertIsNone(getattr(sa, "sa_max_logit_const", None))
+    workarounds.use_tokamax_splash_attention_patch(model, sa)
+
+    self.assertIsNone(TokamaxConfig.max_logit_const)
+
   def test_tokamax_patch_raises_when_a_splash_config_resolves_nothing(self):
     """A real splash config whose fields resolve to nothing must fail loudly."""
     model, _ = self._tokamax_patch_fixture()

@@ -136,9 +136,15 @@ class SplashAttentionKernelConfig:
   sa_q_layout: str = "HEAD_DIM_MINOR"
   sa_k_layout: str = "HEAD_DIM_MINOR"
   sa_v_layout: str = "HEAD_DIM_MINOR"
-  # Tokamax-only knobs (use_tokamax_splash_attention_kernel); None keeps the
-  # kernel default. See kernels/tokamax_splash_attention.TokamaxConfig.
+  # Tokamax only (use_tokamax_splash_attention_kernel); other splash kernels
+  # ignore these two, e.g. the jax lane's always uses natural exp and the
+  # online row max. See kernels/tokamax_splash_attention.TokamaxConfig.
+  # Softmax in base 2 (True) or natural exp (False). None leaves the kernel's
+  # own setting, which is base 2 unless set earlier in the process
+  # (TokamaxConfig is process-global).
   sa_use_base2_exp: bool | None = None
+  # A constant used in place of the running row max, for bounded logits only.
+  # None is the online row max (Tokamax's default).
   sa_max_logit_const: float | None = None
 
 
