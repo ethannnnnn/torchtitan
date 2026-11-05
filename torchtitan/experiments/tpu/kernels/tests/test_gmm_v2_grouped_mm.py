@@ -180,8 +180,8 @@ class TpuGroupedExpertsGmmV2Test(base_device_test.BaseAcceleratorDeviceTest):
                 self.assertLess(rel(g.cpu(), rg), 2e-2, (native, name))
 
     def test_large_expert_shapes_compile(self):
-        # 4096 x 4096 experts: full-axis MegaBlox tiles exceed the 64 MiB VMEM of a
-        # TPU7x TensorCore; the GMM-v2 heuristic tiles must compile and run.
+        # 4096 x 4096 experts: one full-axis BF16 weight tile is 32 MiB, half the
+        # 64 MiB VMEM of a TPU7x TensorCore. The heuristic tiles must still fit.
         device = self.accelerator_device
         experts, _ = self._experts(4096, 4096, 4, True)
         rows = 16384

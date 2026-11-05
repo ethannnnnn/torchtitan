@@ -131,10 +131,9 @@ class TpuGroupedExperts(GroupedExperts):
             tuple[int, int, int] | None
         ) = None
         use_kernel_native_weight_layout: bool = False
-        # Tokamax GMM-v2 (Pallas) for forward, dInput and dWeight, each with the
-        # kernel's own VMEM-aware tiling: no tile knobs, no row padding, and no
-        # VMEM overflow at large expert matrices. Takes precedence over the
-        # MegaBlox switches above.
+        # Tokamax GMM-v2 (Pallas) for forward, dInput and dWeight, each with
+        # tiles the kernel sizes to fit VMEM: no tile knobs and no row padding.
+        # Takes precedence over the MegaBlox switches above.
         use_tokamax_gmm_v2: bool = False
 
     def __init__(self, config: Config):
