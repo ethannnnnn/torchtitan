@@ -4,7 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""CPU tests of the smoke helpers: the debug checkpoint and the check report."""
+"""Unit tests of the smoke helpers (debug checkpoint writer, check report)."""
 
 from __future__ import annotations
 
@@ -39,13 +39,22 @@ class DebugCheckpointTest(unittest.TestCase):
       (cls.tokenizer_dir / name).write_text(json.dumps({"name": name}))
     (cls.tokenizer_dir / "chat_template.jinja").write_text("{{ messages }}")
     cls.out = root / "checkpoint"
+    # The caller's generator state around the call, for test_caller_rng_kept.
+    torch.manual_seed(1234)
+    cls.rng_before = torch.random.get_rng_state()
     cls.tensors = smoke_common.make_debug_checkpoint(
         cls.out, cls.tokenizer_dir
     )
+    cls.rng_after = torch.random.get_rng_state()
 
   @classmethod
   def tearDownClass(cls):
     cls.tmp.cleanup()
+
+  def test_caller_rng_kept(self):
+    # The weights are seeded in a forked generator scope: the caller's
+    # global generator is neither re-seeded nor advanced by the call.
+    self.assertTrue(torch.equal(self.rng_after, self.rng_before))
 
   def _shard(self) -> pathlib.Path:
     shards = sorted(self.out.glob("*.safetensors"))
@@ -144,6 +153,27 @@ class ReportTest(unittest.TestCase):
     self.assertEqual(len(lines), 1)
     self.assertIn("UNIT", lines[0])
     self.assertIn("PASS", lines[0])
+
+  def test_exact_lines(self):
+    # Logs and reviews count these lines, so their bytes are fixed.
+    cases = [
+        ({"alpha": True}, "T", ["[T] OK   alpha", "[T] PASS"], 0),
+        (
+            {"alpha": True, "beta gamma": False},
+            "T",
+            ["[T] OK   alpha", "[T] FAIL beta gamma", "[T] FAIL"],
+            1,
+        ),
+        ({}, "E", ["[E] PASS"], 0),
+    ]
+    for checks, tag, want_lines, want_code in cases:
+      with self.subTest(checks=checks):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+          code = smoke_common.report(checks, tag)
+        self.assertEqual(out.getvalue().splitlines(), want_lines)
+        self.assertTrue(out.getvalue().endswith("\n"))
+        self.assertEqual(code, want_code)
 
 
 if __name__ == "__main__":
