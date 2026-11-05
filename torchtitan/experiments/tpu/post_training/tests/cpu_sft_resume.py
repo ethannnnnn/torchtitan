@@ -43,6 +43,8 @@ Prints ``[RESUME] PASS`` and writes ``<work>/resume_summary.json``.
 from __future__ import annotations
 
 import argparse
+import contextlib
+import importlib
 import json
 import os
 import shutil
@@ -116,9 +118,18 @@ FIELDS = (
 )
 
 
-def _batches(rec: dict) -> list:
-  # The per-process microbatch counter restarts after a resume; compare content.
-  return [(b.get("sha256"), b.get("docs")) for b in rec.get("batches", [])]
+def _batch_identity(record: dict) -> list[tuple]:
+  """``(sha256, docs)`` of every microbatch a per-rank record lists.
+
+  ``compare`` checks these instead of whole entries: the per-process
+  microbatch counter of an entry restarts after a resume.
+  """
+  return list(
+      map(
+          lambda entry: (entry.get("sha256"), entry.get("docs")),
+          record.get("batches", []),
+      )
+  )
 
 
 def compare(a: dict, b: dict, steps: range) -> list[str]:
@@ -135,7 +146,7 @@ def compare(a: dict, b: dict, steps: range) -> list[str]:
         continue
       for field in FIELDS:
         va, vb = (
-            (_batches(ra), _batches(rb))
+            (_batch_identity(ra), _batch_identity(rb))
             if field == "batches"
             else (ra.get(field), rb.get(field))
         )
@@ -160,48 +171,88 @@ def adapter_tensors(dump: Path, step: int) -> dict:
   )
 
 
-def recipe_microbatches_per_step(config_name: str) -> int:
-  """``dataloader.microbatches_per_step`` of a ``cpu_recipes`` config."""
-  from torchtitan.experiments.tpu.post_training.tests import cpu_recipes
+def _recipe_microbatches(config_name: str) -> int:
+  """``dataloader.microbatches_per_step`` of a ``cpu_recipes`` recipe."""
+  recipes = importlib.import_module(
+      "torchtitan.experiments.tpu.post_training.tests.cpu_recipes"
+  )
+  build = vars(recipes)[config_name]
+  return int(build().dataloader.microbatches_per_step)
 
-  recipe = getattr(cpu_recipes, config_name)()
-  return int(recipe.dataloader.microbatches_per_step)
+
+def _parse_cli() -> argparse.Namespace:
+  parser = argparse.ArgumentParser(
+      description=(
+          "Kill a LoRA SFT run mid-step, resume it from its newest complete "
+          "adapter-only checkpoint and compare it with an uninterrupted run."
+      )
+  )
+  parser.add_argument(
+      "--tokenizer-dir",
+      required=True,
+      help="Muse Spark tokenizer folder, chat template included",
+  )
+  parser.add_argument(
+      "--work", required=True, help="output folder; emptied before the runs"
+  )
+  parser.add_argument(
+      "--spark-checkpoint",
+      default="",
+      help="tiny Muse Spark snapshot (default: the Qwen3.5 debug model)",
+  )
+  parser.add_argument(
+      "--nproc", type=int, default=1, help="ranks of every torchrun"
+  )
+  parser.add_argument(
+      "--steps", type=int, default=6, help="optimizer steps of a full run"
+  )
+  parser.add_argument(
+      "--interval", type=int, default=3, help="steps between checkpoints"
+  )
+  parser.add_argument(
+      "--kill-step",
+      type=int,
+      default=5,
+      help="step during which the crash run is killed",
+  )
+  parser.add_argument(
+      "--partial",
+      action="store_true",
+      help="also resume next to a planted, incomplete newer checkpoint",
+  )
+  args = parser.parse_args()
+  if not args.interval < args.kill_step <= args.steps:
+    parser.error("the runs need --interval < --kill-step <= --steps")
+  return args
+
+
+def _checkout_root() -> str:
+  """The repository root, five folders above the folder of this file."""
+  return os.path.realpath(
+      os.path.join(os.path.dirname(__file__), *[os.pardir] * 5)
+  )
+
+
+def _emptied(folder: str) -> Path:
+  """``folder`` re-created empty; anything it held before is deleted."""
+  with contextlib.suppress(FileNotFoundError):
+    shutil.rmtree(folder)
+  os.makedirs(folder)
+  return Path(folder)
 
 
 def main() -> int:
-  ap = argparse.ArgumentParser()
-  ap.add_argument(
-      "--tokenizer-dir",
-      required=True,
-      help="Muse Spark tokenizer and chat template",
-  )
-  ap.add_argument("--work", required=True)
-  ap.add_argument(
-      "--spark-checkpoint",
-      default="",
-      help="public tiny Muse Spark snapshot; runs the Muse Spark port instead",
-  )
-  ap.add_argument("--nproc", type=int, default=1)
-  ap.add_argument("--steps", type=int, default=6)
-  ap.add_argument("--interval", type=int, default=3)
-  ap.add_argument("--kill-step", type=int, default=5)
-  ap.add_argument(
-      "--partial",
-      action="store_true",
-      help="also resume past an incomplete newer checkpoint",
-  )
-  args = ap.parse_args()
-  if not args.interval < args.kill_step <= args.steps:
-    ap.error("need --interval < --kill-step <= --steps")
-  import torch  # noqa: F401  (fail early without torch)
+  args = _parse_cli()
+  # torch first: if it is missing, the check stops before touching any folder.
+  import torch  # noqa: F401
 
-  from torchtitan.experiments.tpu.post_training.tests import cpu_sft_smoke, smoke_common
+  from torchtitan.experiments.tpu.post_training.tests import (
+      cpu_sft_smoke,
+      smoke_common,
+  )
 
-  args.repo = str(Path(__file__).resolve().parents[5])
-  work = Path(args.work)
-  if work.exists():
-    shutil.rmtree(work)
-  work.mkdir(parents=True)
+  args.repo = _checkout_root()
+  work = _emptied(os.path.abspath(args.work))
   args.data = str(work / "conversations.jsonl")
   cpu_sft_smoke.write_conversations(Path(args.data))
   if args.spark_checkpoint:
@@ -244,7 +295,7 @@ def main() -> int:
   checks[f"records from {args.nproc} rank(s)"] = len(ranks) == args.nproc
   # The trainer takes its gradient accumulation from the loader: each step of
   # each rank trains exactly microbatches_per_step microbatches.
-  per_step = recipe_microbatches_per_step(args.config)
+  per_step = _recipe_microbatches(args.config)
   drawn = {
       len(rec.get("batches", []))
       for by_step in ref["records"].values()
@@ -346,20 +397,29 @@ def main() -> int:
     checks["partial: resumed steps == ref (bitwise)"] = not pdiff
     summary["diffs"]["partial"] = pdiff[:20]
 
-  summary["pass"] = all(checks.values())
-  (work / "resume_summary.json").write_text(
-      json.dumps(summary, indent=2, default=str)
-  )
-  for name, ok in checks.items():
-    print(f"[RESUME] {'ok  ' if ok else 'FAIL'} {name}")
-  for kind, diffs in summary["diffs"].items():
-    for d in diffs[:5]:
-      print(f"[RESUME] diff {kind}: {d}")
+  failed = [name for name in checks if not checks[name]]
+  summary["pass"] = not failed
+  with open(work / "resume_summary.json", "w") as handle:
+    json.dump(summary, handle, indent=2, default=str)
+  _print_outcome(summary, failed, args)
+  return int(bool(failed))
+
+
+def _print_outcome(summary: dict, failed: list[str], args) -> None:
+  """The check lines, up to five differences per kind and the verdict."""
+  for name in summary["checks"]:
+    marker = "FAIL" if name in failed else "ok"
+    print(f"[RESUME] {marker:<4} {name}")
+  diffs = summary["diffs"]
+  for kind in diffs:
+    for diff in diffs[kind][:5]:
+      print(f"[RESUME] diff {kind}: {diff}")
+  verdict = "FAIL" if failed else "PASS"
   print(
-      f"[RESUME] {'PASS' if summary['pass'] else 'FAIL'} config={args.config} nproc={args.nproc} "
-      f"ckpt_step={ckpt_step} checkpoint={summary['checkpoint']}"
+      f"[RESUME] {verdict} config={args.config} nproc={args.nproc} "
+      f"ckpt_step={summary['checkpoint_step']} "
+      f"checkpoint={summary['checkpoint']}"
   )
-  return 0 if summary["pass"] else 1
 
 
 if __name__ == "__main__":

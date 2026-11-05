@@ -4,32 +4,39 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""CPU end-to-end smoke of chat SFT (no TPU).
+"""Chat SFT through the trainer that TPU jobs use, as one gloo rank here.
 
-Runs the real SFT path -- ConfigManager CLI parse, SFTTPUTrainer on
-TPUTrainer, HF initial load, ChatSFTDataLoader (Muse Spark chat template,
-assistant-only labels, packed documents), ChunkedLossWrapper(CrossEntropyLoss)
-with the global supervised-token denominator, and checkpoint saves -- on CPU
-with gloo, world size 1. The TPU Qwen3.5 debug model (random weights) in five
-variants: full-parameter AdamW, LoRA (r 8) on the attention projections with
-TorchTitan's full DCP save, LoRA with adapter saves, full-parameter AdamW8bit,
-and bf16 weights with AdamWBf16; with ``--spark-checkpoint`` (and the Muse
-Spark TPU package installed), the Muse Spark port loaded from the public tiny
-checkpoint, full-parameter and LoRA. Every variant must lower the training
-loss on a small repeated dataset of short templated replies; LoRA runs must
-leave every base weight bit-identical to the checkpoint, and LoRA runs with
-adapter saves must write the adapter-only resume state (which needs
-``checkpointing/lora_checkpoint.py``; without it they write the PEFT adapter
-only, ``sft.lora_save=peft``).
+Each configuration of ``cpu_recipes`` trains for 8 steps. Upstream's
+``ConfigManager`` parses the command line; ``SFTTPUTrainer`` (built on
+``TPUTrainer``) starts from the Hugging Face weights; ``ChatSFTDataLoader``
+renders the conversations with the Muse Spark chat template, trains assistant
+tokens only and packs several documents into each row; the loss is
+cross-entropy evaluated in chunks by ``ChunkedLossWrapper`` and divided by
+the supervised-token count of the whole step; checkpoints are saved on the
+way.
+
+The TPU Qwen3.5 debug model (random weights) trains in five configurations:
+full-parameter AdamW; rank-8 LoRA on q/k/v/o of every attention layer, saved
+with TorchTitan's DCP save of the whole model; LoRA with adapter saves;
+full-parameter AdamW8bit; bf16 weights with AdamWBf16. ``--spark-checkpoint``
+(the public tiny Muse Spark snapshot) adds full-parameter and LoRA runs of
+the Muse Spark port when that package is installed.
+
+Every run has to lower its loss on a small set of short, repeated replies.
+LoRA runs must also leave each base weight bit-identical, and LoRA runs with
+adapter saves must write the adapter-only resume state, which comes from
+``checkpointing/lora_checkpoint.py`` (when it is absent they write just the
+PEFT adapter, ``sft.lora_save=peft``).
 
     python -m torchtitan.experiments.tpu.post_training.tests.cpu_sft_smoke \\
         --tokenizer-dir <Muse Spark tokenizer dir> --work <new dir> \\
-        [--spark-checkpoint <public tiny Muse Spark snapshot>]
+        [--spark-checkpoint <tiny Muse Spark snapshot>]
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import pathlib
 import random
@@ -109,22 +116,29 @@ def run(
     template_dir: pathlib.Path,
     extra: list[str] | None = None,
 ) -> dict:
+  """Train recipe ``config_name`` of ``cpu_recipes`` in this process.
+
+  Returns the parsed ``<work>/dump/sft-records-rank0.json``. The ``extra``
+  arguments come last, so they win over the ones set here.
+  """
   from torchtitan.config import ConfigManager
   from torchtitan.experiments.tpu.post_training import sft_train
 
   dump = work / "dump"
   smoke_common.single_rank_env()
-  argv = [
-      "--module=torchtitan.experiments.tpu.post_training.tests.cpu_recipes",
-      f"--config={config_name}",
-      f"--hf_assets_path={assets}",
-      f"--dataloader.data-path={data}",
-      f"--dataloader.hf-tokenizer-path={template_dir}",
-      f"--dump_folder={dump}",
-      *(extra or []),
-  ]
+  settings = {
+      "--module": "torchtitan.experiments.tpu.post_training.tests.cpu_recipes",
+      "--config": config_name,
+      "--hf_assets_path": assets,
+      "--dataloader.data-path": data,
+      "--dataloader.hf-tokenizer-path": template_dir,
+      "--dump_folder": dump,
+  }
+  argv = [f"{flag}={value}" for flag, value in settings.items()]
+  argv.extend(extra or ())
   sft_train.start_trainer(ConfigManager().parse_args(argv))
-  return json.loads((dump / "sft-records-rank0.json").read_text())
+  with open(dump / "sft-records-rank0.json", encoding="utf-8") as records:
+    return json.load(records)
 
 
 def dcp_model_state(checkpoint_dir: pathlib.Path) -> dict[str, torch.Tensor]:
@@ -189,20 +203,42 @@ def expected_base_state(
   return spec.state_dict_adapter(spec.model, str(assets)).from_hf(hf)
 
 
-def main() -> int:
-  ap = argparse.ArgumentParser()
-  ap.add_argument("--tokenizer-dir", required=True)
-  ap.add_argument("--work", required=True)
-  ap.add_argument(
+def _parse_cli() -> argparse.Namespace:
+  parser = argparse.ArgumentParser(
+      description=(
+          "Train every SFT configuration of cpu_recipes in this process and "
+          "check losses, saves and frozen weights."
+      )
+  )
+  parser.add_argument(
+      "--tokenizer-dir",
+      required=True,
+      help="Muse Spark tokenizer folder, chat template included",
+  )
+  parser.add_argument(
+      "--work", required=True, help="output folder; deleted first if present"
+  )
+  parser.add_argument(
       "--spark-checkpoint",
       default="",
-      help="public tiny Muse Spark snapshot (weights + tokenizer); "
-      "adds the Muse Spark runs when the Muse Spark package is installed",
+      help=(
+          "public tiny Muse Spark snapshot (weights and tokenizer); adds the "
+          "Muse Spark runs when that package is installed"
+      ),
   )
-  args = ap.parse_args()
+  return parser.parse_args()
+
+
+def _discard(folder: pathlib.Path) -> None:
+  """Delete ``folder`` with everything below it; a missing folder is fine."""
+  with contextlib.suppress(FileNotFoundError):
+    shutil.rmtree(folder)
+
+
+def main() -> int:
+  args = _parse_cli()
   work = pathlib.Path(args.work)
-  if work.exists():
-    shutil.rmtree(work)
+  _discard(work)
   tokenizer_dir = pathlib.Path(args.tokenizer_dir)
   qwen_assets, data = work / "assets", work / "sft.jsonl"
   qwen_initial = smoke_common.make_debug_checkpoint(qwen_assets, tokenizer_dir)

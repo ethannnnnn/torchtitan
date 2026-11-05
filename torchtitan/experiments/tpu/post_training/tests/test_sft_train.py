@@ -4,10 +4,11 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""CPU tests of the ``sft_train`` entry point; no trainer is built.
+"""Unit tests of the ``sft_train`` entry point.
 
-Upstream's TPU startup is replaced by a stand-in that records which class
-the name ``torchtitan.experiments.tpu.train.TPUTrainer`` holds while it runs.
+Upstream's TPU start-up is swapped for a stand-in that notes which class the
+module-level ``TPUTrainer`` name of ``torchtitan.experiments.tpu.train`` holds
+while it runs, so no trainer is ever built.
 """
 
 from __future__ import annotations

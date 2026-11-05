@@ -15,9 +15,8 @@
 # import-only stand-in torchtitan/experiments/tpu/tests/cpu_stubs satisfies the
 # TPU modules' imports. Each process uses OMP_NUM_THREADS threads (default 8).
 set -euo pipefail
-TEST_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-REPO_ROOT=$(cd "$TEST_DIR/../../../../.." && pwd)
-CPU_PYTHON=${CPU_PYTHON:-python3}
+REPO_ROOT=$(realpath -- "$(dirname -- "${BASH_SOURCE[0]}")/../../../../..")
+: "${CPU_PYTHON:=python3}"
 tokenizer_dir=${SPARK_TEST_ASSETS:-}
 work_root=
 keep_work=0
@@ -36,17 +35,23 @@ while [[ $# -gt 0 ]]; do
 done
 [[ -d "$tokenizer_dir" ]] || usage
 tokenizer_dir=$(cd "$tokenizer_dir" && pwd)
-if [[ -n "$work_root" ]]; then
-  [[ ! -e "$work_root" ]] || { echo '--work must name a new directory' >&2; exit 2; }
-  mkdir -p "$work_root"
-  work_root=$(cd "$work_root" && pwd)
+if (( keep_work == 0 )); then
+  work_root=$(mktemp -d /tmp/sft-cpu-checks.XXXXXX)
+elif [[ -e "$work_root" ]]; then
+  echo "run_cpu.sh: $work_root already exists; --work takes a new folder" >&2
+  exit 2
 else
-  work_root=$(mktemp -d /tmp/post-training-tests.XXXXXX)
+  mkdir -p -- "$work_root"
+  work_root=$(realpath -- "$work_root")
 fi
-finish() {
-  if [[ "$keep_work" -eq 0 ]]; then rm -rf "$work_root"; else echo "CPU smoke artifacts: $work_root"; fi
+clean_up_work() {
+  if (( keep_work )); then
+    echo "run_cpu.sh: outputs kept in $work_root"
+  else
+    rm -rf -- "$work_root"
+  fi
 }
-trap finish EXIT
+trap clean_up_work EXIT
 export PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"
 if ! "$CPU_PYTHON" -c 'import torch_tpu' 2>/dev/null; then
   stubs="$REPO_ROOT/torchtitan/experiments/tpu/tests/cpu_stubs"
