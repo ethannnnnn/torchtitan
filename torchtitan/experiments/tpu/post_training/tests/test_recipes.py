@@ -24,6 +24,7 @@ from torchtitan.experiments.tpu.post_training.sft_config import (
     SFTConfig,
     SFTTrainerConfig,
     as_sft_config,
+    validated_lora_save,
 )
 from torchtitan.experiments.tpu.post_training.sft_data import ChatSFTDataLoader
 from torchtitan.experiments.tpu.post_training.tests import cpu_recipes, smoke_common
@@ -209,6 +210,31 @@ class BuilderTest(unittest.TestCase):
     self.assertEqual(
         cpu_recipes.sft_debug_lora_adapter_smoke().sft.lora_save, "adapter"
     )
+
+  def test_sft_config_over_an_sft_base(self):
+    base = cpu_recipes.sft_debug_lora_smoke()  # already an SFTTrainerConfig
+    self.assertEqual(base.sft.lora_save, "full")
+    sft = SFTConfig(lora_save="none", val_every=3)
+    config = as_sft_config(base, sft)
+    self.assertIsInstance(config, SFTTrainerConfig)
+    self.assertIs(config.sft, sft)
+    # The TPU trainer sections are shared, not copied; the base keeps its sft.
+    self.assertIs(config.training, base.training)
+    self.assertIs(config.dataloader, base.dataloader)
+    self.assertEqual(base.sft.lora_save, "full")
+    for bad in (
+        SFTConfig(lora_save="weights"),
+        SFTConfig(val_every=-1),
+        SFTConfig(val_max_microbatches=-1),
+    ):
+      with self.subTest(sft=bad), self.assertRaises(ValueError):
+        as_sft_config(base, bad)
+
+  def test_lora_save_validator(self):
+    for mode in ("adapter", "peft", "full", "none"):
+      self.assertEqual(validated_lora_save(mode), mode)
+    with self.assertRaisesRegex(ValueError, "weights"):
+      validated_lora_save("weights")
 
   def test_debug_recipe(self):
     config = cpu_recipes.sft_debug_smoke()
