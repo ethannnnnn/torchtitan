@@ -123,7 +123,12 @@ python torchtitan/experiments/tpu/muse_spark/launch/render.py "${SITE[@]}" \
   --mode e2e --run <RUN_NAME> --topology 2x2x1 --config s1_sft_trunc2 \
   --env SPARK_STEPS=5 --out ./rendered-2l
 kubectl --context <KUBE_CONTEXT> -n <K8S_NAMESPACE> create -f ./rendered-2l/trainer.json
+bash ./rendered-2l/own-configmaps.sh --context <KUBE_CONTEXT>
 ```
+
+`own-configmaps.sh` makes the JobSet the owner of its code ConfigMaps, so they
+are deleted together with it (by hand or an hour after the run, through
+`ttlSecondsAfterFinished`).
 
 ### Full model (`s2_sft_full`, one `4x4x4` slice)
 
@@ -134,6 +139,7 @@ python torchtitan/experiments/tpu/muse_spark/launch/render.py "${SITE[@]}" \
   --extra-args='--dataloader.data-path=/mnt/data/sft/train.jsonl --checkpoint.interval=20' \
   --budget-seconds 4200 --deadline-seconds 4500 --out ./rendered-sft
 kubectl --context <KUBE_CONTEXT> -n <K8S_NAMESPACE> create -f ./rendered-sft/trainer.json
+bash ./rendered-sft/own-configmaps.sh --context <KUBE_CONTEXT>
 ```
 
 Watch host 0's log (`kubectl logs` of pod `<RUN_NAME>-trainer-0-0-*`, or
@@ -208,8 +214,9 @@ above 1 means routes were dropped on that rank).
 ## 7. Collect results and clean up
 
 Capture every pod's logs (including previous restarts) and `kubectl describe`
-output before deleting anything, then delete the JobSet and its code
-ConfigMaps:
+output before deleting anything, then delete the JobSet; Kubernetes deletes
+its code ConfigMaps with it once `own-configmaps.sh` ran. The second command
+removes ConfigMaps that were never handed over (it finds nothing otherwise):
 
 ```bash
 kubectl --context <KUBE_CONTEXT> -n <K8S_NAMESPACE> delete jobset <RUN_NAME>

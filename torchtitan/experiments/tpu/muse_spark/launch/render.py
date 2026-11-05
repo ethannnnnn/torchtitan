@@ -17,8 +17,10 @@ base commit, applies the overlay and starts only if the resulting git tree is
 the candidate's tree (``bootstrap.sh``).
 
 Output goes to a new directory: ``trainer.json`` (a ``v1`` List: the overlay
-ConfigMaps, then the suspended JobSet) plus ``receipt.json`` (geometry, code,
-inputs, file digests).
+ConfigMaps, then the suspended JobSet), ``own-configmaps.sh`` (run once after
+``kubectl create``: makes the JobSet the owner of its code ConfigMaps, so they
+are deleted with it, also when ``ttlSecondsAfterFinished`` removes a finished
+JobSet) and ``receipt.json`` (geometry, code, inputs, file digests).
 """
 from __future__ import annotations
 
@@ -28,6 +30,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import sys
 from pathlib import Path
 
@@ -115,7 +118,9 @@ def parse_args(argv=None):
     p.add_argument("--prefix", default="muse-spark", help="storage prefix inside the bucket (runs/ goes here)")
     p.add_argument("--model-dir", default="muse-spark/model/Muse-Spark-Open-816B-A42B",
                    help="checkpoint directory inside the bucket")
-    p.add_argument("--data-dir", default="muse-spark/data/shopping-ctr-v1", help="dataset directory inside the bucket")
+    p.add_argument("--data-dir", required=True,
+                   help="dataset directory inside the bucket, mounted at /mnt/data (the SFT recipes read "
+                        "sft/train.jsonl there)")
     p.add_argument("--runtime-dir", help="mounted wheelhouse directory inside the bucket (default <prefix>/runtime)")
     p.add_argument("--runtime-mode", choices=RUNTIME_MODES, default="auto",
                    help="mounted: install the wheelhouse offline (runtime_install.sh); preinstalled: use the image; "
@@ -235,6 +240,32 @@ def projected_sources(maps: list[dict]) -> list[dict]:
     return sources
 
 
+OWNER_SCRIPT = """#!/usr/bin/env bash
+# Written by render.py for JobSet {run} in namespace {namespace}. Run it once after
+# `kubectl create -f trainer.json`: it makes the JobSet the owner of its code ConfigMaps,
+# so Kubernetes deletes them together with the JobSet (deleted by hand, or by
+# ttlSecondsAfterFinished after the run). Arguments go to every kubectl call,
+# e.g. --context NAME.
+set -euo pipefail
+uid=$(kubectl "$@" -n {namespace} get jobset {run} -o jsonpath='{{.metadata.uid}}')
+[[ -n "$uid" ]] || {{ echo "JobSet {run} not found in {namespace}" >&2; exit 1; }}
+patch='{{"metadata":{{"ownerReferences":[{{"apiVersion":"{api_version}","kind":"JobSet","name":"{name}","uid":"'"$uid"'"}}]}}}}'
+for configmap in {configmaps}; do
+  kubectl "$@" -n {namespace} patch configmap "$configmap" --type=merge -p "$patch"
+done
+echo "the code ConfigMaps of {run} now belong to JobSet uid $uid"
+"""
+
+
+def owner_script(jobset: dict, maps: list[dict]) -> str:
+    """``own-configmaps.sh``: ownerReferences from the code ConfigMaps to the JobSet (needs its uid)."""
+    meta = jobset["metadata"]
+    return OWNER_SCRIPT.format(
+        run=shlex.quote(meta["name"]), namespace=shlex.quote(meta["namespace"]),
+        name=meta["name"], api_version=jobset["apiVersion"],
+        configmaps=" ".join(shlex.quote(m["metadata"]["name"]) for m in maps))
+
+
 def main(argv=None):
     args = parse_args(argv)
     hosts, accelerator = TOPOLOGIES[args.topology]
@@ -299,6 +330,7 @@ def main(argv=None):
             "overlay_sha256": manifest["sha256"], "overlay_bytes": manifest["bytes"],
             "files": len(manifest["files"]), "deleted": len(manifest["deleted"]),
             "configmaps": [m["metadata"]["name"] for m in maps],
+            "configmap_owner_script": "own-configmaps.sh",
         },
         "runtime": {"mode": args.runtime_mode, "dir": f"gs://{args.bucket}/{runtime_dir}/", "name": args.runtime_name,
                     "pins": {k: v for k, v in kit_env.items() if k.endswith("_SHA256")},
@@ -317,11 +349,16 @@ def main(argv=None):
     fd = os.open(args.out / "trainer.json", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(fd, "wb") as handle:
         handle.write(data)
-    receipt["files"] = {"trainer.json": hashlib.sha256(data).hexdigest()}
+    script = owner_script(trainer, maps).encode()
+    (args.out / "own-configmaps.sh").write_bytes(script)
+    (args.out / "own-configmaps.sh").chmod(0o700)
+    receipt["files"] = {"trainer.json": hashlib.sha256(data).hexdigest(),
+                        "own-configmaps.sh": hashlib.sha256(script).hexdigest()}
     (args.out / "receipt.json").write_text(json.dumps(receipt, indent=2) + "\n")
     print(f"rendered {args.mode} {args.config} on {args.topology} ({hosts} hosts, {4 * hosts} chips) "
           f"under {args.out}: {len(maps)} code ConfigMap(s) + the JobSet, suspended until the queue admits it; "
-          f"candidate tree {manifest['candidate_tree']}")
+          f"candidate tree {manifest['candidate_tree']}. After `kubectl create -f {args.out / 'trainer.json'}`, "
+          f"run `bash {args.out / 'own-configmaps.sh'} [--context NAME]` so the ConfigMaps go with the JobSet.")
     return 0
 
 

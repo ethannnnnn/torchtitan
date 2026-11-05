@@ -1,16 +1,17 @@
 # Launching Muse Spark recipes on TPU7x (GKE)
 
 These files turn a recipe name into a reviewed, suspended JobSet. Nothing here
-contacts a cluster or a bucket except `stage_checkpoint.sh`, which you run
-yourself with your own credentials. Every site-specific value (bucket,
-project, namespace, queue, image, storage directories) is a command-line
-argument; nothing site-specific is stored in these files.
+contacts a cluster or a bucket except `stage_checkpoint.sh` and the rendered
+`own-configmaps.sh`, which you run yourself with your own credentials. Every
+site-specific value (bucket, project, namespace, queue, image, storage
+directories) is a command-line argument; nothing site-specific is stored in
+these files.
 
 | File | Purpose |
 |---|---|
 | `stage_checkpoint.sh` | Copy the public checkpoint from Hugging Face to `gs://<GCS_BUCKET>/...`, one shard at a time, verified against the Hub's SHA-256 |
 | `build_overlay.py` | The code the pods run: the candidate commit's changed files relative to a public base commit, as a deterministic archive plus a manifest (commits, trees, git modes, blob ids) |
-| `render.py` | Renders `trainer_jobset.json.in` for a slice shape and a recipe, with the overlay in ConfigMaps; rejects unresolved placeholders |
+| `render.py` | Renders `trainer_jobset.json.in` for a slice shape and a recipe, with the overlay in ConfigMaps, plus `own-configmaps.sh` (hands the ConfigMaps to the JobSet after `kubectl create`); rejects unresolved placeholders |
 | `trainer_jobset.json.in` | One multi-host trainer JobSet: four chips and eight ranks per host, the overlay ConfigMaps, GCSFuse mounts for runtime, model, data, and outputs |
 | `bootstrap.sh` | Container entry point: checks the slice wiring, fetches the base commit, applies the overlay, and starts only if the git tree equals the candidate's |
 | `spark_pod.sh` | In-pod runner: optional offline runtime install, optional hash-pinned wheel overlay, version record and import check, `torch.distributed.run` (or the merged-export workers) |
@@ -37,7 +38,7 @@ if your cluster uses static TPU node pools.
 gs://<GCS_BUCKET>/muse-spark/
   runtime/                              # optional mounted wheelhouse (runtime_install.sh)
   model/Muse-Spark-Open-816B-A42B/      # from stage_checkpoint.sh
-  data/shopping-ctr-v1/                 # SFT records: sft/train.jsonl, sft/val.jsonl
+  data/<DATASET>/                       # --data-dir; SFT records: sft/train.jsonl, sft/val.jsonl
   runs/<RUN_NAME>/                      # outputs: logs, versions, checkpoints, adapters
 ```
 
@@ -73,17 +74,21 @@ python torchtitan/experiments/tpu/muse_spark/launch/build_overlay.py \
 python torchtitan/experiments/tpu/muse_spark/launch/render.py --mode e2e --run <RUN_NAME> \
   --topology 4x4x4 --config s2_sft_full --code-overlay ./overlay \
   --bucket <GCS_BUCKET> --namespace <K8S_NAMESPACE> --local-queue <LOCAL_QUEUE> \
-  --project <GCP_PROJECT> --trainer-image <TRAINER_IMAGE> \
+  --project <GCP_PROJECT> --trainer-image <TRAINER_IMAGE> --data-dir muse-spark/data/<DATASET> \
   --pip-overlay torchtitan/experiments/tpu/muse_spark/launch/pip-pins-jax0.12.0.1-tokamax0.0.17.txt \
   --env SPARK_STEPS=20 --out ./rendered
 kubectl --context <KUBE_CONTEXT> -n <K8S_NAMESPACE> create -f ./rendered/trainer.json
+bash ./rendered/own-configmaps.sh --context <KUBE_CONTEXT>
 ```
 
 `<BASE_COMMIT>` must be a commit the pods can fetch from `--base-repo` (for
 example the upstream commit your branch starts from). `trainer.json` is a
 `v1` List: the code ConfigMaps (`<RUN_NAME>-code-N`) followed by the JobSet,
-which stays suspended until the queue admits it. Delete the ConfigMaps
-together with the JobSet: `kubectl delete jobset <RUN_NAME>` and
+which stays suspended until the queue admits it. `own-configmaps.sh` looks up
+the new JobSet's uid and makes it the owner of those ConfigMaps, so Kubernetes
+deletes them together with the JobSet, whether you delete it
+(`kubectl delete jobset <RUN_NAME>`) or `ttlSecondsAfterFinished` removes it
+an hour after the run. If the script did not run, delete them by label:
 `kubectl delete configmap -l muse-spark-run=<RUN_NAME>`.
 
 `--mode` picks the entry point and the TorchTitan `--module`; `--entry` and

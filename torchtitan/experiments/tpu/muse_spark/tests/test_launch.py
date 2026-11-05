@@ -35,6 +35,7 @@ import render  # noqa: E402
 BASE_ARGS = [
     "--bucket", "example-bucket", "--namespace", "example-ns", "--local-queue", "example-queue",
     "--project", "example-project", "--trainer-image", "registry.example/trainer@sha256:" + "a" * 64,
+    "--data-dir", "example/data/chat-sft",
 ]
 PINS = "torchtitan/experiments/tpu/muse_spark/launch/pip-pins-jax0.12.0.1-tokamax0.0.17.txt"
 HAVE_GIT = shutil.which("git") is not None
@@ -173,8 +174,9 @@ class RenderTest(LaunchTestCase):
                 self.assertEqual(env["SPARK_OVERLAY_CHUNKS"], str(len(maps)))
                 self.assertEqual(receipt["chips"], 4 * hosts)
                 self.assertEqual(receipt["accelerator_type"], accelerator)
-                digest = hashlib.sha256((out / "trainer.json").read_bytes()).hexdigest()
-                self.assertEqual(receipt["files"]["trainer.json"], digest)
+                for name in ("trainer.json", "own-configmaps.sh"):
+                    digest = hashlib.sha256((out / name).read_bytes()).hexdigest()
+                    self.assertEqual(receipt["files"][name], digest, name)
 
     def test_code_is_inline_and_mounted_from_the_configmaps(self):
         jobset, maps, receipt, _ = self._render("--mode", "e2e", "--run", "inline", "--topology", "2x2x1",
@@ -197,6 +199,38 @@ class RenderTest(LaunchTestCase):
         command = pod["containers"][0]["args"][0]
         self.assertEqual(command, (LAUNCH / "bootstrap.sh").read_text())
         self.assertEqual(maps[0]["metadata"]["labels"]["muse-spark-run"], "inline")
+
+    @unittest.skipIf(shutil.which("bash") is None, "bash not installed")
+    def test_owner_script_hands_the_configmaps_to_the_jobset(self):
+        jobset, maps, receipt, out = self._render("--mode", "e2e", "--run", "owned", "--topology", "2x2x1",
+                                                  "--config", "s1_sft_trunc2")
+        script = out / "own-configmaps.sh"
+        self.assertEqual(receipt["code"]["configmap_owner_script"], script.name)
+        subprocess.run(["bash", "-n", str(script)], check=True)
+        # A stand-in kubectl that records its arguments and knows the JobSet's uid.
+        bindir = self.tmp / "fake-kubectl"
+        bindir.mkdir()
+        calls = self.tmp / "kubectl-calls.jsonl"
+        (bindir / "kubectl").write_text(
+            f"#!{sys.executable}\nimport json, sys\n"
+            f"open({str(calls)!r}, 'a').write(json.dumps(sys.argv[1:]) + '\\n')\n"
+            "if 'get' in sys.argv: print('0f0f0f0f-1111-2222-3333-444455556666', end='')\n")
+        (bindir / "kubectl").chmod(0o755)
+        result = subprocess.run(["bash", str(script), "--context", "example-context"], capture_output=True, text=True,
+                                env=dict(os.environ, PATH=f"{bindir}:{os.environ.get('PATH', '')}"), timeout=60)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        recorded = [json.loads(line) for line in calls.read_text().splitlines()]
+        self.assertEqual(recorded[0], ["--context", "example-context", "-n", "example-ns", "get", "jobset", "owned",
+                                       "-o", "jsonpath={.metadata.uid}"])
+        patched = []
+        for call in recorded[1:]:
+            self.assertEqual(call[:6], ["--context", "example-context", "-n", "example-ns", "patch", "configmap"])
+            patched.append(call[6])
+            self.assertEqual(call[7:9], ["--type=merge", "-p"])
+            owner, = json.loads(call[9])["metadata"]["ownerReferences"]
+            self.assertEqual(owner, {"apiVersion": jobset["apiVersion"], "kind": "JobSet", "name": "owned",
+                                     "uid": "0f0f0f0f-1111-2222-3333-444455556666"})
+        self.assertEqual(patched, [m["metadata"]["name"] for m in maps])
 
     def test_large_overlay_uses_several_configmaps(self):
         big = self.tmp / "big-repo"
@@ -291,6 +325,13 @@ class RenderTest(LaunchTestCase):
             with self.assertRaises(SystemExit, msg=override), contextlib.redirect_stderr(io.StringIO()):
                 render.main(args)
             self.assertFalse((self.tmp / "never").exists())
+        # No default dataset: the data directory is always explicit.
+        index = BASE_ARGS.index("--data-dir")
+        without_data = BASE_ARGS[:index] + BASE_ARGS[index + 2:]
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+            render.main(["--mode", "sft", "--run", "ok", "--topology", "2x2x1", "--config", "c", *without_data,
+                         "--code-overlay", str(self.overlay), "--out", str(self.tmp / "never")])
+        self.assertFalse((self.tmp / "never").exists())
 
     def test_templates_use_only_known_placeholders(self):
         known = {"<RUN_NAME>", "<MODE>", "<ENTRY_MODULE>", "<CONFIG_MODULE>", "<CONFIG>", "<EXTRA_ARGS>",
@@ -303,12 +344,12 @@ class RenderTest(LaunchTestCase):
             found = set(render.PLACEHOLDER.findall(template.read_text()))
             self.assertTrue(found <= known, (template.name, sorted(found - known)))
 
-    def test_full_model_lora_sft_matches_the_verified_run(self):
-        """The 4x4x4 LoRA SFT launch of the documented reproduction (example site values)."""
+    def test_full_model_lora_sft_launch(self):
+        """The 4x4x4 LoRA SFT launch of the reproduction guide (example site values)."""
         jobset, _, receipt, _ = self._render(
             "--mode", "e2e", "--run", "example-sft", "--topology", "4x4x4", "--config", "s2_sft_full",
             "--prefix", "example/sft", "--model-dir", "example/model/Muse-Spark-Open-816B-A42B",
-            "--data-dir", "example/data/shopping-ctr-v1", "--priority-class", "example-priority",
+            "--data-dir", "example/data/chat-sft", "--priority-class", "example-priority",
             "--label", "owner=example", "--env", "SPARK_STEPS=60", "--env", "SPARK_VAL_DATA=/mnt/data/sft/val.jsonl",
             "--env", "SPARK_VAL_EVERY=10",
             "--extra-args=--dataloader.data-path=/mnt/data/sft/train.jsonl --checkpoint.interval=20",
@@ -336,7 +377,7 @@ class RenderTest(LaunchTestCase):
         self.assertEqual(options, {
             "runtime": "implicit-dirs,only-dir=example/sft/runtime",
             "model": "implicit-dirs,only-dir=example/model/Muse-Spark-Open-816B-A42B",
-            "data": "implicit-dirs,only-dir=example/data/shopping-ctr-v1",
+            "data": "implicit-dirs,only-dir=example/data/chat-sft",
             "out": "implicit-dirs,only-dir=example/sft/runs/example-sft",
         })
         self.assertEqual(pod["containers"][0]["resources"]["limits"]["google.com/tpu"], "4")
