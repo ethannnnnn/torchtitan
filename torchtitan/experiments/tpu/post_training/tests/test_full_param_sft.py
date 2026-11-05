@@ -11,10 +11,13 @@ The recipes build on the post-training SFT layer (``config_registry``,
 (``muse_spark``: the model, expert placement and the step recipes, whose
 module imports ``checkpointing``). Building the configs imports the TPU MoE
 kernel modules, which need TorchTPU or an import-only CPU stand-in for it on
-PYTHONPATH. The tests skip, naming the missing modules, unless all of these
-are importable.
+PYTHONPATH (``torchtitan/experiments/tpu/tests/cpu_stubs``). The tests skip,
+naming the missing modules, unless all of these are importable.
 
-Run: python -m pytest -q torchtitan/experiments/tpu/post_training/tests/test_full_param_sft.py
+Run from the repository root (on a host without TorchTPU)::
+
+    PYTHONPATH=torchtitan/experiments/tpu/tests/cpu_stubs:. python -m pytest -q \\
+        torchtitan/experiments/tpu/post_training/tests/test_full_param_sft.py
 """
 
 from __future__ import annotations
@@ -22,6 +25,7 @@ from __future__ import annotations
 import dataclasses
 import importlib.util
 import os
+import types
 import unittest
 
 # Modules from other changes (and TorchTPU) that the recipes import, directly or
@@ -84,12 +88,6 @@ def _lora_configs(model_config):
       and hasattr(cfg, "rank")
       and hasattr(cfg, "alpha")
   ]
-
-
-def _has_ep_grad_reduce_dtype(model_config) -> bool:
-  return "ep_grad_reduce_dtype" in {
-      f.name for f in dataclasses.fields(model_config)
-  }
 
 
 @unittest.skipIf(
@@ -262,8 +260,8 @@ class FullParamSFTRecipeTest(unittest.TestCase):
         self.assertEqual(
             model.ep_expert_placement, "file:/placement/placement_ep8.json"
         )
-        if _has_ep_grad_reduce_dtype(model):
-          self.assertIsNone(model.ep_grad_reduce_dtype)
+        # The expert gradients follow training.mixed_precision_reduce too.
+        self.assertIsNone(model.ep_grad_reduce_dtype)
         self.assertTrue(
             issubclass(config.model_spec.state_dict_adapter, FastSparkAdapter)
         )
@@ -314,20 +312,17 @@ class FullParamSFTRecipeTest(unittest.TestCase):
     ):
       with self.subTest(bad=bad), self.assertRaises(ValueError):
         self._build(name, **bad)
-    # The expert gradients' reduce dtype needs the model config's ep_grad_reduce_dtype.
-    model = getattr(self.fp, name)().model_spec.model
-    if _has_ep_grad_reduce_dtype(model):
-      config = self._build(name, SPARK_EXPERT_GRAD_REDUCE="bfloat16")
-      self.assertEqual(config.model_spec.model.ep_grad_reduce_dtype, "bfloat16")
-      self.assertEqual(config.training.mixed_precision_reduce, "float32")
-      config = self._build(
-          name, SPARK_GRAD_REDUCE="bfloat16", SPARK_EXPERT_GRAD_REDUCE="float32"
-      )
-      self.assertEqual(config.model_spec.model.ep_grad_reduce_dtype, "float32")
-      self.assertEqual(config.training.mixed_precision_reduce, "bfloat16")
-    else:
-      with self.assertRaises(ValueError):
-        self._build(name, SPARK_EXPERT_GRAD_REDUCE="bfloat16")
+    # SPARK_EXPERT_GRAD_REDUCE sets the model config's ep_grad_reduce_dtype,
+    # the dtype of the expert gradients' reduce-scatter over the efsdp ranks;
+    # the other gradients keep training.mixed_precision_reduce.
+    config = self._build(name, SPARK_EXPERT_GRAD_REDUCE="bfloat16")
+    self.assertEqual(config.model_spec.model.ep_grad_reduce_dtype, "bfloat16")
+    self.assertEqual(config.training.mixed_precision_reduce, "float32")
+    config = self._build(
+        name, SPARK_GRAD_REDUCE="bfloat16", SPARK_EXPERT_GRAD_REDUCE="float32"
+    )
+    self.assertEqual(config.model_spec.model.ep_grad_reduce_dtype, "float32")
+    self.assertEqual(config.training.mixed_precision_reduce, "bfloat16")
     # Expert parallelism without a measured placement is refused; EP 1 needs none.
     saved = os.environ.pop("SPARK_EXPERT_PLACEMENT_FILE")
     try:
@@ -340,6 +335,25 @@ class FullParamSFTRecipeTest(unittest.TestCase):
       )
     finally:
       os.environ["SPARK_EXPERT_PLACEMENT_FILE"] = saved
+
+  def test_expert_grad_reduce_needs_the_model_field(self):
+    # A model config without ep_grad_reduce_dtype refuses
+    # SPARK_EXPERT_GRAD_REDUCE instead of taking an attribute nothing reads.
+    @dataclasses.dataclass
+    class ModelConfig:
+      ep_dispatcher: str = "allgather"
+      ep_capacity_factor: float = 1.5
+      ep_expert_placement: str = "contiguous"
+
+    config = types.SimpleNamespace(
+        model_spec=types.SimpleNamespace(model=ModelConfig()),
+        parallelism=types.SimpleNamespace(expert_parallel_degree=1),
+        compile=types.SimpleNamespace(compile_grad_norm=True),
+    )
+    with self.assertRaisesRegex(ValueError, "ep_grad_reduce_dtype"):
+      self.fp.spark_expert_parallel(
+          config, degree=8, capacity_factor=2.0, expert_grad_reduce="bfloat16"
+      )
 
   def test_recipe_names_registered_only_here(self):
     # One recipe per name: the SFT layer's registry (--module
