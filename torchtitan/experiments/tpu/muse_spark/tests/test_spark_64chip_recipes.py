@@ -5,9 +5,9 @@
 # LICENSE file in the root directory of this source tree.
 """CPU checks that the 64-chip step recipes (``spark_64chip_recipes``) build with the intended settings.
 
-Needs TorchTPU or its import-only CPU stand-in on PYTHONPATH
-(``spark_e2e/tests/tpu_import_stubs``, as ``spark_e2e/tests/run_cpu.sh`` sets it)
-because the recipes enable the TPU MoE kernels; no model is instantiated.
+Needs TorchTPU or its CPU stand-in on PYTHONPATH
+(``torchtitan/experiments/tpu/tests/cpu_stubs``, as ``spark_e2e/tests/run_cpu.sh``
+sets it) because the recipes enable the TPU MoE kernels; no model is instantiated.
 """
 from __future__ import annotations
 

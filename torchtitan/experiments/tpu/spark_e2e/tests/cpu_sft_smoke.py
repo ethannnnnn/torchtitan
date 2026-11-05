@@ -29,7 +29,7 @@ steps and after the last; finite training losses; run B restores run A's
 adapter exactly; each run used the reader it asked for, and both readers give
 the same held-out loss for that adapter.
 
-    PYTHONPATH=<repo>/torchtitan/experiments/tpu/spark_e2e/tests/tpu_import_stubs:<repo> \\
+    PYTHONPATH=<repo>/torchtitan/experiments/tpu/tests/cpu_stubs:<repo> \\
       TORCH_DEVICE_BACKEND_AUTOLOAD=0 python -m torchtitan.experiments.tpu.spark_e2e.tests.cpu_sft_smoke \\
         --model <tiny-muse-spark> --work <new dir> [--nproc 2]
 

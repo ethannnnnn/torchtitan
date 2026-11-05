@@ -41,7 +41,7 @@ on CPU through the same entry point as the TPU stages (two ranks, LoRA-only
 checkpoints, PEFT exports, held-out loss, adapter initialization) and checks
 that a run killed mid-training and relaunched continues bit for bit like an
 uninterrupted one. Without TorchTPU the runner imports the TPU modules through
-the CPU stand-in in `spark_e2e/tests/tpu_import_stubs`.
+the shared CPU stand-in in `torchtitan/experiments/tpu/tests/cpu_stubs`.
 
 ## 2. Trainer runtime
 

@@ -13,8 +13,9 @@
 #                      (revision c9e83e8784d89e7e7f66f78e15adf10e3a93fdbb): adds the torchrun SFT
 #                      smoke and the kill-and-resume check through spark_e2e.train
 #   --nproc            ranks for those runs (default 2)
-# Without TorchTPU the TPU modules are imported through the CPU stand-in in
-# tpu_import_stubs/ (kernels raise if called; nothing here calls them).
+# Without TorchTPU the TPU modules are imported through the shared CPU stand-in
+# in torchtitan/experiments/tpu/tests/cpu_stubs (kernels raise if called;
+# nothing here calls them).
 set -euo pipefail
 TEST_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd "$TEST_DIR/../../../../.." && pwd)
@@ -29,7 +30,9 @@ while [[ $# -gt 0 ]]; do
 done
 export PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"
 if ! "$CPU_PYTHON" -c 'import torch_tpu' >/dev/null 2>&1; then
-  export PYTHONPATH="$TEST_DIR/tpu_import_stubs:$PYTHONPATH"
+  STUBS=$REPO_ROOT/torchtitan/experiments/tpu/tests/cpu_stubs
+  [[ -d "$STUBS/torch_tpu" ]] || { echo "no torch_tpu and no CPU stand-in at $STUBS" >&2; exit 2; }
+  export PYTHONPATH="$STUBS:$PYTHONPATH"
 fi
 export PJRT_DEVICE=CPU JAX_PLATFORMS=cpu TORCH_DEVICE_BACKEND_AUTOLOAD=0
 export HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1 PYTHONDONTWRITEBYTECODE=1

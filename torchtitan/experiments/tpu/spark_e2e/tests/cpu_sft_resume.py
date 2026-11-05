@@ -27,7 +27,7 @@ gradient norm, learning rate, the SHA-256 of every microbatch and its
 document ids); the final PEFT adapters are identical; the checkpoint holds
 only adapter tensors plus training state.
 
-    PYTHONPATH=<repo>/torchtitan/experiments/tpu/spark_e2e/tests/tpu_import_stubs:<repo> \\
+    PYTHONPATH=<repo>/torchtitan/experiments/tpu/tests/cpu_stubs:<repo> \\
       TORCH_DEVICE_BACKEND_AUTOLOAD=0 python -m torchtitan.experiments.tpu.spark_e2e.tests.cpu_sft_resume \\
         --model <tiny-muse-spark> --work <new dir> [--data <chat jsonl>] [--nproc 2] [--ac] [--partial]
 

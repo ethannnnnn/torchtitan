@@ -6,9 +6,9 @@
 """CPU checks for the end-to-end LoRA SFT recipes, the PEFT export and the tools. ASCII only.
 
 The recipe tests build trainer configs only (no model is instantiated); the
-TPU stages need TorchTPU or its import-only CPU stand-in on PYTHONPATH
-(``tests/tpu_import_stubs``, as ``run_cpu.sh`` sets it) and are skipped
-otherwise.
+TPU stages need TorchTPU or its CPU stand-in on PYTHONPATH
+(``torchtitan/experiments/tpu/tests/cpu_stubs``, as ``run_cpu.sh`` sets it)
+and are skipped otherwise.
 """
 from __future__ import annotations
 
