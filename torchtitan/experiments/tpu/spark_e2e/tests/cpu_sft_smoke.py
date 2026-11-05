@@ -15,7 +15,10 @@ exports, held-out loss):
   ``SPARK_VAL_EVERY=2``);
 * run B: a fresh run that starts from run A's last PEFT adapter
   (``SPARK_ADAPTER_INIT``) with a learning rate of 0, so its own export must
-  equal that adapter bit for bit.
+  equal that adapter bit for bit. Run A reads the base weights with the
+  default positional reader, run B with the stock Hugging Face reader
+  (``SPARK_FAST_READER=0``), and both measure the held-out loss of the same
+  adapter: run A after its last step, run B before its first.
 
 Checks: both runs exit 0; PEFT exports at every checkpoint step, every
 ``SPARK_EXPORT_EVERY`` steps and the last step, in the PEFT layout (HF module
@@ -23,7 +26,8 @@ names, rank 16 / alpha 32, an anchored ``target_modules`` regex); LoRA-only
 DCP checkpoints (adapter tensors plus optimizer, LR schedule, dataloader and
 train state, under 2 MB); held-out losses before the first step, every two
 steps and after the last; finite training losses; run B restores run A's
-adapter exactly.
+adapter exactly; each run used the reader it asked for, and both readers give
+the same held-out loss for that adapter.
 
     PYTHONPATH=<repo>/torchtitan/experiments/tpu/spark_e2e/tests/tpu_import_stubs:<repo> \\
       TORCH_DEVICE_BACKEND_AUTOLOAD=0 python -m torchtitan.experiments.tpu.spark_e2e.tests.cpu_sft_smoke \\
@@ -47,6 +51,7 @@ from pathlib import Path
 ENTRY = "torchtitan.experiments.tpu.spark_e2e.train"
 RECIPES = "torchtitan.experiments.tpu.spark_e2e.recipes"
 PROJECTIONS = ("q_proj", "k_proj", "v_proj", "o_proj")
+READER_LOG = "[spark] Hugging Face checkpoint reader:"
 COLORS = ("red", "blue", "green", "black", "white", "silver")
 ITEMS = ("mug", "lamp", "chair", "kettle", "scarf", "backpack", "notebook", "speaker")
 
@@ -118,6 +123,8 @@ def main() -> int:
         "SPARK_STEPS": str(args.steps), "SPARK_LR": "1e-2", "SPARK_EXPORT_EVERY": "3",
         "SPARK_VAL_DATA": str(val), "SPARK_VAL_EVERY": "2"})
     checks["run A exit 0"] = rc_a == 0
+    log_a = (work / "a.log").read_text()
+    checks["run A read the base with the positional reader"] = f"{READER_LOG} FastHFStorageReader" in log_a
     expected_exports = sorted({s for s in range(1, args.steps + 1) if s % 2 == 0 or s % 3 == 0} | {args.steps})
     summary["exports_a"] = adapter_steps(dump_a)
     checks[f"PEFT exports at steps {expected_exports}"] = summary["exports_a"] == expected_exports
@@ -163,13 +170,23 @@ def main() -> int:
         [r["step"] for r in steps] == list(range(1, args.steps + 1))
         and all(math.isfinite(r.get("loss_local", float("nan"))) for r in steps))
 
-    # ---- run B: start from run A's adapter, learning rate 0 --------------
+    # ---- run B: start from run A's adapter, learning rate 0, stock reader --
     dump_b = work / "b"
     rc_b = run_trainer(repo, args.nproc, args.model, train, dump_b, work / "b.log", [], {
-        "SPARK_STEPS": "1", "SPARK_LR": "0", "SPARK_ADAPTER_INIT": str(last)})
+        "SPARK_STEPS": "1", "SPARK_LR": "0", "SPARK_ADAPTER_INIT": str(last), "SPARK_FAST_READER": "0",
+        "SPARK_VAL_DATA": str(val)})
     checks["run B exit 0"] = rc_b == 0
     log_b = (work / "b.log").read_text()
     checks["run B logged the adapter init"] = "adapter initialized from" in log_b
+    checks["run B read the base with the stock reader"] = f"{READER_LOG} HuggingFaceStorageReader" in log_b
+    val_b_path = dump_b / "sft-val-rank0.json"
+    evals_b = json.loads(val_b_path.read_text())["evals"] if val_b_path.is_file() else []
+    summary["val_b"] = evals_b
+    first_b = evals_b[0]["loss"] if evals_b and evals_b[0]["step"] == 0 else float("nan")
+    last_a = evals[-1]["loss"] if evals and evals[-1]["step"] == args.steps else float("nan")
+    summary["held_out_last_a_first_b"] = [last_a, first_b]
+    checks["same held-out loss for run A's adapter with either reader"] = (
+        math.isfinite(first_b) and math.isfinite(last_a) and abs(first_b - last_a) <= 1e-5 * max(1.0, abs(last_a)))
     restored = dump_b / "adapter" / "step-1" / "adapter_model.safetensors"
     tensors_b = load_file(str(restored)) if restored.is_file() else {}
     checks["run B export == run A's adapter (bitwise)"] = bool(tensors) and sorted(tensors_b) == sorted(tensors) and all(

@@ -7,12 +7,13 @@
 
 Two gaps between the generic pieces and a LoRA run on an 816B model:
 
-1. State-dict adapter. ``MuseSparkStateDictAdapter`` is strict: it checks
-   that its HF map covers every model key, so a LoRA-converted model (extra
-   ``lora_a`` / ``lora_b`` keys) fails at construction and in ``from_hf``.
-   ``LoRATolerantMuseSparkAdapter`` excludes adapter keys from those checks;
-   ``post_training.lora.apply_lora`` then wraps it (``to_hf`` drops adapter
-   keys, ``to_hf_for_export`` merges them).
+1. Checkpoint reader. ``MuseSparkStateDictAdapter`` maps the Hugging Face
+   checkpoint and already leaves the LoRA adapter keys out of its checks
+   (``post_training.lora.apply_lora`` wraps it: ``to_hf`` drops adapter keys,
+   ``to_hf_for_export`` merges them). ``FastReaderSparkAdapter`` changes only
+   the reader: with ``SPARK_FAST_READER=1`` (the default) the base weights
+   are read with ``tpu_knobs.FastHFStorageReader``, one positional read per
+   contiguous slice; ``SPARK_FAST_READER=0`` keeps the base adapter's reader.
 2. Checkpoints. A LoRA checkpoint holds the adapters, their optimizer
    state, the LR schedule, the dataloader position and the step counter,
    not the frozen 1.64 TB base (``checkpointing.lora_checkpoint.
@@ -44,48 +45,35 @@ from torchtitan.experiments.tpu.checkpointing.lora_checkpoint import enable_adap
 from torchtitan.experiments.tpu.muse_spark import state_dict_adapter as spark_sda
 from torchtitan.experiments.tpu.post_training.lora import is_lora_key
 from torchtitan.experiments.tpu.post_training.sft_train import SFTTPUTrainer
-from torchtitan.protocols.state_dict_adapter import StateDictAdapter
 
 from .peft_adapter import adapter_spec_from_model, gather_peft_adapter, load_peft_into_model, save_peft_dir
 
 logger = logging.getLogger(__name__)
 
 
-class LoRATolerantMuseSparkAdapter(spark_sda.MuseSparkStateDictAdapter):
-    """``MuseSparkStateDictAdapter`` that ignores LoRA adapter keys."""
+class FastReaderSparkAdapter(spark_sda.MuseSparkStateDictAdapter):
+    """``MuseSparkStateDictAdapter`` that reads the checkpoint with the fast reader.
 
-    def __init__(self, model_config, hf_assets_path):  # noqa: D107 - see class doc
-        StateDictAdapter.__init__(self, model_config, hf_assets_path)
-        self.num_layers = len(model_config.layers)
-        self.from_hf_map = spark_sda._build_from_hf_map(model_config)
-        self.to_hf_map = {tt: hf for hf, tt in self.from_hf_map.items()}
-        self.moe_layers = [i for i, layer in enumerate(model_config.layers) if layer.moe is not None]
-        self.expected_hf_keys = set(spark_sda.hf_text_keys_for_config(model_config))
-        with torch.device("meta"):
-            model = model_config.build()
-        self.expected_model_shapes = {
-            k: tuple(v.shape) for k, v in model.state_dict().items() if not is_lora_key(k)
-        }
-        del model
-        experts = spark_sda._EXPERTS
-        expected_tt = set(self.from_hf_map.values()) | {
-            f"layers.{i}.{experts}.{w}" for i in self.moe_layers for w in ("w1_EFD", "w3_EFD")
-        }
-        if expected_tt != set(self.expected_model_shapes):
-            raise ValueError(
-                "LoRATolerantMuseSparkAdapter does not cover the model: missing "
-                f"{sorted(set(self.expected_model_shapes) - expected_tt)[:10]}, unknown "
-                f"{sorted(expected_tt - set(self.expected_model_shapes))[:10]}"
-            )
-        if hf_assets_path:
-            self._check_index(hf_assets_path)
+    ``SPARK_FAST_READER=1`` (default): ``tpu_knobs.FastHFStorageReader``.
+    ``SPARK_FAST_READER=0``, or a model whose expert rows use a permuted
+    placement: the base adapter's reader (which applies the placement).
+
+    The 64-chip step recipes (``muse_spark/spark_64chip_recipes.py``) have a
+    placement-aware variant of this reader, but importing that module patches
+    TorchTitan's checkpoint and metrics classes for the whole process, so the
+    SFT path keeps its own reader, the one its full-model TPU run used.
+    """
 
     def get_hf_storage_reader(self, path, from_quantized=False):
-        if os.environ.get("SPARK_FAST_READER", "1") == "1":
+        if os.environ.get("SPARK_FAST_READER", "1") == "1" and not self.permutes_experts:
             from .tpu_knobs import fast_reader
 
-            return fast_reader(path, from_quantized)
-        return super().get_hf_storage_reader(path, from_quantized)
+            reader = fast_reader(path, from_quantized)
+        else:
+            reader = super().get_hf_storage_reader(path, from_quantized)
+        if int(os.environ.get("RANK", "0")) == 0:
+            logger.info("[spark] Hugging Face checkpoint reader: %s", type(reader).__name__)
+        return reader
 
 
 def has_lora(model: torch.nn.Module) -> bool:

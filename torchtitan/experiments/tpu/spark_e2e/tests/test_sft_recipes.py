@@ -86,11 +86,11 @@ class RecipeTest(unittest.TestCase):
 
     def test_cpu_stage_defaults_and_knobs(self):
         from torchtitan.experiments.tpu.post_training.sft_config import SFTTrainerConfig
-        from torchtitan.experiments.tpu.spark_e2e.lora_publish import LoRATolerantMuseSparkAdapter
+        from torchtitan.experiments.tpu.spark_e2e.lora_publish import FastReaderSparkAdapter
 
         cfg = self._recipe("s0_sft_tiny")
         self.assertIsInstance(cfg, SFTTrainerConfig)
-        self.assertTrue(issubclass(cfg.model_spec.state_dict_adapter, LoRATolerantMuseSparkAdapter))
+        self.assertTrue(issubclass(cfg.model_spec.state_dict_adapter, FastReaderSparkAdapter))
         self.assertEqual(cfg.sft.lora_save, "full")  # SparkSFTTrainer installs the adapter-only checkpoints
         self.assertEqual((cfg.sft.val_data_path, cfg.sft.val_every, cfg.sft.val_max_microbatches), ("", 10, 0))
         self.assertEqual(cfg.dataloader.reasoning_effort, "low")
@@ -286,6 +286,44 @@ class FastReaderTest(unittest.TestCase):
             dcp.load(loaded, storage_reader=reader, no_dist=True)
             for key in weights:
                 self.assertTrue(torch.equal(loaded[key], weights[key]), key)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+@unittest.skipUnless(HAVE_TPU_IMPORTS, "needs torch_tpu or the CPU import stub on PYTHONPATH")
+class CheckpointReaderTest(unittest.TestCase):
+    """The recipes' HF adapter: built by the base adapter's constructor, reader chosen by SPARK_FAST_READER."""
+
+    def test_both_readers_load_the_same_tensors(self):
+        import torch.distributed.checkpoint as dcp
+        from safetensors.torch import save_file
+        from torch.distributed.checkpoint import HuggingFaceStorageReader
+        from torchtitan.experiments.tpu.muse_spark.state_dict_adapter import ExpertPermutingHFStorageReader
+        from torchtitan.experiments.tpu.spark_e2e.recipes import _lora, spark_model_spec
+        from torchtitan.experiments.tpu.spark_e2e.tpu_knobs import FastHFStorageReader
+
+        with _clean_env():
+            spec = spark_model_spec("tiny-hf", 256, lora=_lora(), tpu_kernels=False)
+        adapter = spec.state_dict_adapter(spec.model, None)  # LoRA model: adapter keys are not expected
+        self.assertFalse(adapter.permutes_experts)
+        tmp = Path(tempfile.mkdtemp(prefix="spark-adapter-reader-"))
+        try:
+            weights = {"model.language_model.norm.weight": torch.randn(6).to(torch.bfloat16),
+                       "model.language_model.layers.0.mlp.experts.down_proj": torch.randn(4, 3, 2)}
+            save_file(weights, str(tmp / "model-00001-of-00001.safetensors"))
+            for knob, reader_type in (("1", FastHFStorageReader), ("0", HuggingFaceStorageReader)):
+                with _clean_env(SPARK_FAST_READER=knob):
+                    reader = adapter.get_hf_storage_reader(str(tmp))
+                self.assertIs(type(reader), reader_type, knob)
+                loaded = {k: torch.empty_like(v) for k, v in weights.items()}
+                dcp.load(loaded, storage_reader=reader, no_dist=True)
+                for key in weights:
+                    self.assertTrue(torch.equal(loaded[key], weights[key]), (knob, key))
+            # A permuted expert placement always goes through the base adapter's reader.
+            slots = list(adapter.expert_slot_to_logical)
+            adapter.expert_slot_to_logical = slots[1::-1] + slots[2:]
+            with _clean_env(SPARK_FAST_READER="1"):
+                self.assertIsInstance(adapter.get_hf_storage_reader(str(tmp)), ExpertPermutingHFStorageReader)
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 

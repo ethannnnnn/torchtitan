@@ -6,8 +6,8 @@
 """Muse Spark LoRA SFT recipes for the end-to-end stages. ASCII only.
 
 Built on ``post_training.config_registry`` (``_base_config``) and the chat
-SFT loader; the differences are the model spec (LoRA-tolerant HF adapter,
-see ``lora_publish``) and per-stage geometry:
+SFT loader; the differences are the model spec (the Muse Spark HF adapter with
+the fast checkpoint reader, see ``lora_publish``) and per-stage geometry:
 
 * ``s0_sft_tiny``: CPU, the public tiny Muse Spark checkpoint (``tiny-hf``),
   no TPU kernels, fp32.
@@ -29,8 +29,9 @@ training and evaluation see the same system prompt), ``SPARK_COMPILE`` [0:
 eager DEFER_AND_FUSE; 1 compiles blocks], ``SPARK_AC`` [1 on TPU, 0 on CPU:
 full activation checkpointing], ``SPARK_WARMUP`` [2], ``SPARK_ADAPTER_INIT``
 (PEFT adapter directory to start from), ``SPARK_EXPORT_EVERY`` [0] (also
-export the PEFT adapter every N steps), ``SPARK_FAST_READER`` [1] and
-``SPARK_HF_READER_THREADS`` [8] (checkpoint reader, ``tpu_knobs``),
+export the PEFT adapter every N steps), ``SPARK_FAST_READER`` [1: the
+positional reader of ``tpu_knobs``; 0: the stock Hugging Face reader] and
+``SPARK_HF_READER_THREADS`` [8] (threads of the positional reader),
 ``SPARK_SFT_SEQ`` [8192 on TPU, 4096 on CPU] (packed row length, a multiple
 of 1,024 on TPU), ``SPARK_SFT_ROWS`` [1] (packed rows per rank and
 microbatch; two rows amortize the per-step expert all-gathers of expert
@@ -63,7 +64,7 @@ from torchtitan.experiments.tpu.post_training.lora import LoRAOptions, apply_lor
 from torchtitan.experiments.tpu.post_training.sft_config import SFTConfig, SFTTrainerConfig, as_sft_config
 from torchtitan.experiments.tpu.post_training.sft_data import ChatSFTDataLoader
 
-from .lora_publish import LoRATolerantMuseSparkAdapter
+from .lora_publish import FastReaderSparkAdapter
 
 
 def _env_int(name: str, default: int) -> int:
@@ -79,7 +80,7 @@ def spark_model_spec(flavor: str, seq_len: int, *, lora: LoRAOptions | None,
     from torchtitan.experiments.tpu.muse_spark import model_registry
 
     spec = model_registry(flavor, seq_len=seq_len, tpu_moe_kernels=tpu_kernels)
-    spec.state_dict_adapter = LoRATolerantMuseSparkAdapter
+    spec.state_dict_adapter = FastReaderSparkAdapter
     if lora is not None:
         apply_lora(spec, lora)
     return spec
