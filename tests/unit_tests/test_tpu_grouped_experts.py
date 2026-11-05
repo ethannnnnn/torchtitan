@@ -31,21 +31,25 @@ from torchtitan.protocols.sharding import ShardingConfig
 def _build_experts(
     num_experts=1,
     *,
+    activation="silu",
     use_pallas_grouped_mm=False,
     use_pallas_paired_grouped_mm=False,
     use_kernel_native_weight_layout=False,
+    use_tokamax_gmm_v2=False,
     param_init=None,
 ):
     config = TpuGroupedExperts.Config(
         dim=16,
         hidden_dim=24,
         num_experts=num_experts,
+        activation=activation,
         use_pallas_grouped_mm=use_pallas_grouped_mm,
         use_pallas_paired_grouped_mm=use_pallas_paired_grouped_mm,
         pallas_grouped_mm_tgmm_tiling=(
             (128, 0, 0) if use_pallas_paired_grouped_mm else (128, 128, 128)
         ),
         use_kernel_native_weight_layout=use_kernel_native_weight_layout,
+        use_tokamax_gmm_v2=use_tokamax_gmm_v2,
         param_init=param_init,
     )
     experts = config.build()
@@ -206,6 +210,17 @@ def test_graph_trainer_parallelize_forwards_to_the_graph_trainer():
 def test_kernel_native_layout_requires_pallas():
     with pytest.raises(ValueError, match="Kernel-native expert weights require Pallas"):
         _build_experts(use_kernel_native_weight_layout=True)
+
+
+def test_kernel_native_layout_accepts_tokamax_gmm_v2():
+    experts = _build_experts(
+        use_kernel_native_weight_layout=True, use_tokamax_gmm_v2=True
+    )
+    assert {name for name, _ in experts.named_parameters()} == {
+        "w1_EDF",
+        "w2_EFD",
+        "w3_EDF",
+    }
 
 
 def test_paired_grouped_mm_validates_supported_configuration():
@@ -470,6 +485,94 @@ def test_kernel_native_layout_pallas_forward_and_backward(use_pair):
     ):
         expected_param = getattr(stock, name)
         torch.testing.assert_close(grad, expected_param.grad, rtol=0.01, atol=1e-6)
+
+
+_GMM_V2 = "torchtitan.experiments.tpu.kernels.gmm_v2_grouped_mm.gmm_v2_grouped_mm"
+
+
+def _gmm_v2_reference(lhs, rhs, group_sizes):
+    """CPU stand-in for the Tokamax GMM-v2 kernel; ``rhs`` is ``(E, K, N)``."""
+    offsets = torch.cumsum(group_sizes, dim=0, dtype=torch.int32)
+    return torch._grouped_mm(lhs, rhs, offs=offsets)
+
+
+@pytest.mark.parametrize("activation", ["silu", "gelu_tanh"])
+@pytest.mark.parametrize("use_pallas_grouped_mm", [False, True])
+@pytest.mark.parametrize("native", [False, True])
+def test_tokamax_gmm_v2_forward_and_backward(native, use_pallas_grouped_mm, activation):
+    """GMM-v2 runs all three expert matmuls, in either weight layout.
+
+    With the kernel stubbed by ``torch._grouped_mm``, this checks the wiring
+    against the stock experts on the same weights: ``(E, K, N)`` BF16 weights,
+    unpadded rows, the activation, and precedence over the MegaBlox kernels.
+    """
+    param_init = {
+        name: lambda x: torch.nn.init.normal_(x, std=0.02)
+        for name in ("w1_EFD", "w2_EDF", "w3_EFD")
+    }
+    torch.manual_seed(0)
+    stock = _build_experts(num_experts=2, activation=activation, param_init=param_init)
+    stock.init_states()
+    experts = _build_experts(
+        num_experts=2,
+        activation=activation,
+        use_pallas_grouped_mm=use_pallas_grouped_mm,
+        use_kernel_native_weight_layout=native,
+        use_tokamax_gmm_v2=True,
+    )
+    experts.load_state_dict(stock.state_dict())
+    x = torch.randn(7, 16, requires_grad=True)
+    x_v2 = x.detach().clone().requires_grad_(True)
+    counts = torch.tensor([3, 4], dtype=torch.int32)
+
+    expected = stock.forward(x, counts)
+    with patch(_GMM_V2, side_effect=_gmm_v2_reference) as gmm_v2, patch(
+        "torchtitan.experiments.tpu.grouped_experts.segment_matmul_pallas_2d"
+    ) as unpaired, patch(
+        "torchtitan.experiments.tpu.grouped_experts.paired_segment_matmul_pallas_2d"
+    ) as paired:
+        actual = experts.forward(x_v2, counts)
+
+    unpaired.assert_not_called()
+    paired.assert_not_called()
+    assert [call.args[1].shape for call in gmm_v2.call_args_list] == [
+        (2, 16, 24),
+        (2, 16, 24),
+        (2, 24, 16),
+    ]
+    for call in gmm_v2.call_args_list:
+        lhs, rhs, group_sizes = call.args
+        assert lhs.shape[0] == 7
+        assert lhs.dtype == rhs.dtype == torch.bfloat16
+        assert group_sizes is counts
+    torch.testing.assert_close(actual, expected)
+
+    actual.float().square().sum().backward()
+    expected.float().square().sum().backward()
+    torch.testing.assert_close(x_v2.grad, x.grad, rtol=0.01, atol=1e-6)
+    for name, native_name in (
+        ("w1_EFD", "w1_EDF"),
+        ("w2_EDF", "w2_EFD"),
+        ("w3_EFD", "w3_EDF"),
+    ):
+        if native:
+            grad = getattr(experts, native_name).grad.transpose(-2, -1)
+        else:
+            grad = getattr(experts, name).grad
+        torch.testing.assert_close(
+            grad, getattr(stock, name).grad, rtol=0.01, atol=1e-6
+        )
+
+
+def test_tokamax_gmm_v2_rejects_row_scale():
+    experts = _build_experts(num_experts=2, use_tokamax_gmm_v2=True)
+    x = torch.randn(7, 16)
+    counts = torch.tensor([3, 4], dtype=torch.int32)
+    with patch(_GMM_V2) as gmm_v2, pytest.raises(
+        ValueError, match="row_scale_R is not supported with Tokamax GMM-v2"
+    ):
+        experts.forward(x, counts, row_scale_R=torch.ones(7))
+    gmm_v2.assert_not_called()
 
 
 def test_kernel_native_layout_transposes_tp_sharding_axes():
