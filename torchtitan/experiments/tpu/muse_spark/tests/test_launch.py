@@ -22,6 +22,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 import zipfile
 from pathlib import Path
@@ -745,6 +746,11 @@ class RuntimeInstallTest(unittest.TestCase):
         result = self._install("badpin", **bad)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("does not match its pin", result.stderr)
+        # A pinned system package list must exist: a missing list would skip the system packages silently.
+        result = self._install("nodebs", **pins, SPARK_RUNTIME_DEBS_SHA256="3" * 64)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("the system package list is pinned but", result.stderr)
+        self.assertNotIn("VERSION", result.stdout)
 
 
 @unittest.skipUnless(HAVE_BASH, "needs bash >= 4.4")
@@ -847,6 +853,19 @@ class SparkPodDryRunTest(unittest.TestCase):
         self.assertEqual(result.returncode, 5, result.stdout + result.stderr)
         self.assertIn("[SPARK:IMPORTS] the import check did not finish within 3 s", result.stdout)
         self.assertIn("python", self._versions())  # written before the imports
+
+    def test_import_check_kills_an_import_that_ignores_sigterm(self):
+        modules = self.tmp / "modules"
+        modules.mkdir()
+        (modules / "spark_stubborn_module_for_tests.py").write_text(
+            "import signal, time\nsignal.signal(signal.SIGTERM, signal.SIG_IGN)\ntime.sleep(600)\n")
+        start = time.monotonic()
+        result = self._run(SPARK_CONFIG="c", SPARK_IMPORT_MODULES="spark_stubborn_module_for_tests",
+                           SPARK_IMPORT_TIMEOUT_S="2",
+                           PYTHONPATH=os.pathsep.join(filter(None, [str(modules), os.environ.get("PYTHONPATH")])))
+        self.assertLess(time.monotonic() - start, 120)  # SIGTERM after 2 s is ignored; SIGKILL 30 s later
+        self.assertEqual(result.returncode, 5, result.stdout + result.stderr)
+        self.assertIn("[SPARK:IMPORTS] the import check did not finish within 2 s", result.stdout)
 
     def test_low_open_file_limit_is_reported(self):
         result = self._run(SPARK_CONFIG="c", wrapper="ulimit -Sn 1024 && ulimit -Hn 1024")
