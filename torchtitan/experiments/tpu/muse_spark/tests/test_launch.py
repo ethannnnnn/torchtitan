@@ -390,6 +390,27 @@ class RenderTest(LaunchTestCase):
             with self.subTest(command=bad), self.assertRaises(SystemExit):
                 render.check_command(bad, set(env))
 
+    def test_slice_provisioning(self):
+        """Default: existing node pools of the slice shape. dynamic adds exactly three settings."""
+        common = ("--mode", "e2e", "--run", "slices", "--topology", "4x4x4", "--config", "s2_sft_full",
+                  "--render-id", "same")
+        static, static_maps, static_receipt, _ = self._render(*common)
+        dynamic, dynamic_maps, dynamic_receipt, _ = self._render(*common, "--slice-provisioning", "dynamic")
+        self.assertEqual((static_receipt["slice_provisioning"], dynamic_receipt["slice_provisioning"]),
+                         ("static", "dynamic"))
+        self.assertEqual(pod_of(static)["nodeSelector"], {"cloud.google.com/gke-tpu-accelerator": "tpu7x",
+                                                          "cloud.google.com/gke-tpu-topology": "4x4x4"})
+        self.assertNotIn("metadata", static["spec"]["replicatedJobs"][0]["template"])
+        self.assertFalse([key for key in static["metadata"]["labels"] if key.startswith("x.tpu")])
+        added = json.loads(json.dumps(dynamic))
+        self.assertEqual(added["metadata"]["labels"].pop("x.tpu.cloud.google.com/slice-autoprovisioning"), "async")
+        self.assertEqual(added["spec"]["replicatedJobs"][0]["template"].pop("metadata"),
+                         {"labels": {"x.tpu.google.com/inject-slice-selector": "true"}})
+        self.assertEqual(pod_of(added)["nodeSelector"].pop("cloud.google.com/gke-accelerator-topology-mode"),
+                         "PROVISION_ONLY")
+        self.assertEqual(added, static)
+        self.assertEqual(dynamic_maps, static_maps)
+
     def test_priority_class_labels_work_size_and_extra_args(self):
         jobset, maps, _, _ = self._render("--mode", "sft", "--run", "t", "--topology", "2x2x1", "--config", "c",
                                           "--priority-class", "example-priority", "--extra-args=--training.steps=3",
@@ -458,6 +479,8 @@ class RenderTest(LaunchTestCase):
             ["--render-id", "toolongid"],
             ["--label", "muse-spark-run=other"],
             ["--label", "muse-spark-render=other"],
+            ["--label", "x.tpu.cloud.google.com/slice-autoprovisioning=async"],
+            ["--slice-provisioning", "auto"],
         ]
         for override in bad:
             args = ["--mode", "sft", "--run", "ok", "--topology", "2x2x1", "--config", "c", *BASE_ARGS,

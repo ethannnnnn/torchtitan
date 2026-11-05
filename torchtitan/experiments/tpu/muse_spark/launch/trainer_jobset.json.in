@@ -9,8 +9,7 @@
       "muse-spark-run": "<RUN_NAME>",
       "muse-spark-mode": "<MODE>",
       "muse-spark-render": "<RENDER_ID>",
-      "kueue.x-k8s.io/queue-name": "<LOCAL_QUEUE>",
-      "x.tpu.cloud.google.com/slice-autoprovisioning": "async"
+      "kueue.x-k8s.io/queue-name": "<LOCAL_QUEUE>"
     },
     "annotations": {
       "muse-spark/base-commit": "<BASE_COMMIT>",
@@ -35,11 +34,6 @@
         "name": "trainer",
         "replicas": 1,
         "template": {
-          "metadata": {
-            "labels": {
-              "x.tpu.google.com/inject-slice-selector": "true"
-            }
-          },
           "spec": {
             "activeDeadlineSeconds": "<DEADLINE_S>",
             "backoffLimit": 0,
@@ -66,8 +60,7 @@
                 "terminationGracePeriodSeconds": 120,
                 "nodeSelector": {
                   "cloud.google.com/gke-tpu-accelerator": "tpu7x",
-                  "cloud.google.com/gke-tpu-topology": "<TPU_TOPOLOGY>",
-                  "cloud.google.com/gke-accelerator-topology-mode": "PROVISION_ONLY"
+                  "cloud.google.com/gke-tpu-topology": "<TPU_TOPOLOGY>"
                 },
                 "tolerations": [
                   {

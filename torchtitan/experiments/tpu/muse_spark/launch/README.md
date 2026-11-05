@@ -26,11 +26,16 @@ account with read access to the runtime, model, and data prefixes and write
 access to the run prefix. The pods fetch the base commit from the public
 repository (`--base-repo`, default `https://github.com/google-pytorch/torchtitan.git`)
 and, with `--pip-overlay` and no `--pip-find-links`, wheels from PyPI, so
-they need outbound HTTPS. The template carries the labels used by dynamic
-slice provisioning (`x.tpu.cloud.google.com/slice-autoprovisioning`,
-`x.tpu.google.com/inject-slice-selector`) and
-`cloud.google.com/gke-accelerator-topology-mode: PROVISION_ONLY`; remove them
-if your cluster uses static TPU node pools.
+they need outbound HTTPS.
+
+By default the pods select existing TPU7x nodes of the slice shape
+(`cloud.google.com/gke-tpu-accelerator`, `cloud.google.com/gke-tpu-topology`).
+On a cluster that provisions the slice when the queue admits the JobSet,
+render with `--slice-provisioning dynamic`: it adds the JobSet label
+`x.tpu.cloud.google.com/slice-autoprovisioning: async`, the Job template label
+`x.tpu.google.com/inject-slice-selector: "true"` and the node selector
+`cloud.google.com/gke-accelerator-topology-mode: PROVISION_ONLY`, and nothing
+else. The receipt records the choice.
 
 ## Storage layout
 

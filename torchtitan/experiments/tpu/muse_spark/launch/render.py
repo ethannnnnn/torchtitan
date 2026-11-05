@@ -52,7 +52,8 @@ ENV_NAME = re.compile(r"[A-Z_][A-Z0-9_]*")
 SECRET_NAME = re.compile(r"TOKEN|SECRET|PASSWORD|CREDENTIAL|PRIVATE_KEY")
 RENDER_ID = re.compile(r"[a-z0-9]{1,8}")
 KIT_LABELS = frozenset({"app", "component", "muse-spark-run", "muse-spark-mode", "muse-spark-render",
-                        "kueue.x-k8s.io/queue-name"})
+                        "kueue.x-k8s.io/queue-name", "x.tpu.cloud.google.com/slice-autoprovisioning",
+                        "x.tpu.google.com/inject-slice-selector"})
 """Labels the kit sets itself (cleanup and ownership rely on them); --label cannot override them."""
 SHA256 = re.compile(r"[0-9a-f]{64}")
 # In container arguments the kubelet replaces $(NAME) by the value of the container variable NAME
@@ -87,6 +88,13 @@ MODES = {
     "export": ("torchtitan.experiments.tpu.checkpointing.hf_export", "-"),
 }
 RUNTIME_MODES = ("auto", "mounted", "preinstalled")
+# --slice-provisioning dynamic: labels and node selector for clusters that provision the TPU slice
+# when the queue admits the JobSet. The default (static) uses existing node pools of the slice shape.
+DYNAMIC_SLICE = {
+    "jobset_labels": {"x.tpu.cloud.google.com/slice-autoprovisioning": "async"},
+    "job_labels": {"x.tpu.google.com/inject-slice-selector": "true"},
+    "node_selector": {"cloud.google.com/gke-accelerator-topology-mode": "PROVISION_ONLY"},
+}
 
 
 def substitute(value, settings):
@@ -151,6 +159,10 @@ def parse_args(argv=None):
     p.add_argument("--mode", choices=sorted(MODES), required=True)
     p.add_argument("--run", required=True, help="JobSet name (DNS label, at most 40 characters)")
     p.add_argument("--topology", choices=sorted(TOPOLOGIES), required=True)
+    p.add_argument("--slice-provisioning", choices=("static", "dynamic"), default="static",
+                   help="static: existing TPU7x node pools of the slice shape (default); dynamic: add the labels "
+                        "and node selector of dynamic TPU slice provisioning (the slice is created when the "
+                        "queue admits the JobSet)")
     p.add_argument("--config", required=True,
                    help="recipe name in the config module; with --mode export, the PEFT adapter "
                         "directory relative to --data-dir (e.g. adapter/step-60)")
@@ -384,6 +396,11 @@ def main(argv=None):
     check_command(command, {env["name"] for env in container_env})
     if args.priority_class:
         pod_spec["priorityClassName"] = args.priority_class
+    if args.slice_provisioning == "dynamic":
+        trainer["metadata"]["labels"].update(DYNAMIC_SLICE["jobset_labels"])
+        job_template = trainer["spec"]["replicatedJobs"][0]["template"]
+        job_template.setdefault("metadata", {}).setdefault("labels", {}).update(DYNAMIC_SLICE["job_labels"])
+        pod_spec["nodeSelector"].update(DYNAMIC_SLICE["node_selector"])
     if args.labels:
         trainer["metadata"]["labels"].update(args.labels)
         trainer["spec"]["replicatedJobs"][0]["template"]["spec"]["template"]["metadata"]["labels"].update(args.labels)
@@ -391,7 +408,8 @@ def main(argv=None):
     receipt = {
         "kind": "muse-spark-render", "status": "RENDERED", "mode": args.mode, "run": args.run,
         "render_id": args.render_id,
-        "topology": args.topology, "hosts": hosts, "chips": 4 * hosts, "ranks": 8 * hosts,
+        "topology": args.topology, "slice_provisioning": args.slice_provisioning,
+        "hosts": hosts, "chips": 4 * hosts, "ranks": 8 * hosts,
         "accelerator_type": accelerator, "entry": entry, "config_module": config_module, "config": args.config,
         "extra_args": args.extra_args, "image": args.trainer_image,
         "code": {

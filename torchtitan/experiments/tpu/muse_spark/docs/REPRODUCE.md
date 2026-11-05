@@ -10,8 +10,10 @@ repository root unless noted. The launch kit is described in
 
 - A GKE cluster with TPU7x capacity: 4 chips (`2x2x1`) for the two-layer
   smoke and 64 chips (`4x4x4`, 16 hosts, 128 ranks) for the full 62-layer
-  model. With dynamic slice provisioning, 64-chip slices came up in under a
-  minute while some small slices were never provisioned.
+  model, as node pools of those shapes or through dynamic slice provisioning
+  (`render.py --slice-provisioning dynamic`). With dynamic slice provisioning,
+  64-chip slices came up in under a minute while some small slices were never
+  provisioned.
 - JobSet, Kueue, and the GCSFuse CSI driver; a Kubernetes service account that
   can read your model, data, and runtime prefixes and write the run prefix.
   The pods need outbound HTTPS: they fetch the base commit from the public
@@ -115,6 +117,10 @@ SITE=(--bucket <GCS_BUCKET> --namespace <K8S_NAMESPACE> --local-queue <LOCAL_QUE
       --code-overlay ./overlay
       --pip-overlay torchtitan/experiments/tpu/muse_spark/launch/pip-pins-jax0.12.0.1-tokamax0.0.17.txt)
 ```
+
+Add `--slice-provisioning dynamic` if your cluster creates TPU slices on
+demand (the run quoted below did); without it the pods wait for existing
+TPU7x nodes of the slice shape.
 
 ### Two-layer smoke (`s1_sft_trunc2`, one 4-chip host)
 
