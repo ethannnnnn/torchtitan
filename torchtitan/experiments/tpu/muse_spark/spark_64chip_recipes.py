@@ -96,7 +96,7 @@ def _install_hbm_logger() -> None:
         info["total_GiB"] = round(total / 2**30, 2)
       except Exception as e:  # pragma: no cover
         info["get_memory_info"] = repr(e)[:80]
-      print(f"[SPMEM] rank={os.environ.get('RANK')} step={step} {json.dumps(info)}", flush=True)
+      print(f"[spark] hbm rank={os.environ.get('RANK')} step={step} {json.dumps(info)}", flush=True)
     return out
 
   log._sp_hbm = True
@@ -111,8 +111,8 @@ def _install_ckpt_cache_drop() -> None:
 
   ``ModelWrapper`` caches ``model.state_dict()``; with the TPU kernel-native expert layout the
   state-dict hook returns fresh contiguous canonical copies of every expert weight, so the cache
-  pins ~11.6 GiB per device on the full model for the whole run (VERIFIED-ON-TPU: resident 66.4 vs
-  54.8 GiB, full-param OOM at step 2). The cache only serves asynchronous saves (stable staging
+  pins ~11.6 GiB per device on the full model for the whole run (measured on TPU7x: resident 66.4
+  vs 54.8 GiB, full-param OOM at step 2). The cache only serves asynchronous saves (stable staging
   buffers); with synchronous saves it is dropped after each load and each save.
   """
   if os.environ.get("SPARK_DROP_CKPT_CACHE", "1") != "1":
@@ -154,7 +154,8 @@ def _install_ckpt_cache_drop() -> None:
 
         seconds = device_flush(device)
         if int(os.environ.get("RANK", "0")) == 0:
-          print(f"[SPCKPT] step={curr_step} every rank left the save (flush {seconds:.3f} s)", flush=True)
+          print(f"[spark] checkpoint step={curr_step}: every rank left the save (flush {seconds:.3f} s)",
+                flush=True)
     return saved
 
   CheckpointManager._save = _save
@@ -308,7 +309,8 @@ class FastHFStorageReader(HuggingFaceStorageReader):
       md.storage_meta = StorageMeta()
     md.storage_meta.load_id = self.load_id
     if int(os.environ.get("RANK", "0")) == 0:
-      print(f"[SPLOAD] read_metadata: {len(files)} files, {len(sd_md)} tensors in {_time.time() - t0:.1f}s", flush=True)
+      print(f"[spark] hf read_metadata: {len(files)} files, {len(sd_md)} tensors in {_time.time() - t0:.1f}s",
+            flush=True)
     return md
 
   def read_data(self, plan, planner):
@@ -417,7 +419,7 @@ class FastHFStorageReader(HuggingFaceStorageReader):
       list(pool.map(do_file, per_file.items()))
     if int(os.environ.get("RANK", "0")) == 0:
       nbytes = sum(t.numel() * t.element_size() for t in [planner.resolve_tensor(r) for r in plan.items])
-      print(f"[SPLOAD] read_data rank0: {len(plan.items)} slices from {len(per_file)} files, "
+      print(f"[spark] hf read_data rank0: {len(plan.items)} slices from {len(per_file)} files, "
             f"{nbytes / 2**30:.2f} GiB in {_time.time() - t0:.1f}s ({self.thread_count} threads)", flush=True)
     fut: Future = Future()
     fut.set_result(None)
