@@ -319,6 +319,34 @@ class ChatSFTDataLoaderTest(unittest.TestCase):
         self.assertTrue(torch.equal(want[key], got[key]), key)
       self.assertEqual(want["num_valid_tokens"], got["num_valid_tokens"])
 
+  def test_state_dict_schema(self):
+    loader = self._loader(self.path, rank=1, world=2)
+    next(iter(loader))
+    state = loader.state_dict()
+    self.assertEqual(set(state), {"version", "dp_world_size", "dp_rank_1"})
+    self.assertEqual((state["version"], state["dp_world_size"]), (1, 2))
+    position = state["dp_rank_1"]
+    self.assertEqual(set(position), {"epoch", "cursor", "pending"})
+    self.assertIsInstance(position["epoch"], int)
+    self.assertIsInstance(position["cursor"], int)
+    self.assertIsInstance(position["pending"], list)
+    self.assertTrue(all(isinstance(i, int) for i in position["pending"]))
+
+  def test_load_empty_state_changes_nothing(self):
+    loader = self._loader(self.path)
+    next(iter(loader))
+    before = loader.state_dict()
+    loader.load_state_dict({})
+    self.assertEqual(loader.state_dict(), before)
+
+  def test_load_state_guards(self):
+    loader = self._loader(self.path)
+    state = loader.state_dict()
+    with self.assertRaises(ValueError):
+      loader.load_state_dict(dict(state, version=2))
+    with self.assertRaises(ValueError):
+      loader.load_state_dict(dict(state, dp_world_size=2))
+
 
 if __name__ == "__main__":
   unittest.main()

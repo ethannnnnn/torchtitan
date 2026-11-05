@@ -4,39 +4,48 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Packed chat SFT dataloader.
+"""Packed chat SFT microbatches in which only assistant tokens are trained.
 
-Each record holds a conversation (``messages``: system / user / assistant /
-tool turns; JSONL or parquet). ``ChatSFTDataLoader`` renders it with the
-checkpoint's chat template (``chat_template.render_chat``), trains only the
-assistant tokens, and packs conversations into the native fixed-shape batch:
+Data: records that hold a conversation under ``messages`` (system, user,
+assistant and tool turns), stored as JSONL lines or parquet rows. Each
+conversation is rendered by ``chat_template.render_chat`` with the template
+that ships with the model; the assistant tokens are the only targets.
 
-    input            [T] int64  token ids, pad-filled
-    labels           [T] int64  next-token targets; IGNORE_INDEX off the
-                                assistant tokens, at document ends and on pad
-    positions        [T] int64  restart at 0 at every document start
-    padding_mask     [T] bool   True on padding
-    num_valid_tokens int        supervised targets in this microbatch
+A microbatch consists of 1-D tensors of length T, filled row after row:
 
-``T = rows * max_context_length`` (``training.num_tokens_per_microbatch_per_
-dp_rank``). A document never crosses a row; positions reset per document, so
-models that derive document masks from position resets (flex / splash /
-varlen attention) never attend across documents. The tail pad continues the
-last document's positions, so it creates no phantom document. The trainer
-sums ``num_valid_tokens`` over microbatches and data-parallel ranks and
-divides the summed cross-entropy by that global count.
+* ``input``, int64 -- token ids; padded slots hold the pad id.
+* ``labels``, int64 -- the following token wherever it is trained, otherwise
+  ``IGNORE_INDEX``: outside assistant targets, on the last token of every
+  document and on all padding.
+* ``positions``, int64 -- counts 0, 1, 2, ... within a document and starts
+  over at the first token of the next one.
+* ``padding_mask``, bool -- true on exactly the padded slots.
+* ``num_valid_tokens``, a Python int -- how many targets the microbatch
+  trains.
 
-Packing is first-fit decreasing over a lookahead window of documents, at most
-``max_documents_per_row`` documents per row; documents that do not fit wait
-for the next microbatch. Conversations longer than a row are dropped
-(``overlong="drop"``) or cut to the row (``"truncate"``; only the retained
-assistant tokens train). Data-parallel ranks read disjoint strided shards of
-one shuffled epoch order; epochs reshuffle with ``shuffle_seed + epoch``. The
-state dict holds the epoch, the shard cursor and the pending documents, so a
-resumed run serves exactly the batches it would have served. ``batch_log``
-lists, per microbatch served, a SHA-256 fingerprint of its token, label and
-position tensors and the ids of the documents packed into it (the trainer
-drains it every step), so two runs can be compared batch by batch.
+T equals rows x ``max_context_length``, i.e.
+``training.num_tokens_per_microbatch_per_dp_rank``, and no document crosses
+from one row into the next. Attention kernels that find document starts
+where ``positions`` returns to 0 (flex, splash, varlen) thus keep every
+document separate. Padding at the end of a row carries on counting from the
+final position of the row's last document rather than restarting at 0, so it
+never opens a document of its own. The trainer divides the summed loss by the
+number of trained targets across all ranks.
+
+Packing considers a window of ``lookahead_documents`` documents, places the
+longest first into the first row with space (first fit), with at most
+``max_documents_per_row`` per row; documents left without space wait for the
+next microbatch. Conversations longer than a row are either dropped
+(``overlong="drop"``) or cut to the row length (``"truncate"``), in which case
+the assistant tokens that remain are trained.
+
+Every epoch draws a single shuffled order seeded with ``shuffle_seed +
+epoch``; data-parallel rank r takes positions r, r + n, r + 2n, ... of it for
+n ranks, so no conversation is seen by two ranks. ``load_state_dict`` brings a
+loader to the saved position, after which it produces the very microbatches
+the saved loader would have produced next. ``batch_log`` receives an entry for
+each microbatch served -- a fingerprint plus the indices of the
+conversations packed into it -- and the trainer clears it after each step.
 """
 
 from __future__ import annotations
@@ -61,6 +70,26 @@ logger = logging.getLogger(__name__)
 OVERLONG_POLICIES = ("drop", "truncate")
 
 
+def _read_records(file: Path) -> Iterator[dict[str, Any]]:
+  """The rows of a parquet file (read with pyarrow); for any other file, the
+  JSON object on each non-blank line (UTF-8)."""
+  if file.suffix == ".parquet":
+    import pyarrow.parquet as pq
+
+    yield from pq.read_table(str(file)).to_pylist()
+    return
+  with file.open(encoding="utf-8") as handle:
+    for line in handle:
+      if line.strip():
+        yield json.loads(line)
+
+
+def _decoded_messages(record: dict[str, Any]) -> Any:
+  """A record's ``messages`` value, parsed first when it is JSON text."""
+  value = record.get("messages")
+  return json.loads(value) if isinstance(value, str) else value
+
+
 def load_conversations(
     path: str | Path, *, limit: int | None = None
 ) -> list[list[dict[str, Any]]]:
@@ -79,20 +108,7 @@ def load_conversations(
     raise FileNotFoundError(f"no SFT records at {resolved}")
   conversations: list[list[dict[str, Any]]] = []
   for file in files:
-    if file.suffix == ".parquet":
-      import pyarrow.parquet as pq
-
-      records = pq.read_table(file).to_pylist()
-    else:
-      records = [
-          json.loads(line)
-          for line in file.read_text(encoding="utf-8").splitlines()
-          if line.strip()
-      ]
-    for record in records:
-      messages = record.get("messages")
-      if isinstance(messages, str):
-        messages = json.loads(messages)
+    for messages in map(_decoded_messages, _read_records(file)):
       if not isinstance(messages, list) or not messages:
         raise ValueError(f"SFT record {len(conversations)} has no messages")
       if not any(m.get("role") == "assistant" for m in messages):
@@ -149,68 +165,92 @@ def pack_rows(
     width: int,
     max_docs_per_row: int,
 ) -> tuple[list[list[SFTDocument]], list[SFTDocument]]:
-  """First-fit decreasing placement. Returns (per-row documents, leftovers).
+  """First-fit decreasing: place whole documents into ``rows`` rows.
 
-  The first document always lands (it fits an empty row), so every call
-  makes progress; leftovers keep their arrival order.
+  Documents are taken longest first, equal lengths in input order. Each goes
+  into the lowest-numbered row that still has a free document slot (at most
+  ``max_docs_per_row``) and at least its length in unused width. Returns the
+  rows, each in placement order, and the documents that fit nowhere, in input
+  order. Nothing is split or truncated and ``documents`` is not modified. A
+  document no longer than ``width`` always fits the empty first row, so every
+  call places at least one document when the longest one fits.
   """
-  order = sorted(range(len(documents)), key=lambda i: (-documents[i].length, i))
-  used = [0] * rows
+  room = [width] * rows
   placed: list[list[SFTDocument]] = [[] for _ in range(rows)]
-  left: set[int] = set()
-  for i in order:
-    doc = documents[i]
-    for row in range(rows):
-      if (
-          len(placed[row]) < max_docs_per_row
-          and used[row] + doc.length <= width
-      ):
-        placed[row].append(doc)
-        used[row] += doc.length
-        break
-    else:
-      left.add(i)
-  return placed, [documents[i] for i in range(len(documents)) if i in left]
+  taken: set[int] = set()
+  longest_first = sorted(
+      enumerate(documents), key=lambda item: item[1].length, reverse=True
+  )
+  for arrival, doc in longest_first:
+    target = next(
+        (
+            r
+            for r in range(rows)
+            if len(placed[r]) < max_docs_per_row and doc.length <= room[r]
+        ),
+        None,
+    )
+    if target is None:
+      continue
+    placed[target].append(doc)
+    room[target] -= doc.length
+    taken.add(arrival)
+  waiting = [
+      doc for arrival, doc in enumerate(documents) if arrival not in taken
+  ]
+  return placed, waiting
 
 
 def build_microbatch(
     placed: list[list[SFTDocument]], *, width: int, pad_id: int
 ) -> dict[str, Any]:
-  rows = len(placed)
-  ids = torch.full((rows, width), pad_id, dtype=torch.int64)
-  labels = torch.full((rows, width), IGNORE_INDEX, dtype=torch.int64)
-  positions = torch.zeros((rows, width), dtype=torch.int64)
-  padding = torch.ones((rows, width), dtype=torch.bool)
-  for row, docs in enumerate(placed):
-    fill = 0
-    for doc in docs:
-      n = doc.length
-      ids[row, fill : fill + n] = torch.tensor(doc.input_ids, dtype=torch.int64)
-      labels[row, fill : fill + n] = torch.tensor(doc.labels, dtype=torch.int64)
-      positions[row, fill : fill + n] = torch.arange(n, dtype=torch.int64)
-      padding[row, fill : fill + n] = False
-      fill += n
-    if fill == 0:
-      positions[row] = torch.arange(width, dtype=torch.int64)
-    elif fill < width:
-      positions[row, fill:] = (
-          positions[row, fill - 1] + 1 + torch.arange(width - fill)
+  """Flatten packed rows into one microbatch of ``len(placed) * width`` slots.
+
+  Row r occupies ``[r * width, (r + 1) * width)``: its documents back to back
+  from the row start, then padding (``pad_id`` inputs, ``IGNORE_INDEX``
+  labels, ``padding_mask`` true). A document of n tokens gets positions
+  0 .. n - 1. Padding positions go on rising from the row's last document
+  position, and an empty row simply counts 0, 1, ..., width - 1.
+  ``num_valid_tokens`` is the number of labels that are not ``IGNORE_INDEX``.
+  """
+  token_ids: list[int] = []
+  targets: list[int] = []
+  position_ids: list[int] = []
+  is_pad: list[bool] = []
+  for row in placed:
+    used = sum(doc.length for doc in row)
+    if used > width:
+      raise ValueError(
+          f"a packed row holds {used} tokens; rows are {width} wide"
       )
+    resume_at = 0
+    for doc in row:
+      token_ids += doc.input_ids
+      targets += doc.labels
+      position_ids += range(doc.length)
+      resume_at = doc.length
+    gap = width - used
+    token_ids += [pad_id] * gap
+    targets += [IGNORE_INDEX] * gap
+    position_ids += range(resume_at, resume_at + gap)
+    is_pad += [False] * used + [True] * gap
+  labels = torch.tensor(targets, dtype=torch.int64)
   return {
-      "input": ids.reshape(-1),
-      "labels": labels.reshape(-1),
-      "positions": positions.reshape(-1),
-      "padding_mask": padding.reshape(-1),
+      "input": torch.tensor(token_ids, dtype=torch.int64),
+      "labels": labels,
+      "positions": torch.tensor(position_ids, dtype=torch.int64),
+      "padding_mask": torch.tensor(is_pad, dtype=torch.bool),
       "num_valid_tokens": int((labels != IGNORE_INDEX).sum()),
   }
 
 
 def batch_fingerprint(batch: dict[str, Any]) -> str:
-  """SHA-256 (hex) of a microbatch's input, label and position tensors."""
-  digest = hashlib.sha256()
-  for key in ("input", "labels", "positions"):
-    digest.update(batch[key].numpy().tobytes())
-  return digest.hexdigest()
+  """Lowercase hex SHA-256 over the raw bytes of input, labels, positions."""
+  raw = b"".join(
+      batch[name].detach().cpu().contiguous().numpy().tobytes()
+      for name in ("input", "labels", "positions")
+  )
+  return hashlib.sha256(raw).hexdigest()
 
 
 @dataclass
@@ -225,6 +265,14 @@ class SFTStats:
   last: dict[str, int] = field(default_factory=dict)
 
 
+def _tokenizer_dir(tokenizer: Any) -> str:
+  """Where the trainer's own tokenizer was loaded from; '' if unknown."""
+  try:
+    return tokenizer.tokenizer_path or ""
+  except AttributeError:  # no tokenizer (None), or one without a path
+    return ""
+
+
 class ChatSFTDataLoader(BaseDataLoader):
   """Assistant-only, document-packed chat SFT batches."""
 
@@ -232,7 +280,10 @@ class ChatSFTDataLoader(BaseDataLoader):
   class Config(BaseDataLoader.Config):
     data_path: str = ""
     hf_tokenizer_path: str = ""
-    """Chat-template source; empty = the trainer tokenizer's path."""
+    """Source of the chat template: a directory or hub id whose Hugging Face
+        tokenizer renders the conversations. When empty, the loader reuses the
+        location of the tokenizer the trainer itself loaded (its
+        ``--hf_assets_path``)."""
     reasoning_effort: str = ""
     current_date: str = ""
     mask_mode: str = "auto"
@@ -278,14 +329,15 @@ class ChatSFTDataLoader(BaseDataLoader):
     self._width = width
     self._rows = num_tokens_per_batch // width
     self.max_num_documents = self._rows * config.max_documents_per_row
-    self._dp_world_size = int(dp_world_size)
-    self._dp_rank = int(dp_rank)
-    path = config.hf_tokenizer_path or getattr(tokenizer, "tokenizer_path", "")
-    if not path:
+    self._dp_world_size, self._dp_rank = int(dp_world_size), int(dp_rank)
+    template_source = config.hf_tokenizer_path or _tokenizer_dir(tokenizer)
+    if not template_source:
       raise ValueError(
-          "ChatSFTDataLoader needs hf_tokenizer_path or --hf_assets_path"
+          "ChatSFTDataLoader needs a tokenizer with a chat template: set "
+          "--dataloader.hf-tokenizer-path (Config.hf_tokenizer_path) or "
+          "launch the trainer with --hf_assets_path"
       )
-    self._hf_tokenizer = ct.load_hf_tokenizer(path)
+    self._hf_tokenizer = ct.load_hf_tokenizer(template_source)
     self._options = ct.ChatTemplateOptions(
         reasoning_effort=config.reasoning_effort or None,
         current_date=config.current_date or None,
@@ -401,37 +453,47 @@ class ChatSFTDataLoader(BaseDataLoader):
     return batch
 
   def microbatches_for_step(self) -> int:
-    """Accumulation count for the next optimizer step (fixed per recipe)."""
+    """Microbatches this rank contributes to one optimizer step (constant)."""
     return int(self.config.microbatches_per_step)
 
-  # -- BaseDataLoader -----------------------------------------------------
+  # -- iteration and checkpointed position -------------------------------
   def __iter__(self) -> Iterator[dict[str, Any]]:
-    while True:
-      yield self.next_microbatch()
+    # Endless; every iterator draws from the same loader position.
+    return iter(self.next_microbatch, None)
 
   def state_dict(self) -> dict[str, Any]:
+    position = {
+        "epoch": self._epoch,
+        "cursor": self._cursor,
+        "pending": [doc.index for doc in self._pending],
+    }
     return {
         "version": 1,
         "dp_world_size": self._dp_world_size,
-        f"dp_rank_{self._dp_rank}": {
-            "epoch": self._epoch,
-            "cursor": self._cursor,
-            "pending": [doc.index for doc in self._pending],
-        },
+        f"dp_rank_{self._dp_rank}": position,
     }
 
   def load_state_dict(self, state_dict: dict[str, Any]) -> None:
     if not state_dict:
       return
-    if state_dict.get("version") != 1:
-      raise ValueError("unsupported ChatSFTDataLoader state version")
-    if state_dict.get("dp_world_size") != self._dp_world_size:
-      raise ValueError("cannot resume after changing the data-parallel degree")
-    mine = state_dict[f"dp_rank_{self._dp_rank}"]
-    self._epoch = int(mine["epoch"])
-    self._cursor = int(mine["cursor"])
+    version = state_dict.get("version")
+    if version != 1:
+      raise ValueError(
+          f"ChatSFTDataLoader state version {version!r}; only 1 is understood"
+      )
+    saved_world = state_dict.get("dp_world_size")
+    if saved_world != self._dp_world_size:
+      raise ValueError(
+          f"refusing a dataloader position saved with {saved_world} "
+          f"data-parallel ranks in a run with {self._dp_world_size}"
+      )
+    own_key = f"dp_rank_{self._dp_rank}"
+    if own_key not in state_dict:
+      raise ValueError(f"the dataloader state has no {own_key!r} entry")
+    position = state_dict[own_key]
+    self._epoch = int(position["epoch"])
+    self._cursor = int(position["cursor"])
     self._shard = self._epoch_shard(self._epoch)
-    self._pending = [
-        doc for doc in (self.tokenize(i) for i in mine["pending"]) if doc
-    ]
+    queue = (self.tokenize(int(index)) for index in position["pending"])
+    self._pending = [doc for doc in queue if doc is not None]
     self.stats.epoch = self._epoch
