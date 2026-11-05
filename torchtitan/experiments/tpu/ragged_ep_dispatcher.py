@@ -44,8 +44,8 @@ trip, so on an accelerator the error may surface later in the step) and is
 skipped under ``torch.compile``, like the RoPE position bounds check. The
 received total is returned in the metadata (``received_rows``), and
 ``max_buffer_fill`` reports the largest demanded / buffer ratio (above 1.0:
-routes were dropped); raise ``capacity_factor`` or balance the expert
-placement.
+routes were dropped, or an all-to-all buffer overflowed under
+``torch.compile``); raise ``capacity_factor`` or balance the expert placement.
 ``ragged_all_to_all`` is differentiable with respect to its operand, and the
 row permutations use a gather-only VJP, so the backward pass mirrors the
 forward with the same static shapes.
@@ -76,9 +76,9 @@ _DISPATCHERS: "weakref.WeakSet[BaseEPTokenDispatcher]" = weakref.WeakSet()
 def track_buffer_fill(dispatcher: BaseEPTokenDispatcher) -> None:
     """Report a dispatcher through ``max_buffer_fill`` and ``max_dropped_fraction``.
 
-    The dispatcher keeps its largest fill in ``max_fill`` (and, if it drops
-    routes, its largest dropped fraction in ``max_drop``) as device tensors or
-    None. It is held weakly.
+    The dispatcher keeps its largest fill in ``max_fill`` (and optionally its
+    largest dropped-route fraction in ``max_drop``) as a device tensor or None.
+    It is held weakly.
     """
     _DISPATCHERS.add(dispatcher)
 
@@ -106,8 +106,9 @@ def max_buffer_fill(reset: bool = True) -> float | None:
 
     Tracked on the device (no host sync inside the step); reading it syncs.
     A value above 1.0 means routes were dropped because they did not fit a
-    receive buffer (``exchange="allgather"`` and ``AllGatherEPTokenDispatcher``;
-    ``exchange="alltoall"`` raises instead, see the module docstring): raise
+    receive buffer (``exchange="allgather"`` and ``AllGatherEPTokenDispatcher``)
+    or, with ``exchange="alltoall"``, which otherwise raises, that a buffer
+    overflowed under ``torch.compile`` (see the module docstring): raise
     ``capacity_factor`` or balance the expert placement. Returns None if no
     dispatch ran since the last reset.
     """
@@ -616,7 +617,8 @@ class RaggedAllToAllTokenDispatcher(BaseEPTokenDispatcher):
                 recv_counts_GE, buffer_rows
             )
             # Demanded rows / buffer: > 1.0 means routes were dropped
-            # ("allgather" exchange; "alltoall" raised above).
+            # ("allgather" exchange) or, with "alltoall" under torch.compile
+            # (no check above), that the buffer overflowed.
             fill = demand.float() / buffer_rows
             self.max_fill = (
                 fill if self.max_fill is None else torch.maximum(self.max_fill, fill)
