@@ -5,7 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 """Muse Spark LoRA SFT recipes for the end-to-end stages. ASCII only.
 
-Built on ``post_training.config_registry`` (``_base_config``) and the chat
+Built on ``post_training.config_registry`` (``base_config``) and the chat
 SFT loader; the differences are the model spec (the Muse Spark HF adapter with
 the fast checkpoint reader, see ``lora_publish``) and per-stage geometry:
 
@@ -58,7 +58,7 @@ from torchtitan.experiments.tpu.post_training.config_registry import (
     Parallel,
     Precision,
     TrainShape,
-    _base_config,
+    base_config,
 )
 from torchtitan.experiments.tpu.post_training.lora import LoRAOptions, apply_lora
 from torchtitan.experiments.tpu.post_training.sft_config import SFTConfig, SFTTrainerConfig, as_sft_config
@@ -95,7 +95,7 @@ def sft_config(*, flavor: str, tpu: bool, shape: TrainShape, precision: Precisio
                hf_assets_path: str = "/mnt/model", microbatches_per_step: int = 1,
                max_documents_per_row: int = 8, seed: int = 42) -> SFTTrainerConfig:
     spec = spark_model_spec(flavor, shape.seq_len, lora=_lora(), tpu_kernels=tpu)
-    base = _base_config(
+    base = base_config(
         model_spec=spec,
         hf_assets_path=hf_assets_path,
         loss=ChunkedLossWrapper.Config(num_chunks=shape.num_chunks, loss_fn=CrossEntropyLoss.Config()),
