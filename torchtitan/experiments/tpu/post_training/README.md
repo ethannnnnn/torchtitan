@@ -167,8 +167,9 @@ export SPARK_TEST_ASSETS=<public tiny Muse Spark snapshot>   # tokenizer + chat 
 bash torchtitan/experiments/tpu/post_training/tests/run_cpu.sh --tokenizer-dir "$SPARK_TEST_ASSETS" --work <new dir>
 ```
 
-The runner covers the unit tests (chat masks, packing, LoRA, optimizers,
-recipes, held-out loss) and end-to-end runs of the real trainer on CPU: the SFT
+The runner covers the unit tests (chat masks, packing, the loader's resumable
+state, LoRA, optimizers, recipes, held-out loss, the `sft_train` entry point and
+the smoke helpers) and end-to-end runs of the real trainer on CPU: the SFT
 smoke (full, LoRA with full and adapter saves, AdamW8bit, AdamWBf16) and, with
 the adapter-only checkpoint support of `../checkpointing/` installed, a LoRA
 kill-and-resume check on two ranks. With the Muse Spark TPU package installed

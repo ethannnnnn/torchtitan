@@ -160,6 +160,14 @@ def adapter_tensors(dump: Path, step: int) -> dict:
   )
 
 
+def recipe_microbatches_per_step(config_name: str) -> int:
+  """``dataloader.microbatches_per_step`` of a ``cpu_recipes`` config."""
+  from torchtitan.experiments.tpu.post_training.tests import cpu_recipes
+
+  recipe = getattr(cpu_recipes, config_name)()
+  return int(recipe.dataloader.microbatches_per_step)
+
+
 def main() -> int:
   ap = argparse.ArgumentParser()
   ap.add_argument(
@@ -234,6 +242,17 @@ def main() -> int:
   checks["resume run exit 0"] = resume["rc"] == 0
   ranks = sorted(ref["records"])
   checks[f"records from {args.nproc} rank(s)"] = len(ranks) == args.nproc
+  # The trainer takes its gradient accumulation from the loader: each step of
+  # each rank trains exactly microbatches_per_step microbatches.
+  per_step = recipe_microbatches_per_step(args.config)
+  drawn = {
+      len(rec.get("batches", []))
+      for by_step in ref["records"].values()
+      for rec in by_step.values()
+  }
+  checks[f"ref: {per_step} microbatches in every step of every rank"] = (
+      drawn == {per_step}
+  )
   killed_steps = sorted({s for r in crash_records.values() for s in r})
   checks[f"crash run stopped before finishing step {args.kill_step}"] = (
       bool(killed_steps) and max(killed_steps) == args.kill_step - 1
