@@ -264,6 +264,8 @@ def use_tokamax_splash_attention_patch(model: nn.Module, sa_config: Any) -> None
       q_layout=_sa("q_layout"),
       k_layout=_sa("k_layout"),
       v_layout=_sa("v_layout"),
+      use_base2_exp=_sa("use_base2_exp"),
+      max_logit_const=_sa("max_logit_const"),
   )
   # Guard the bug above, without rejecting a caller that deliberately passes an empty
   # config to mean "just use the kernel's defaults" (some parity tests do exactly
@@ -448,14 +450,12 @@ def use_tokamax_splash_attention_patch(model: nn.Module, sa_config: Any) -> None
 
   # Only modules patched via forward receive segment_ids, so only they are
   # affected. `_sdpa_native_torch` modules run with the field at its default and
-  # must not warn.
+  # get no note.
   if _patched_forward and sa_kwargs.get("use_document_aware_block_skipping"):
-    logger.warning(
-        "Tokamax splash: use_document_aware_block_skipping=True is not"
-        " supported; packed documents are still masked exactly via segment_ids,"
-        " but cross-document blocks are computed and discarded. Set"
-        " sa_use_document_aware_block_skipping=False to acknowledge, or use the"
-        " stock splash kernel for block skipping."
+    logger.info(
+        "Tokamax splash: sa_use_document_aware_block_skipping is not a wrapper"
+        " option here; tokamax >= 0.0.17 prunes tiles whose q/kv segment-id"
+        " ranges are disjoint by itself whenever segment_ids are passed."
     )
 
 
