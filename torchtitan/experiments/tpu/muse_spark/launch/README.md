@@ -13,7 +13,7 @@ argument; nothing site-specific is stored in these files.
 | `render.py` | Renders `trainer_jobset.json.in` for a slice shape and a recipe, with the overlay in ConfigMaps; rejects unresolved placeholders |
 | `trainer_jobset.json.in` | One multi-host trainer JobSet: four chips and eight ranks per host, the overlay ConfigMaps, GCSFuse mounts for runtime, model, data, and outputs |
 | `bootstrap.sh` | Container entry point: checks the slice wiring, fetches the base commit, applies the overlay, and starts only if the git tree equals the candidate's |
-| `spark_pod.sh` | In-pod runner: optional offline runtime install, optional hash-pinned wheel overlay, version record, `torch.distributed.run` (or the merged-export workers) |
+| `spark_pod.sh` | In-pod runner: optional offline runtime install, optional hash-pinned wheel overlay, version record and import check, `torch.distributed.run` (or the merged-export workers) |
 | `runtime_install.sh` | Offline install of a mounted, digest-pinned wheelhouse into a fresh virtual environment |
 | `pip-pins-*.txt` | Hash-pinned wheels for `--pip-overlay` (JAX/jaxlib 0.12.0.1 with Tokamax 0.0.17, or Tokamax 0.0.17 alone) |
 
@@ -108,6 +108,15 @@ for tokens). TPU node boot disks often have only about 20 GB free, so the
 (`--deadline-seconds`, default 2,700). Logs, `versions-hostN.json`,
 `pip-freeze-hostN.txt`, and `exit_code-hostN` land under `runs/<RUN_NAME>/`.
 Collect pod logs and `kubectl describe` output before deleting a JobSet.
+
+Before the trainer starts, every host imports `torch_tpu`, `jax`, `tokamax`,
+`torchtitan.experiments.tpu.muse_spark`, the config module and the entry
+module once, in one process that touches no device (the export module in
+export mode), and records the result in `versions-hostN.json`; a failed
+import stops the pod with `[SPARK:GATE]` instead of a traceback from every
+rank. `--env SPARK_IMPORT_MODULES='...'` changes the list,
+`--env SPARK_IMPORT_TIMEOUT_S=N` bounds the check (default 600 s) and
+`--env SPARK_IMPORT_CHECK=0` skips it.
 
 ## Trainer runtime
 

@@ -513,15 +513,23 @@ class SparkPodDryRunTest(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def _run(self, **env) -> subprocess.CompletedProcess:
+    def _run(self, *, wrapper: str | None = None, **env) -> subprocess.CompletedProcess:
         run_env = dict(os.environ, SPARK_SRC_DIR=str(REPO_ROOT), SPARK_MODEL=str(self.tmp / "model"),
                        SPARK_DATA=str(self.tmp / "data"), SPARK_OUT=str(self.tmp / "out"),
                        SPARK_LOG=str(self.tmp / "work" / "trainer.log"), SPARK_RUNTIME_MODE="preinstalled",
                        TRAINER_PYTHON=sys.executable, SPARK_DRY_RUN="1",
-                       TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT=str(self.tmp / "cache"))
+                       TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT=str(self.tmp / "cache"),
+                       # The default list imports TorchTPU, JAX and Tokamax; the command tests do not need them.
+                       SPARK_IMPORT_MODULES="json")
         run_env.update(env)
-        return subprocess.run(["bash", str(LAUNCH / "spark_pod.sh")], env=run_env, capture_output=True, text=True,
-                              timeout=300)
+        run_env = {k: v for k, v in run_env.items() if v is not None}
+        command = ["bash", str(LAUNCH / "spark_pod.sh")]
+        if wrapper:  # shell code run first, then exec of the runner
+            command = ["bash", "-c", wrapper + ' && exec bash "$0"', str(LAUNCH / "spark_pod.sh")]
+        return subprocess.run(command, env=run_env, capture_output=True, text=True, timeout=600)
+
+    def _versions(self, host: int = 0) -> dict:
+        return json.loads((self.tmp / "out" / f"versions-host{host}.json").read_text())
 
     def test_multi_host_training_command(self):
         result = self._run(SPARK_CONFIG="s2_sft_full", SPARK_ENTRY="torchtitan.experiments.tpu.spark_e2e.train",
@@ -538,8 +546,10 @@ class SparkPodDryRunTest(unittest.TestCase):
                       "--dataloader.data-path=/mnt/data/sft/train.jsonl"):
             self.assertIn(piece, line)
         self.assertEqual((self.tmp / "out" / "exit_code-host3").read_text().strip(), "0")
-        versions = json.loads((self.tmp / "out" / "versions-host3.json").read_text())
+        versions = self._versions(3)
         self.assertIn("python", versions)
+        self.assertEqual(versions["imports"], {"json": "ok"})
+        self.assertIn("[SPARK:IMPORTS] 1 of 1 modules imported", result.stdout)
         self.assertTrue((self.tmp / "out" / "stdout-host3.log").is_file())
 
     def test_export_mode_command(self):
@@ -552,6 +562,50 @@ class SparkPodDryRunTest(unittest.TestCase):
         line = [l for l in result.stdout.splitlines() if l.startswith("[SPARK:DRY_RUN]")][0]
         self.assertIn(f"-m torchtitan.experiments.tpu.checkpointing.hf_export --base {self.tmp / 'model'} "
                       f"--out {self.tmp / 'out' / 'hf'} --peft {adapter} --worker 1 --num-workers 2", line)
+
+    def test_import_check_stops_the_pod_before_the_trainer(self):
+        result = self._run(SPARK_CONFIG="c", SPARK_IMPORT_MODULES="json spark_missing_module_for_tests")
+        self.assertEqual(result.returncode, 5, result.stdout + result.stderr)
+        self.assertIn("[SPARK:IMPORTS] spark_missing_module_for_tests: ModuleNotFoundError", result.stdout)
+        self.assertIn("[SPARK:GATE] import check failed", result.stdout + result.stderr)
+        self.assertNotIn("[SPARK:DRY_RUN]", result.stdout)
+        imports = self._versions()["imports"]
+        self.assertEqual(imports["json"], "ok")
+        self.assertTrue(imports["spark_missing_module_for_tests"].startswith("ModuleNotFoundError"))
+        self.assertEqual((self.tmp / "out" / "exit_code-host0").read_text().strip(), "5")
+
+    def test_default_import_list(self):
+        result = self._run(SPARK_CONFIG="c", SPARK_IMPORT_MODULES=None, SPARK_CONFIG_MODULE="spark_missing_config_module",
+                           SPARK_ENTRY="spark_missing_entry_module")
+        self.assertEqual(result.returncode, 5, result.stdout + result.stderr)
+        imports = self._versions()["imports"]
+        self.assertEqual(set(imports), {"torch_tpu", "jax", "tokamax", "torchtitan.experiments.tpu.muse_spark",
+                                        "spark_missing_config_module", "spark_missing_entry_module"})
+        self.assertTrue(imports["spark_missing_entry_module"].startswith("ModuleNotFoundError"))
+        result = self._run(SPARK_MODE="export", SPARK_CONFIG="adapter/none", SPARK_IMPORT_MODULES=None)
+        self.assertEqual(set(self._versions()["imports"]), {"torchtitan.experiments.tpu.checkpointing.hf_export"})
+        # SPARK_IMPORT_CHECK=0 skips the check.
+        result = self._run(SPARK_CONFIG="c", SPARK_IMPORT_MODULES=None, SPARK_IMPORT_CHECK="0",
+                           SPARK_CONFIG_MODULE="spark_missing_config_module")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("[SPARK:DRY_RUN]", result.stdout)
+        self.assertEqual(self._versions()["imports"], {})
+
+    def test_import_check_is_bounded_in_time(self):
+        modules = self.tmp / "modules"
+        modules.mkdir()
+        (modules / "spark_slow_module_for_tests.py").write_text("import time\ntime.sleep(60)\n")
+        result = self._run(SPARK_CONFIG="c", SPARK_IMPORT_MODULES="spark_slow_module_for_tests",
+                           SPARK_IMPORT_TIMEOUT_S="3",
+                           PYTHONPATH=os.pathsep.join(filter(None, [str(modules), os.environ.get("PYTHONPATH")])))
+        self.assertEqual(result.returncode, 5, result.stdout + result.stderr)
+        self.assertIn("[SPARK:IMPORTS] the import check did not finish within 3 s", result.stdout)
+        self.assertIn("python", self._versions())  # written before the imports
+
+    def test_low_open_file_limit_is_reported(self):
+        result = self._run(SPARK_CONFIG="c", wrapper="ulimit -Sn 1024 && ulimit -Hn 1024")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("[SPARK:WARN] cannot raise the open-file limit to 65536; it stays 1024", result.stdout)
 
     def test_gates(self):
         result = self._run(SPARK_CONFIG="c", SPARK_TOPOLOGY="4x4x4", TPU_TOPOLOGY="2x2x1")

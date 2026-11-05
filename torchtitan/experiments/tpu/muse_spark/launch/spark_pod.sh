@@ -22,13 +22,18 @@
 #   SPARK_PIP_FIND_LINKS   install SPARK_PIP_OVERLAY offline from this directory
 #   SPARK_PIP_INDEX_URL    package index otherwise (default https://pypi.org/simple)
 #   SPARK_LOG              runner log (default /work/trainer.log)
+#   SPARK_IMPORT_MODULES   modules imported once per host before the trainer starts (default:
+#                          torch_tpu jax tokamax torchtitan.experiments.tpu.muse_spark, the config
+#                          module and the entry; export mode: the export module); a failed import
+#                          stops the pod with [SPARK:GATE]. SPARK_IMPORT_CHECK=0 skips the check,
+#                          SPARK_IMPORT_TIMEOUT_S bounds it (default 600).
 #   SPARK_DRY_RUN=1        print the trainer command instead of running it (local checks)
 #   NNODES, JOB_COMPLETION_INDEX, WORKERS_0_HOSTNAME   multi-host rendezvous
-# Outputs under SPARK_OUT: stdout-hostN.log, versions-hostN.json, pip-freeze-hostN.txt,
-# exit_code-hostN, plus whatever the trainer writes (--dump_folder).
+# Outputs under SPARK_OUT: stdout-hostN.log, versions-hostN.json (package versions, code tree,
+# import check), pip-freeze-hostN.txt, exit_code-hostN, plus whatever the trainer writes
+# (--dump_folder).
 set -euo pipefail
 ulimit -c 0
-ulimit -n 65536 2>/dev/null || true
 SRC=${SPARK_SRC_DIR:-/work/tt}
 MODEL=${SPARK_MODEL:-/mnt/model}
 DATA=${SPARK_DATA:-/mnt/data}
@@ -47,7 +52,8 @@ TRAINER_PYTHON=${TRAINER_PYTHON:-python3}
 LOG=${SPARK_LOG:-/work/trainer.log}
 mkdir -p "$(dirname "$LOG")" "$OUT"
 : > "$LOG"
-( while sleep 30; do cp -f "$LOG" "$OUT/stdout-$HOST.log" 2>/dev/null || true; done ) &
+# The copy loop writes nothing: it must not keep the caller's stdout open after the runner exits.
+( while sleep 30; do cp -f "$LOG" "$OUT/stdout-$HOST.log" 2>/dev/null || true; done ) >/dev/null 2>&1 &
 log_sync_pid=$!
 finish() {
   local rc=$?
@@ -66,6 +72,10 @@ exec > >(tee -a "$LOG" >&3) 2>&1
 log_tee_pid=$!
 
 echo "[SPARK:START] run=${SPARK_RUN:-spark} config=$CONFIG $HOST/$NNODES $(date -u +%FT%TZ)"
+# Every rank opens many checkpoint shards and sockets; a low limit fails much later, inside a load.
+if ! ulimit -n 65536 2>/dev/null; then
+  echo "[SPARK:WARN] cannot raise the open-file limit to 65536; it stays $(ulimit -n)"
+fi
 if [[ -n "${SPARK_TOPOLOGY:-}" && -n "${TPU_TOPOLOGY:-}" && "$SPARK_TOPOLOGY" != "$TPU_TOPOLOGY" ]]; then
   echo "[SPARK:GATE] slice topology $TPU_TOPOLOGY does not match the rendered $SPARK_TOPOLOGY" >&2
   exit 5
@@ -114,8 +124,23 @@ fi
 export TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT=${TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT:-/dev/shm/cache/tier3}
 mkdir -p "$TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT" /dev/shm/torch_tpu_cache 2>/dev/null || true
 cd "$SRC"
-TORCH_DEVICE_BACKEND_AUTOLOAD=0 "$TRAINER_PYTHON" - "$OUT/versions-$HOST.json" <<'PY'
-import importlib.metadata as md, json, os, platform, sys
+# Versions, then one import of every module the run needs (in a single process per host), so a
+# runtime that cannot import TorchTPU, JAX, Tokamax or the recipe (for example a --no-deps
+# overlay that does not fit the runtime) stops here with one line instead of a traceback per rank.
+# Imports only: no device is touched (torch's backend autoload stays off; torch_tpu is imported
+# explicitly), and the process exits before the trainer starts.
+if [[ "${SPARK_MODE:-}" == export ]]; then
+  default_imports="torchtitan.experiments.tpu.checkpointing.hf_export"
+else
+  default_imports="torch_tpu jax tokamax torchtitan.experiments.tpu.muse_spark $CONFIG_MODULE $ENTRY"
+fi
+read -r -a IMPORTS <<< "${SPARK_IMPORT_MODULES:-$default_imports}"
+[[ "${SPARK_IMPORT_CHECK:-1}" == 1 ]] || IMPORTS=()
+IMPORT_TIMEOUT_S=${SPARK_IMPORT_TIMEOUT_S:-600}
+rc=0
+TORCH_DEVICE_BACKEND_AUTOLOAD=0 timeout "$IMPORT_TIMEOUT_S" "$TRAINER_PYTHON" - "$OUT/versions-$HOST.json" \
+  "${IMPORTS[@]}" <<'PY' || rc=$?
+import importlib, importlib.metadata as md, json, os, platform, sys, time
 versions = {"python": platform.python_version()}
 for name in ("torch", "torch_tpu", "libtpu", "jax", "jaxlib", "tokamax", "transformers", "safetensors"):
     try:
@@ -125,10 +150,37 @@ for name in ("torch", "torch_tpu", "libtpu", "jax", "jaxlib", "tokamax", "transf
 for key in ("SPARK_BASE_COMMIT", "SPARK_CANDIDATE_COMMIT", "SPARK_CANDIDATE_TREE"):
     if os.environ.get(key):
         versions[key[len("SPARK_"):].lower()] = os.environ[key]
-line = json.dumps(versions, sort_keys=True)
-print("[SPARK:VERSIONS] " + line, flush=True)
-open(sys.argv[1], "w").write(line + "\n")
+
+
+def write() -> str:
+    line = json.dumps(versions, sort_keys=True)
+    with open(sys.argv[1], "w") as handle:
+        handle.write(line + "\n")
+    return line
+
+
+write()  # before the imports, in case one of them hangs
+imports, start = {}, time.monotonic()
+for module in dict.fromkeys(sys.argv[2:]):
+    try:
+        importlib.import_module(module)
+        imports[module] = "ok"
+    except BaseException as exc:  # noqa: BLE001 - report every failure, then stop the pod
+        imports[module] = f"{type(exc).__name__}: {exc}".splitlines()[0][:300]
+        print(f"[SPARK:IMPORTS] {module}: {imports[module]}", flush=True)
+versions["imports"] = imports
+print("[SPARK:VERSIONS] " + write(), flush=True)
+failed = [m for m, result in imports.items() if result != "ok"]
+if imports:
+    print(f"[SPARK:IMPORTS] {len(imports) - len(failed)} of {len(imports)} modules imported "
+          f"in {time.monotonic() - start:.1f} s", flush=True)
+sys.exit(1 if failed else 0)
 PY
+if (( rc != 0 )); then
+  (( rc == 124 )) && echo "[SPARK:IMPORTS] the import check did not finish within $IMPORT_TIMEOUT_S s"
+  echo "[SPARK:GATE] import check failed (see [SPARK:IMPORTS] above; SPARK_IMPORT_CHECK=0 skips it)" >&2
+  exit 5
+fi
 
 RDZV=(--nnodes="$NNODES" --node-rank="$NODE_RANK")
 if (( NNODES > 1 )); then

@@ -138,6 +138,7 @@ kubectl --context <KUBE_CONTEXT> -n <K8S_NAMESPACE> create -f ./rendered-sft/tra
 
 Watch host 0's log (`kubectl logs` of pod `<RUN_NAME>-trainer-0-0-*`, or
 `runs/<RUN_NAME>/stdout-host0.log`) for `[SPARK:CODE] ... = candidate tree`,
+`[SPARK:PIP]`, `[SPARK:IMPORTS] N of N modules imported`, `[SPARK:VERSIONS]`,
 `Finished loading the checkpoint`, the `step: N loss: ...` lines and the
 `[sft] validation step=N loss=...` lines. Outputs land under
 `gs://<GCS_BUCKET>/muse-spark/runs/<RUN_NAME>/`: `checkpoint/step-N`
