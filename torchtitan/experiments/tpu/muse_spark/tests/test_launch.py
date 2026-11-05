@@ -513,8 +513,9 @@ class RuntimeInstallTest(unittest.TestCase):
     def tearDownClass(cls):
         shutil.rmtree(cls.tmp, ignore_errors=True)
 
-    def _install(self, name: str, **pins) -> subprocess.CompletedProcess:
-        env = dict(os.environ, SPARK_RUNTIME_DIR=str(self.runtime), SPARK_RUNTIME_NAME="rt",
+    def _install(self, name: str, runtime: Path | None = None, runtime_name: str = "rt",
+                 **pins) -> subprocess.CompletedProcess:
+        env = dict(os.environ, SPARK_RUNTIME_DIR=str(runtime or self.runtime), SPARK_RUNTIME_NAME=runtime_name,
                    SPARK_RUNTIME_VENV=str(self.tmp / name / "venv"), SPARK_RUNTIME_WORK=str(self.tmp / name / "work"),
                    SPARK_BOOTSTRAP_PYTHON=sys.executable, SPARK_TCMALLOC=str(self.tmp / "no-allocator"))
         env.update(pins)
@@ -532,6 +533,34 @@ class RuntimeInstallTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("VERSION 1.2.3", result.stdout)
         self.assertIn("identical to the lock", result.stdout)
+
+    def test_wheelhouse_built_as_the_readme_describes(self):
+        """README "Building a wheelhouse", offline: lock from a venv, pip download, digest lists, install."""
+        work = self.tmp / "readme"
+        given = work / "given-wheels"
+        given.mkdir(parents=True)
+        _wheel(given, "sparkdemo", "1.2.3")
+        builder = work / "builder"
+        subprocess.run([sys.executable, "-m", "venv", str(builder)], check=True, capture_output=True)
+        pip = [str(builder / "bin" / "python"), "-m", "pip", "--disable-pip-version-check"]
+        subprocess.run([*pip, "install", "-q", "--no-index", "--find-links", str(given), "sparkdemo==1.2.3"],
+                       check=True, capture_output=True)
+        runtime = work / "runtime"
+        runtime.mkdir()
+        lock = subprocess.run([*pip, "list", "--format=freeze", "--exclude", "pip"], check=True,
+                              capture_output=True, text=True).stdout
+        self.assertEqual(lock, "sparkdemo==1.2.3\n")
+        (runtime / "wh-lock.txt").write_text(lock)
+        subprocess.run([*pip, "download", "-q", "--no-deps", "--only-binary=:all:", "--no-index", "--find-links",
+                        str(given), "-r", "wh-lock.txt", "-d", "wheels"], check=True, capture_output=True, cwd=runtime)
+        listing = subprocess.run(["bash", "-c", "cd wheels && sha256sum *.whl"], check=True, capture_output=True,
+                                 text=True, cwd=runtime).stdout
+        (runtime / "wh-wheels.sha256").write_text(listing)
+        pins = {"SPARK_RUNTIME_LOCK_SHA256": hashlib.sha256((runtime / "wh-lock.txt").read_bytes()).hexdigest(),
+                "SPARK_RUNTIME_WHEELS_SHA256": hashlib.sha256(listing.encode()).hexdigest()}
+        result = self._install("readme-install", runtime=runtime, runtime_name="wh", **pins)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("1 packages installed offline, identical to the lock", result.stdout)
 
     def test_refuses_unpinned_or_mismatched_inputs(self):
         pins = self._pins()

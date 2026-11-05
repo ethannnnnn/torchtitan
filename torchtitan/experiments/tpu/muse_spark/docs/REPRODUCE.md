@@ -46,8 +46,8 @@ the CPU stand-in in `spark_e2e/tests/tpu_import_stubs`.
 The trainer needs Python with the TorchTPU runtime (torch CPU wheel,
 torch_tpu, libtpu, JAX, Tokamax, transformers, safetensors) and `git`. Either
 bake it into `<TRAINER_IMAGE>`, or mount a digest-pinned wheelhouse and use a
-stock Python image (`--runtime-dir` and the `--runtime-*-sha256` pins; see the
-launch README). `--pip-overlay
+stock Python image (`--runtime-dir` and the `--runtime-*-sha256` pins; the
+launch README describes how to build one). `--pip-overlay
 torchtitan/experiments/tpu/muse_spark/launch/pip-pins-jax0.12.0.1-tokamax0.0.17.txt`
 moves either one to JAX and jaxlib 0.12.0.1 with Tokamax 0.0.17, the versions
 `torchtitan/experiments/tpu/requirements.txt` pins.
@@ -163,12 +163,14 @@ The other knobs (`SPARK_LR`, `SPARK_LORA_RANK`, `SPARK_SFT_ROWS` for two
 packed rows per rank, `SPARK_EXPORT_EVERY`, ...) are listed in the
 `spark_e2e/recipes.py` docstring; set them with `--env`.
 
-Measured with exactly this full-model launch on one `4x4x4` slice (released
-weights, JAX 0.11.1 runtime, one 8,192-token row per rank, 1,048,576 tokens
-per step): checkpoint load 208 s, step 1 23 s, then 14.6 to 14.8 s per step
-(about 1,117 tokens/s/chip); the steps right after a checkpoint (21, 41) took
-longer because of the save and the PEFT export. A first step on a cold
-compilation cache takes several minutes.
+For orientation only (one run, not a benchmark): the same recipe with the
+same launch arguments, on an earlier revision of this code and launch kit,
+with JAX 0.11.1 and Tokamax 0.0.17 instead of the JAX 0.12.0.1 overlay, on one
+`4x4x4` slice (released weights, one 8,192-token row per rank, 1,048,576
+tokens per step), loaded the checkpoint in 208 s, took 23 s for step 1 and
+then 14.6 to 14.8 s per step (about 1,117 tokens/s/chip); the steps right
+after a checkpoint (21, 41) took longer because of the save and the PEFT
+export. A first step on a cold compilation cache takes several minutes.
 
 ### Merged Hugging Face export
 

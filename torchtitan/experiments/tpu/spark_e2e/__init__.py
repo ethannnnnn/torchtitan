@@ -19,4 +19,8 @@ Wires the pieces of the Muse Spark TPU lane into one runnable SFT path:
 * ``build_trunc``: truncated (first N layers) checkpoints for small slices.
 * ``train``: the entry point
   (``-m torchtitan.experiments.tpu.spark_e2e.train``).
+
+It builds on the Muse Spark model package (``muse_spark``: model, Hugging
+Face mapping, TPU7x settings, expert placement), the chat SFT layer
+(``post_training``) and the LoRA checkpoint helpers (``checkpointing``).
 """

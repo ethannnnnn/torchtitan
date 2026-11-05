@@ -1,5 +1,6 @@
-# Hash-pinned Tokamax 0.0.17 for a trainer runtime whose lock pins JAX but not Tokamax
-# (render.py --pip-overlay, optionally offline with --pip-find-links).
+# Hash-pinned Tokamax 0.0.17 alone, installed with --no-deps over a trainer runtime that pins
+# an older Tokamax and keeps its own JAX (render.py --pip-overlay, optionally offline with
+# --pip-find-links, e.g. from a wheel stored in the mounted runtime directory).
 # Regenerate with: printf 'tokamax==0.0.17\n' |
 #   uv pip compile - --no-deps --generate-hashes --universal --no-header
 

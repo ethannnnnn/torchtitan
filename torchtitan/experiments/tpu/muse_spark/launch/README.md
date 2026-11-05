@@ -137,7 +137,8 @@ to provide the Python packages:
   the digest lists against `--runtime-lock-sha256`, `--runtime-wheels-sha256`
   and `--runtime-debs-sha256`, copies and verifies every file, installs the
   system packages and the wheels offline into a fresh virtual environment,
-  and refuses an installed set that differs from the lock.
+  and refuses an installed set that differs from the lock (see "Building a
+  wheelhouse" below).
 * Either way, `--pip-overlay FILE` installs a hash-pinned requirements file
   from the repository on top, with `--no-deps --require-hashes
   --only-binary=:all:` (from PyPI, `--pip-index-url`, or offline from
@@ -150,3 +151,38 @@ The recipes were brought up on Python 3.14, torch 2.15.0 (CPU wheel),
 torch_tpu 0.2.0, libtpu 0.0.50, JAX 0.11.1, Tokamax 0.0.17, and transformers
 5.20.2. torchtitan's `requirements.txt` pins JAX 0.12.0.1;
 `pip-pins-jax0.12.0.1-tokamax0.0.17.txt` moves such a runtime to it.
+`pip-pins-tokamax0.0.17.txt` replaces only Tokamax (for a runtime that pins an
+older Tokamax and should keep its JAX), for example offline from a wheel
+stored in the runtime directory (`--pip-find-links /mnt/runtime`).
+
+## Building a wheelhouse
+
+`runtime_install.sh` installs exactly what a lock file lists, offline, and
+checks every byte against digests given on the command line. To build the
+directory for `--runtime-dir` (`NAME` = `--runtime-name`):
+
+```bash
+# 1. In a fresh virtual environment with the trainer's Python version and
+#    platform, install the trainer runtime (torch CPU wheel, torch_tpu, libtpu,
+#    JAX, Tokamax, transformers, safetensors, ...), then pin exactly that set:
+python -m pip list --format=freeze --exclude pip > NAME-lock.txt
+# 2. Collect one wheel per pin. Wheels that are on no index (for example one
+#    you were given directly) go into a local directory passed with --find-links;
+#    add --extra-index-url https://download.pytorch.org/whl/cpu for the torch CPU wheel:
+python -m pip download --no-deps --only-binary=:all: --find-links ./given-wheels \
+  -r NAME-lock.txt -d wheels
+# 3. Digest lists, and the digests of the lists for render.py (without system
+#    packages, leave out debs/ and NAME-debs.sha256):
+(cd wheels && sha256sum *.whl) > NAME-wheels.sha256
+(cd debs && sha256sum *.deb) > NAME-debs.sha256
+sha256sum NAME-lock.txt NAME-wheels.sha256 NAME-debs.sha256
+gcloud storage cp -r NAME-lock.txt NAME-wheels.sha256 NAME-debs.sha256 wheels debs \
+  gs://<GCS_BUCKET>/<RUNTIME_DIR>/
+```
+
+Pass the three digests as `--runtime-lock-sha256`, `--runtime-wheels-sha256`
+and `--runtime-debs-sha256`. In the pod, the installer copies every listed
+file to local disk, checks it against its list, installs the system packages
+with `dpkg -i`, installs the wheels with `pip install --no-index --no-deps`
+into a fresh virtual environment and refuses to continue unless `pip list`
+equals the lock.
