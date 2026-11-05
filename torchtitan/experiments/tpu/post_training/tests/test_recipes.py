@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import os
 import unittest
+from unittest import mock
 
 from torchtitan.components.loss import ChunkedLossWrapper
 from torchtitan.experiments.tpu.loss import PallasCrossEntropyLoss
@@ -164,6 +165,23 @@ class BuilderTest(unittest.TestCase):
   def test_resolver_errors(self):
     with self.assertRaises(ValueError):
       cr.resolve_model_spec("nope", "x", 128)
+
+  def test_public_helpers(self):
+    # Other recipe modules build on these; the underscore names are aliases.
+    self.assertIs(cr._base_config, cr.base_config)
+    self.assertIs(cr._spark, cr.spark)
+    self.assertIs(cr._spark_parallel, cr.spark_parallel)
+    env = {
+        "SPARK_FLAVOR": "816B-A42B-2L",
+        "SPARK_EP": "8",
+        "SPARK_COMPILE": "1",
+    }
+    with mock.patch.dict(os.environ, env):
+      self.assertEqual(cr.spark(), cr.ModelChoice("muse_spark", "816B-A42B-2L"))
+      parallel = cr.spark_parallel()
+    self.assertEqual(parallel.expert_parallel, 8)
+    self.assertTrue(parallel.compile_model)
+    self.assertEqual(parallel.activation_checkpoint, "full")
 
   def test_sft_config_modes(self):
     base = cpu_recipes.sft_debug_smoke()

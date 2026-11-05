@@ -158,7 +158,7 @@ def _model_spec(
   return spec
 
 
-def _base_config(
+def base_config(
     *,
     model_spec: Any,
     hf_assets_path: str,
@@ -171,6 +171,15 @@ def _base_config(
     checkpoint_interval: int,
     seed: int,
 ) -> TPUTrainerConfig:
+  """The trainer config every SFT recipe builds on.
+
+  ``shape`` sets the microbatch geometry, run length, learning-rate schedule
+  and AdamW hyperparameters, ``precision`` the weight dtype and optimizer, and
+  ``parallel`` the parallelism, activation checkpointing and compile policy.
+  The checkpointer loads the initial weights from the Hugging Face checkpoint
+  in ``hf_assets_path`` and saves every ``checkpoint_interval`` steps;
+  gradients are reduced in fp32.
+  """
   microbatch_tokens = shape.rows_per_microbatch * shape.seq_len
   if microbatch_tokens % shape.num_chunks:
     raise ValueError(
@@ -286,7 +295,7 @@ class SFTRecipe:
 def build_sft_config(recipe: SFTRecipe) -> SFTTrainerConfig:
   shape = recipe.shape
   spec = _model_spec(recipe.model, shape.seq_len, recipe.lora)
-  config = _base_config(
+  config = base_config(
       model_spec=spec,
       hf_assets_path=recipe.hf_assets_path,
       loss=ChunkedLossWrapper.Config(
@@ -329,11 +338,12 @@ def build_sft_config(recipe: SFTRecipe) -> SFTTrainerConfig:
 # reasoning effort "low" (the shopping CTR SFT set); any chat JSONL works.
 
 
-def _spark() -> ModelChoice:
+def spark() -> ModelChoice:
+  """Muse Spark in the flavor ``SPARK_FLAVOR`` (default ``816B-A42B``)."""
   return ModelChoice("muse_spark", os.environ.get("SPARK_FLAVOR", "816B-A42B"))
 
 
-def _spark_parallel() -> Parallel:
+def spark_parallel() -> Parallel:
   """The Muse Spark port's TPU bring-up settings: full activation
   checkpointing, reshard after forward, DEFER_AND_FUSE eager mode, compiled
   gradient norm; per-block compile only with SPARK_COMPILE=1."""
@@ -345,6 +355,13 @@ def _spark_parallel() -> Parallel:
       fsdp_reshard_after_forward="always",
       compile_grad_norm=True,
   )
+
+
+# Earlier names of base_config, spark and spark_parallel, kept for the modules
+# that import them.
+_base_config = base_config
+_spark = spark
+_spark_parallel = spark_parallel
 
 
 def spark_tpu_settings(
@@ -413,10 +430,10 @@ def _spark_sft(
   shape = SFT_LORA_SHAPE if lora is not None else SFT_FULL_SHAPE
   config = build_sft_config(
       SFTRecipe(
-          model=_spark(),
+          model=spark(),
           shape=shape,
           precision=precision,
-          parallel=_spark_parallel(),
+          parallel=spark_parallel(),
           lora=lora,
           reasoning_effort="low",
       )
