@@ -70,6 +70,35 @@ def _grouped_mm_fwd(
     )
 
 
+def _dinput_gmm(
+    dout: jax.Array,
+    rhs: jax.Array,
+    group_sizes: jax.Array,
+    tile_m: int,
+    tile_k: int,
+    tile_n: int,
+    transpose_rhs: bool,
+) -> jax.Array:
+    """``dX_e = dY_e @ W_e.T`` per expert, for both backward operators.
+
+    The GMM contracts over N and produces K, so the K and N tiles swap roles.
+    """
+    if transpose_rhs:
+        _, n_dim, k_dim = rhs.shape
+    else:
+        _, k_dim, n_dim = rhs.shape
+    return call_named(
+        megablox_gmm,
+        "moe_gmm_dgrad",
+        dout,
+        rhs,
+        group_sizes=group_sizes,
+        preferred_element_type=dout.dtype,
+        tiling=_tiling(tile_m, tile_n, tile_k, n_dim, k_dim),
+        transpose_rhs=not transpose_rhs,
+    )
+
+
 @pallas.jax_op("tt_experts::grouped_mm_bwd")
 def _grouped_mm_bwd(
     dout: jax.Array,
@@ -84,6 +113,9 @@ def _grouped_mm_bwd(
     tgmm_tile_n: int,
     transpose_rhs: bool,
 ) -> tuple[jax.Array, jax.Array]:
+    grad_lhs = _dinput_gmm(
+        dout, rhs, group_sizes, tile_m, tile_k, tile_n, transpose_rhs
+    )
     # Store the dWeight in the weight's own dtype. Autograd casts a gradient to
     # the dtype of the input it belongs to, so a wider store would be rounded
     # to this dtype right after the kernel and only add an HBM write and a cast
@@ -91,16 +123,6 @@ def _grouped_mm_bwd(
     # FP32 VMEM; only the final store rounds, so the values equal an FP32 store
     # cast to this dtype.
     if transpose_rhs:
-        _, n_dim, k_dim = rhs.shape
-        grad_lhs = call_named(
-            megablox_gmm,
-            "moe_gmm_dgrad",
-            dout,
-            rhs,
-            group_sizes=group_sizes,
-            preferred_element_type=dout.dtype,
-            tiling=_tiling(tile_m, tile_n, tile_k, n_dim, k_dim),
-        )
         grad_rhs = call_named(
             megablox_tgmm,
             "moe_tgmm_wgrad",
@@ -118,17 +140,6 @@ def _grouped_mm_bwd(
             interpret=False,
         )
     else:
-        _, k_dim, n_dim = rhs.shape
-        grad_lhs = call_named(
-            megablox_gmm,
-            "moe_gmm_dgrad",
-            dout,
-            rhs,
-            group_sizes=group_sizes,
-            preferred_element_type=dout.dtype,
-            tiling=_tiling(tile_m, tile_n, tile_k, n_dim, k_dim),
-            transpose_rhs=True,
-        )
         grad_rhs = call_named(
             megablox_tgmm,
             "moe_tgmm_wgrad",
@@ -163,32 +174,11 @@ def _grouped_mm_dgrad(
 ) -> jax.Array:
     """dInput only, for frozen expert weights (e.g. LoRA): no dWeight TGMM.
 
-    Runs the same GMM with the same tiling as the dInput half of
-    ``_grouped_mm_bwd``, so dInput is bit-identical to the full backward.
+    Runs the dInput GMM of ``_grouped_mm_bwd``, so dInput is bit-identical to
+    the full backward.
     """
     del tgmm_tile_m, tgmm_tile_k, tgmm_tile_n
-    if transpose_rhs:
-        _, n_dim, k_dim = rhs.shape
-        return call_named(
-            megablox_gmm,
-            "moe_gmm_dgrad",
-            dout,
-            rhs,
-            group_sizes=group_sizes,
-            preferred_element_type=dout.dtype,
-            tiling=_tiling(tile_m, tile_n, tile_k, n_dim, k_dim),
-        )
-    _, k_dim, n_dim = rhs.shape
-    return call_named(
-        megablox_gmm,
-        "moe_gmm_dgrad",
-        dout,
-        rhs,
-        group_sizes=group_sizes,
-        preferred_element_type=dout.dtype,
-        tiling=_tiling(tile_m, tile_n, tile_k, n_dim, k_dim),
-        transpose_rhs=True,
-    )
+    return _dinput_gmm(dout, rhs, group_sizes, tile_m, tile_k, tile_n, transpose_rhs)
 
 
 def _setup_context(ctx, inputs, output):
