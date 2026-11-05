@@ -22,7 +22,7 @@ The dispatchers import the TPU token-dispatcher module, which imports TorchTPU.
 Without TorchTPU, put the CPU stand-in first on the path:
 
   PYTHONPATH=torchtitan/experiments/tpu/tests/cpu_stubs:. \\
-      python -m pytest torchtitan/experiments/tpu/tests/test_ragged_ep_dispatcher.py
+      python -m pytest torchtitan/experiments/tpu/tests/test_ep_dispatchers.py
 """
 
 import os
