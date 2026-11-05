@@ -341,6 +341,20 @@ class FullParamSFTRecipeTest(unittest.TestCase):
     finally:
       os.environ["SPARK_EXPERT_PLACEMENT_FILE"] = saved
 
+  def test_recipe_names_registered_only_here(self):
+    # One recipe per name: the SFT layer's registry (--module
+    # torchtitan.experiments.tpu.post_training) registers no other recipe
+    # under any of this module's names.
+    from torchtitan.experiments.tpu.post_training import config_registry
+
+    for name in self.recipes:
+      with self.subTest(name=name):
+        other = getattr(config_registry, name, None)
+        self.assertTrue(
+            other is None or other is getattr(self.fp, name),
+            f"config_registry registers its own {name}",
+        )
+
   def test_update_probe_from_environment(self):
     from unittest import mock
 

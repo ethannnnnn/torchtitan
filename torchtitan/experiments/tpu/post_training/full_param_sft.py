@@ -48,6 +48,10 @@ with bytes per parameter for weights + gradients + optimizer states:
 * ``..._ctr_sft_lora_ep8_tpu7x``: LoRA on the full-parameter layout (AdamW on
   the adapters), for side-by-side comparisons.
 
+These names are registered here only; the SFT layer's registry
+(``--module torchtitan.experiments.tpu.post_training``) holds the LoRA SFT
+recipes.
+
 Launch (placeholders in angle brackets)::
 
     # 1. measure the routing on the SFT data (EP 1, LoRA, 3 steps) and write the placement
@@ -270,7 +274,7 @@ def _spark_sft_base(
 
 
 def _spark_sft_full(optimizer: str) -> SFTTrainerConfig:
-  """Full-parameter CTR SFT on the full model, one 4x4x4 slice.
+  """Full-parameter chat SFT on the full model, one 4x4x4 slice.
 
   Optimizer ``SPARK_OPTIMIZER`` (default ``optimizer``, a key of
   ``SPARK_FULL_OPTIMIZERS``); fp32 gradient reduction (``SPARK_GRAD_REDUCE``;
@@ -336,26 +340,26 @@ def _spark_sft_full(optimizer: str) -> SFTTrainerConfig:
 
 
 def muse_spark_816b_a42b_ctr_sft_full_tpu7x() -> SFTTrainerConfig:
-  """Full-parameter CTR SFT, the default: LowPrecisionAdamW with a Kahan
+  """Full-parameter chat SFT, the default: LowPrecisionAdamW with a Kahan
   residual and float8 moments (8 bytes per parameter), fp32 gradient
   reduction, EP 8 with a measured placement."""
   return _spark_sft_full("kahan8")
 
 
 def muse_spark_816b_a42b_ctr_sft_full_sr8_tpu7x() -> SFTTrainerConfig:
-  """Full-parameter CTR SFT with stochastic rounding and float8 moments
+  """Full-parameter chat SFT with stochastic rounding and float8 moments
   (6 bytes per parameter: more HBM headroom than the Kahan default)."""
   return _spark_sft_full("sr8")
 
 
 def muse_spark_816b_a42b_ctr_sft_full_fp32_tpu7x() -> SFTTrainerConfig:
-  """Full-parameter CTR SFT reference with fp32 master weights and fp32 AdamW
+  """Full-parameter chat SFT reference with fp32 master weights and fp32 AdamW
   (16 bytes per parameter: a 4x4x8 slice or larger)."""
   return _spark_sft_full("fp32")
 
 
 def muse_spark_816b_a42b_ctr_sft_full_bf16_tpu7x() -> SFTTrainerConfig:
-  """Full-parameter CTR SFT with torch.optim.AdamW on bf16 weights (round to
+  """Full-parameter chat SFT with torch.optim.AdamW on bf16 weights (round to
   nearest). NOT a valid fine-tuning recipe at small learning rates (most
   updates fall below half a bf16 ulp and are lost); kept for step-time and
   update-fraction comparisons."""
@@ -363,7 +367,7 @@ def muse_spark_816b_a42b_ctr_sft_full_bf16_tpu7x() -> SFTTrainerConfig:
 
 
 def muse_spark_816b_a42b_ctr_sft_full_bf16sr_tpu7x() -> SFTTrainerConfig:
-  """Full-parameter CTR SFT with stochastic rounding and bf16 moments
+  """Full-parameter chat SFT with stochastic rounding and bf16 moments
   (LowPrecisionAdamW; 8 bytes per parameter)."""
   return _spark_sft_full("sr")
 
@@ -397,7 +401,7 @@ def muse_spark_816b_a42b_ctr_sft_measure_placement_tpu7x() -> SFTTrainerConfig:
 
 
 def muse_spark_816b_a42b_ctr_sft_lora_ep8_tpu7x() -> SFTTrainerConfig:
-  """LoRA r 16 / alpha 32 CTR SFT on the full-parameter recipes' layout (EP 8
+  """LoRA r 16 / alpha 32 chat SFT on the full-parameter recipes' layout (EP 8
   with the measured placement, fast reader, same data and rows), for
   side-by-side comparisons: ``SPARK_LR`` (default 1e-4) after
   ``SPARK_WARMUP`` warmup steps (default 2), then constant."""
