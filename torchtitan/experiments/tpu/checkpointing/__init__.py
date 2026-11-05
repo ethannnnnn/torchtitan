@@ -21,7 +21,7 @@
   (e.g. a Cloud Storage FUSE mount), a ``gs://`` URL (gcsfs), or local
   staging plus parallel object upload.
 * ``gcs``: Cloud Storage credentials and parallel transfer helpers.
-* ``flush``: makes every rank leave a DCP save together on TorchTPU.
+* ``flush``: device-queue flush on every rank after each written checkpoint.
 * ``resume_check``: environment-gated kill and batch-record hooks for
   checkpoint/resume tests of TorchTitan trainers.
 
