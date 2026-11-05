@@ -30,10 +30,11 @@ LoRA adapter (``adapter_model.safetensors`` + ``adapter_config.json``, keys
 rank joins the gather, rank 0 writes. Module names come from the model's state
 dict adapter, and ``lora_B`` rows follow any row permutation it applies to the
 base weight (e.g. RoPE); adapters on weights that do not map one-to-one (e.g. a
-fused ``wqkv``) are refused. Engines that load LoRA adapters take it
-directly; ``hf_export --peft`` merges it into the original safetensors layout
-for engines that need merged weights. ``load_peft_adapter`` initializes the
-model's adapters from such a directory (e.g. SFT adapters as the start of RL).
+fused ``wqkv``), or whose columns or values the adapter changes, are refused.
+Engines that load LoRA adapters take it directly; ``hf_export --peft`` merges
+it into the original safetensors layout for engines that need merged weights.
+``load_peft_adapter`` initializes the model's adapters from such a directory
+(e.g. SFT adapters as the start of RL).
 """
 
 from __future__ import annotations
@@ -219,43 +220,94 @@ def gather_lora_state_dict(model_parts: nn.Module | list[nn.Module], *, to_cpu: 
     return out
 
 
+def _index_probe(shape: tuple[int, ...], dim: int, base: int, digit: int) -> torch.Tensor:
+    """Every element holds digit ``digit`` (base ``base``) of its index along ``dim``.
+
+    Constant along the other dim with stride 0, so an adapter that hands the
+    tensor through allocates nothing.
+    """
+    index = torch.arange(shape[dim]) // base**digit % base
+    return index.to(torch.float32).unsqueeze(1 - dim).expand(shape)
+
+
+def _source_index(
+    run: Any, shape: tuple[int, ...], dim: int, base: int, first: torch.Tensor | None = None
+) -> torch.Tensor | None:
+    """For each output row (``dim=0``) or column (``dim=1``), the input one it holds.
+
+    ``run`` maps a probe through the adapter; ``first`` is its output for the
+    first probe if already computed. The index is read one base-``base`` digit
+    per probe (``base`` keeps every digit exact in the adapter's output dtype).
+    ``None`` if an output row (column) mixes input rows (columns) or holds
+    values that no probe holds (e.g. scaled ones).
+    """
+    n = shape[dim]
+    index = torch.zeros(n, dtype=torch.int64)
+    digit = 0
+    while digit == 0 or base**digit < n:
+        out = first if digit == 0 and first is not None else run(_index_probe(shape, dim, base, digit))
+        out = out.movedim(dim, 0)
+        line = out[:, :1]
+        if not torch.equal(out, line.expand_as(out)):
+            return None
+        values = line[:, 0].to(torch.float64)
+        if not torch.equal(values, values.round()) or values.min() < 0 or values.max() >= base:
+            return None
+        index += values.to(torch.int64) * base**digit
+        digit += 1
+    return index
+
+
 def _hf_module_for(
     adapter: Any, weight_key: str, shape: tuple[int, ...]
 ) -> tuple[str, torch.Tensor | None]:
     """HF module path of a TorchTitan weight and the row order of its HF layout.
 
     Returns ``(module, rows)``: ``rows`` is ``None`` when the adapter only
-    renames the weight, else the permutation with ``hf_weight[i] ==
-    weight[rows[i]]`` (e.g. a RoPE row permutation of q/k projections), which
-    ``lora_B`` must follow since ``P (B A) == (P B) A``. Any other re-layout
-    (several output tensors, a changed shape, mixed columns, changed values)
-    raises ``NotImplementedError``.
+    renames the weight (and possibly casts it), else the permutation with
+    ``hf_weight[i] == weight[rows[i]]`` (e.g. a RoPE row permutation of q/k
+    projections), which ``lora_B`` must follow since ``P (B A) == (P B) A``.
+    Any other re-layout (several output tensors, a changed shape, moved or
+    mixed columns, changed values) raises ``NotImplementedError``.
     """
     to_hf = getattr(adapter, "to_hf_base", adapter.to_hf)
-    mapped = to_hf({weight_key: torch.empty(shape, device="meta")})
+    mapped = to_hf({weight_key: torch.empty(shape, dtype=torch.float32, device="meta")})
     if len(mapped) != 1:
         raise NotImplementedError(f"{weight_key} does not map one-to-one ({sorted(mapped)})")
     (hf_key, value), = mapped.items()
     if not hf_key.endswith(".weight") or tuple(value.shape) != tuple(shape):
         raise NotImplementedError(f"{weight_key} -> {hf_key} is not a plain rename")
+    if not value.dtype.is_floating_point:
+        raise NotImplementedError(f"{weight_key} -> {hf_key} changes the values (dtype {value.dtype})")
     module = hf_key[: -len(".weight")]
-    # Value probe: row i holds i in every column (stride 0, so a plain rename,
-    # which hands the tensor through, costs nothing).
+
+    def run(probe: torch.Tensor) -> torch.Tensor:
+        try:
+            (out,) = to_hf({weight_key: probe}).values()
+        except RuntimeError:  # e.g. the adapter views its input: retry with a contiguous probe
+            (out,) = to_hf({weight_key: probe.contiguous()}).values()
+        if tuple(out.shape) != tuple(shape):
+            raise NotImplementedError(f"{weight_key} -> {hf_key} changes the shape")
+        return out
+
+    # Value probes hold the row (column) index of each element, one digit per
+    # probe in a base whose digits the output dtype holds exactly (256 for bf16).
+    base = int(2 / torch.finfo(value.dtype).eps)
+    probe = _index_probe(shape, 0, base, 0)
+    first = run(probe)
+    if first is probe:
+        return module, None  # handed through unchanged: a plain rename
     out_features, in_features = shape
-    probe = torch.arange(out_features, dtype=torch.float32).unsqueeze(1).expand(out_features, in_features)
-    (value,) = to_hf({weight_key: probe}).values()
-    if value is probe:
-        return module, None
-    if tuple(value.shape) != tuple(shape):
-        raise NotImplementedError(f"{weight_key} -> {hf_key} changes the shape")
-    if torch.equal(value, probe.to(value.dtype)):
-        return module, None  # renamed (copied or cast), rows in place
-    rows = value[:, 0].to(torch.float64)
-    if not torch.equal(value, value[:, :1].expand_as(value)) or not torch.equal(
-        torch.sort(rows).values, torch.arange(out_features, dtype=torch.float64)
+    rows = _source_index(run, shape, 0, base, first)
+    cols = _source_index(run, shape, 1, base)
+    if (
+        rows is None
+        or cols is None
+        or not torch.equal(cols, torch.arange(in_features))
+        or not torch.equal(torch.sort(rows).values, torch.arange(out_features))
     ):
         raise NotImplementedError(f"{weight_key} -> {hf_key} is neither a rename nor a row permutation")
-    return module, rows.to(torch.int64)
+    return module, None if torch.equal(rows, torch.arange(out_features)) else rows
 
 
 def tt_lora_to_peft(lora: dict[str, torch.Tensor], adapter: Any) -> dict[str, torch.Tensor]:

@@ -347,10 +347,17 @@ class _ToyAdapter:
                 out[f"model.layers.{layer}.self_attn.o_proj.weight"] = value
             elif self.mode == "permute":
                 out[f"model.layers.{layer}.self_attn.q_proj.weight"] = _rope_permute(value, self.n_heads)
+            elif self.mode == "permute_cast":  # row permutation, then a cast to bf16
+                out[f"model.layers.{layer}.self_attn.q_proj.weight"] = _rope_permute(
+                    value, self.n_heads).to(torch.bfloat16)
             elif self.mode == "cast":  # a rename that also casts
                 out[f"model.layers.{layer}.self_attn.q_proj.weight"] = value.to(torch.bfloat16)
+            elif self.mode == "view":  # a rename through view(), which needs a compatible stride
+                out[f"model.layers.{layer}.self_attn.q_proj.weight"] = value.view(-1).view(value.shape)
             elif self.mode == "transpose":
                 out[f"model.layers.{layer}.self_attn.q_proj.weight"] = value.t()
+            elif self.mode == "flip_columns":
+                out[f"model.layers.{layer}.self_attn.q_proj.weight"] = value.flip(1)
             elif self.mode == "scale":
                 out[f"model.layers.{layer}.self_attn.q_proj.weight"] = 2 * value
             elif self.mode == "split":
@@ -391,7 +398,7 @@ class PeftLayoutTest(unittest.TestCase):
         from torchtitan.experiments.tpu.checkpointing.lora_checkpoint import peft_to_tt_lora, tt_lora_to_peft
 
         lora = _random_lora(dim=512)  # more rows than bf16 represents exactly as integers
-        for mode in ("rename", "cast"):
+        for mode in ("rename", "cast", "view"):
             with self.subTest(mode=mode):
                 peft = tt_lora_to_peft(lora, _ToyAdapter(n_heads=8, mode=mode))
                 self.assertEqual(len(peft), len(lora))
@@ -426,10 +433,26 @@ class PeftLayoutTest(unittest.TestCase):
         for key, value in lora.items():
             self.assertTrue(torch.equal(back[key], value), key)
 
+    def test_lora_b_rows_follow_a_permutation_that_casts(self):
+        """Row ids above 256 are not exact in bf16; the probes read them digit by digit."""
+        from torchtitan.experiments.tpu.checkpointing.lora_checkpoint import peft_to_tt_lora, tt_lora_to_peft
+
+        adapter = _ToyAdapter(n_heads=8, mode="permute_cast")
+        lora = _random_lora(dim=512)
+        peft = tt_lora_to_peft(lora, adapter)
+        for layer in range(2):
+            a, b = lora[f"layers.{layer}.wq.lora_a.weight"], lora[f"layers.{layer}.wq.lora_b.weight"]
+            module = f"base_model.model.model.layers.{layer}.self_attn.q_proj"
+            self.assertTrue(torch.equal(peft[f"{module}.lora_A.weight"], a))
+            self.assertTrue(torch.equal(peft[f"{module}.lora_B.weight"], _rope_permute(b, 8)))
+        back = peft_to_tt_lora(peft, adapter, {k: tuple(v.shape) for k, v in lora.items()})
+        for key, value in lora.items():
+            self.assertTrue(torch.equal(back[key], value), key)
+
     def test_unsupported_relayouts_raise(self):
         from torchtitan.experiments.tpu.checkpointing.lora_checkpoint import tt_lora_to_peft
 
-        for mode in ("transpose", "scale", "split"):
+        for mode in ("transpose", "scale", "split", "flip_columns"):
             with self.subTest(mode=mode), self.assertRaises(NotImplementedError):
                 tt_lora_to_peft(_random_lora(), _ToyAdapter(mode=mode))
 

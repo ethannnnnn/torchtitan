@@ -45,9 +45,10 @@ save_peft_adapter(model_parts, sd_adapter, "gs://<GCS_BUCKET>/<RUN_NAME>/adapter
   them, so serve the adapter when the engine supports it.
 * PEFT module names come from the model's adapter, and `lora_B` rows follow any
   row permutation the adapter applies to the base weight (for example a RoPE
-  permutation of q/k). An adapter on a weight that does not map one-to-one
-  (such as a fused `wqkv` projection) is refused; export those with the
-  model's own PEFT layout code.
+  permutation of q/k), also when it casts the weight. An adapter on a weight
+  that does not map one-to-one (such as a fused `wqkv` projection), or whose
+  columns or values the model's adapter changes, is refused; export those with
+  the model's own PEFT layout code.
 
 ## Export trained weights in the original layout
 
