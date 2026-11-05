@@ -5,7 +5,9 @@ For expert ``e``, forward computes ``Y_e = X_e @ W_e``. Backward computes
 TGMM. dInput uses MegaBlox's logical rhs transpose so kernel-native weights do
 not require a physical layout conversion. dWeight always accumulates in FP32
 across token tiles and rounds once, at the final store, to the dtype of the
-weight (``rhs.dtype``).
+weight (``rhs.dtype``). When the weights do not require grad (frozen experts,
+e.g. under LoRA), backward runs only the dInput GMM, and forward does not save
+``X`` for backward.
 
 The module-level custom operators are stable Dynamo/AOTAutograd boundaries.
 Tiling arguments are compile-time constants, while ``group_sizes`` remains a
@@ -146,15 +148,84 @@ def _grouped_mm_bwd(
     return grad_lhs, grad_rhs
 
 
+@pallas.jax_op("tt_experts::grouped_mm_dgrad")
+def _grouped_mm_dgrad(
+    dout: jax.Array,
+    rhs: jax.Array,
+    group_sizes: jax.Array,
+    tile_m: int,
+    tile_k: int,
+    tile_n: int,
+    tgmm_tile_m: int,
+    tgmm_tile_k: int,
+    tgmm_tile_n: int,
+    transpose_rhs: bool,
+) -> jax.Array:
+    """dInput only, for frozen expert weights (e.g. LoRA): no dWeight TGMM.
+
+    Runs the same GMM with the same tiling as the dInput half of
+    ``_grouped_mm_bwd``, so dInput is bit-identical to the full backward.
+    """
+    del tgmm_tile_m, tgmm_tile_k, tgmm_tile_n
+    if transpose_rhs:
+        _, n_dim, k_dim = rhs.shape
+        return call_named(
+            megablox_gmm,
+            "moe_gmm_dgrad",
+            dout,
+            rhs,
+            group_sizes=group_sizes,
+            preferred_element_type=dout.dtype,
+            tiling=_tiling(tile_m, tile_n, tile_k, n_dim, k_dim),
+        )
+    _, k_dim, n_dim = rhs.shape
+    return call_named(
+        megablox_gmm,
+        "moe_gmm_dgrad",
+        dout,
+        rhs,
+        group_sizes=group_sizes,
+        preferred_element_type=dout.dtype,
+        tiling=_tiling(tile_m, tile_n, tile_k, n_dim, k_dim),
+        transpose_rhs=True,
+    )
+
+
+def _weight_needs_grad(ctx) -> bool:
+    """True unless autograd reports that ``rhs`` needs no gradient."""
+    needs = getattr(ctx, "needs_input_grad", None)
+    return True if needs is None else bool(needs[1])
+
+
 def _setup_context(ctx, inputs, output):
     del output
     lhs, rhs, group_sizes, *static_args = inputs
-    ctx.save_for_backward(lhs, rhs, group_sizes)
+    # Frozen weights (e.g. LoRA): dInput needs only the weights, so the
+    # (capacity-sized) LHS rows are not kept alive for the backward.
+    ctx.lhs_saved = _weight_needs_grad(ctx)
+    if ctx.lhs_saved:
+        ctx.save_for_backward(lhs, rhs, group_sizes)
+    else:
+        ctx.save_for_backward(rhs, group_sizes)
     ctx.static_args = tuple(static_args)
 
 
 def _backward(ctx, grad_output):
+    if not ctx.lhs_saved:
+        if _weight_needs_grad(ctx):
+            raise RuntimeError(
+                "grouped_mm: weight gradient requested but LHS not saved"
+            )
+        rhs, group_sizes = ctx.saved_tensors
+        # Frozen weights: the dWeight TGMM would be computed inside the same
+        # JAX program and then discarded. It costs as many FLOPs as the
+        # forward GEMM.
+        grad_lhs = _grouped_mm_dgrad(grad_output, rhs, group_sizes, *ctx.static_args)
+        return grad_lhs, None, None, None, None, None, None, None, None, None
     lhs, rhs, group_sizes = ctx.saved_tensors
+    if not _weight_needs_grad(ctx):
+        grad_lhs = _grouped_mm_dgrad(grad_output, rhs, group_sizes, *ctx.static_args)
+        return grad_lhs, None, None, None, None, None, None, None, None, None
     grad_lhs, grad_rhs = _grouped_mm_bwd(
         grad_output, lhs, rhs, group_sizes, *ctx.static_args
     )
@@ -181,7 +252,9 @@ def segment_matmul_pallas_2d(
     dimension. Distinct tiling values produce distinct compiled
     specializations. dWeight accumulation is FP32 and its final store is in
     the dtype of ``rhs``. ``transpose_rhs`` accepts weights
-    in ``(E, N, K)`` order without materializing a transpose.
+    in ``(E, N, K)`` order without materializing a transpose. If ``rhs`` does
+    not require grad, backward computes only the gradient of ``lhs``, and
+    ``lhs`` is not saved for backward.
     """
     if group_sizes.dtype != torch.int32:
         group_sizes = group_sizes.to(torch.int32)

@@ -1,6 +1,9 @@
 """Accelerator tests for the MegaBlox expert grouped matmul."""
 
+from unittest import mock
+
 from absl.testing import absltest
+from absl.testing import parameterized
 import torch
 
 from torchtitan.experiments.tpu import base_device_test
@@ -103,6 +106,50 @@ class ExpertSegmentMatmulTest(base_device_test.BaseAcceleratorDeviceTest):
             grad_rhs_ref,
             rtol=8e-3,
             atol=1e-3,
+        )
+
+    @parameterized.parameters(False, True)
+    def test_frozen_weights_get_the_full_dinput_and_no_dweight(
+        self, transpose_rhs
+    ):
+        """Frozen weights skip the dWeight TGMM; dInput stays bit-identical."""
+        device = self.accelerator_device
+        group_sizes = torch.tensor([64, 64], dtype=torch.int32, device=device)
+        lhs = torch.randn(128, 128, dtype=torch.bfloat16, device=device)
+        rhs = torch.randn(2, 128, 256, dtype=torch.bfloat16, device=device)
+        if transpose_rhs:
+            rhs = rhs.transpose(-2, -1).contiguous()
+        grad_output = torch.randn(128, 256, dtype=torch.bfloat16, device=device)
+
+        def backward(train_weights):
+            lhs_leaf = lhs.clone().requires_grad_()
+            rhs_leaf = rhs.clone().requires_grad_(train_weights)
+            # The full backward (dInput GMM and dWeight TGMM) runs only for
+            # trainable weights.
+            with mock.patch.object(
+                expert_segment_matmul,
+                "_grouped_mm_bwd",
+                wraps=expert_segment_matmul._grouped_mm_bwd,
+            ) as full_backward:
+                out = expert_segment_matmul.segment_matmul_pallas_2d(
+                    lhs_leaf,
+                    rhs_leaf,
+                    group_sizes,
+                    tile_m=128,
+                    tgmm_tiling=(128, 0, 0),
+                    transpose_rhs=transpose_rhs,
+                )
+                out.backward(grad_output)
+            self.assertEqual(full_backward.call_count, int(train_weights))
+            return lhs_leaf.grad, rhs_leaf.grad
+
+        grad_lhs_ref, grad_rhs_ref = backward(train_weights=True)
+        grad_lhs, grad_rhs = backward(train_weights=False)
+
+        self.assertIsNotNone(grad_rhs_ref)
+        self.assertIsNone(grad_rhs)
+        torch.testing.assert_close(
+            grad_lhs.cpu(), grad_lhs_ref.cpu(), rtol=0, atol=0
         )
 
 
