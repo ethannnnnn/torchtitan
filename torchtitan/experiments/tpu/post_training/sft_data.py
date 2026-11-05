@@ -54,12 +54,14 @@ import hashlib
 import json
 import logging
 import random
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
 import torch
 
+from torchtitan.components.data.collators import TrainerBatch
 from torchtitan.components.data.loader import BaseDataLoader
 from torchtitan.components.loss import IGNORE_INDEX
 
@@ -176,7 +178,7 @@ def pack_rows(
   call places at least one document when the longest one fits.
   """
   room = [width] * rows
-  placed: list[list[SFTDocument]] = [[] for _ in range(rows)]
+  placed = [[] for _row in range(rows)]
   taken: set[int] = set()
   longest_first = sorted(
       enumerate(documents), key=lambda item: item[1].length, reverse=True
@@ -204,14 +206,15 @@ def pack_rows(
 def build_microbatch(
     placed: list[list[SFTDocument]], *, width: int, pad_id: int
 ) -> dict[str, Any]:
-  """Flatten packed rows into one microbatch of ``len(placed) * width`` slots.
+  """One microbatch from ``placed``, which lists the documents of each row.
 
-  Row r occupies ``[r * width, (r + 1) * width)``: its documents back to back
-  from the row start, then padding (``pad_id`` inputs, ``IGNORE_INDEX``
-  labels, ``padding_mask`` true). A document of n tokens gets positions
-  0 .. n - 1. Padding positions go on rising from the row's last document
-  position, and an empty row simply counts 0, 1, ..., width - 1.
-  ``num_valid_tokens`` is the number of labels that are not ``IGNORE_INDEX``.
+  Row ``r`` covers slots ``[r * width, (r + 1) * width)``. Its documents come
+  first, in list order, each with positions ``0 .. n - 1``; the slots left
+  over are padding, with ``pad_id`` inputs, ``IGNORE_INDEX`` labels and a true
+  ``padding_mask``. Padding positions go on from the final position of the
+  row's last document (an empty row gets ``0 .. width - 1``), so they never
+  start a document. ``num_valid_tokens`` counts the labels that differ from
+  ``IGNORE_INDEX``.
   """
   token_ids: list[int] = []
   targets: list[int] = []
@@ -245,7 +248,8 @@ def build_microbatch(
 
 
 def batch_fingerprint(batch: dict[str, Any]) -> str:
-  """Lowercase hex SHA-256 over the raw bytes of input, labels, positions."""
+  """SHA-256, as lowercase hex, of the ``input``, ``labels`` and
+  ``positions`` bytes taken in that order."""
   raw = b"".join(
       batch[name].detach().cpu().contiguous().numpy().tobytes()
       for name in ("input", "labels", "positions")
@@ -271,6 +275,22 @@ def _tokenizer_dir(tokenizer: Any) -> str:
     return tokenizer.tokenizer_path or ""
   except AttributeError:  # no tokenizer (None), or one without a path
     return ""
+
+
+def _chat_template_tokenizer(configured: str, tokenizer: Any) -> Any:
+  """The Hugging Face tokenizer whose chat template renders the records.
+
+  ``configured`` (``hf_tokenizer_path``) wins over the folder of the trainer's
+  own tokenizer. Raises ``ValueError`` when neither names a source.
+  """
+  source = configured or _tokenizer_dir(tokenizer)
+  if not source:
+    raise ValueError(
+        "ChatSFTDataLoader has no chat template to render with: set "
+        "--dataloader.hf-tokenizer-path, or --hf_assets_path to reuse the "
+        "trainer's tokenizer folder"
+    )
+  return ct.load_hf_tokenizer(source)
 
 
 class ChatSFTDataLoader(BaseDataLoader):
@@ -320,24 +340,19 @@ class ChatSFTDataLoader(BaseDataLoader):
     if config.microbatches_per_step < 1:
       raise ValueError("microbatches_per_step must be >= 1")
     width = int(max_context_length)
-    if num_tokens_per_batch % width:
+    rows, spare = divmod(num_tokens_per_batch, width)
+    if spare:
       raise ValueError(
-          f"num_tokens_per_microbatch_per_dp_rank {num_tokens_per_batch} must be "
-          f"a multiple of max_context_length {width}"
+          f"num_tokens_per_batch ({num_tokens_per_batch}) must be a whole "
+          f"number of {width}-token rows (max_context_length)"
       )
     self.config = config
-    self._width = width
-    self._rows = num_tokens_per_batch // width
-    self.max_num_documents = self._rows * config.max_documents_per_row
+    self._width, self._rows = width, rows
+    self.max_num_documents = rows * config.max_documents_per_row
     self._dp_world_size, self._dp_rank = int(dp_world_size), int(dp_rank)
-    template_source = config.hf_tokenizer_path or _tokenizer_dir(tokenizer)
-    if not template_source:
-      raise ValueError(
-          "ChatSFTDataLoader needs a tokenizer with a chat template: set "
-          "--dataloader.hf-tokenizer-path (Config.hf_tokenizer_path) or "
-          "launch the trainer with --hf_assets_path"
-      )
-    self._hf_tokenizer = ct.load_hf_tokenizer(template_source)
+    self._hf_tokenizer = _chat_template_tokenizer(
+        config.hf_tokenizer_path, tokenizer
+    )
     self._options = ct.ChatTemplateOptions(
         reasoning_effort=config.reasoning_effort or None,
         current_date=config.current_date or None,
@@ -452,25 +467,27 @@ class ChatSFTDataLoader(BaseDataLoader):
       del self.batch_log[:-4096]
     return batch
 
-  def microbatches_for_step(self) -> int:
-    """Microbatches this rank contributes to one optimizer step (constant)."""
+  def num_microbatches_per_step(self) -> int:
+    """Microbatches per rank in one optimizer step (``microbatches_per_step``
+    of the config); it does not change over the loader's life."""
     return int(self.config.microbatches_per_step)
 
-  # -- iteration and checkpointed position -------------------------------
-  def __iter__(self) -> Iterator[dict[str, Any]]:
-    # Endless; every iterator draws from the same loader position.
+  # -- iteration and resumable position ---------------------------------
+  def __iter__(self) -> Iterator[TrainerBatch]:
+    """Microbatches without end; all iterators share this loader's position."""
     return iter(self.next_microbatch, None)
 
   def state_dict(self) -> dict[str, Any]:
-    position = {
-        "epoch": self._epoch,
-        "cursor": self._cursor,
-        "pending": [doc.index for doc in self._pending],
-    }
+    rank_key = f"dp_rank_{self._dp_rank}"
+    position = dict(
+        epoch=self._epoch,
+        cursor=self._cursor,
+        pending=[doc.index for doc in self._pending],
+    )
     return {
         "version": 1,
         "dp_world_size": self._dp_world_size,
-        f"dp_rank_{self._dp_rank}": position,
+        rank_key: position,
     }
 
   def load_state_dict(self, state_dict: dict[str, Any]) -> None:

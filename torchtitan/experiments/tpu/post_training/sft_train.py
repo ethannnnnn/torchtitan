@@ -62,9 +62,9 @@ Resume checks
   process only, whereas the per-rank JSONL files keep accumulating.
 
 Launch
-  ``torchrun ... -m torchtitan.experiments.tpu.post_training.sft_train``
-  ``--module torchtitan.experiments.tpu.post_training.config_registry``
-  ``--config <recipe>`` plus overrides; README.md has a full command.
+  torchrun runs this module as its program, with ``--module`` naming this
+  package's recipe registry (``config_registry``) and ``--config`` one of
+  its recipes; README.md gives a complete command.
 """
 
 from __future__ import annotations
@@ -96,21 +96,35 @@ from torchtitan.experiments.tpu.train import TPUTrainer
 
 from . import lora as lora_mod
 from .lora import lora_parameter_report
-from .sft_config import LORA_SAVE_MODES
+from .sft_config import validated_lora_save
 
 logger = logging.getLogger(__name__)
 
 
 @runtime_checkable
 class MicrobatchesPerStep(Protocol):
-  """A dataloader that decides how many microbatches form one optimizer step.
+  """Implemented by data loaders that set the gradient-accumulation count.
 
-  ``SFTTPUTrainer.train_step`` sets ``gradient_accumulation_steps`` from it
-  before every step; ``ChatSFTDataLoader`` implements it.
+  ``SFTTPUTrainer`` asks for ``num_microbatches_per_step()`` ahead of every
+  optimizer step and trains that many microbatches on each rank.
   """
 
-  def microbatches_for_step(self) -> int:
+  def num_microbatches_per_step(self) -> int:
     ...
+
+
+@dataclasses.dataclass(frozen=True)
+class _StepStart:
+  """Loader counters, batch-log length and learning rates seen before a step.
+
+  ``None`` marks what the loader does not have.
+  """
+
+  documents: int | None = None
+  tokens: int | None = None
+  valid_tokens: int | None = None
+  log_length: int | None = None
+  learning_rates: dict[str, float] = dataclasses.field(default_factory=dict)
 
 
 class SFTTPUTrainer(TPUTrainer):
@@ -175,16 +189,16 @@ class SFTTPUTrainer(TPUTrainer):
           "SFTTPUTrainer applies the chunked loss to a single model part; "
           f"this job has {len(self.model_parts)} (pipeline parallelism)"
       )
-    part = self.model_parts[0]
-    head = getattr(part, "lm_head", None)
+    (decoder,) = self.model_parts
+    head = getattr(decoder, "lm_head", None)
     if head is None:
       raise ValueError(
-          f"{type(part).__name__} has no lm_head module, which the chunked "
+          f"{type(decoder).__name__} has no lm_head module, which the chunked "
           "loss applies to each chunk of hidden states"
       )
     chunked = loss_config.build(compile_config=job_config.compile)
     chunked.set_lm_head(head)
-    part._skip_lm_head = True
+    decoder._skip_lm_head = True
     self.loss_fn = chunked
     logger.info(
         "[sft] loss: ChunkedLossWrapper back in place of TPUTrainer's loss, "
@@ -204,10 +218,7 @@ class SFTTPUTrainer(TPUTrainer):
   def _install_lora_save(self, config: Any) -> None:
     sft = getattr(config, "sft", None)
     mode = getattr(sft, "lora_save", "full")
-    if mode not in LORA_SAVE_MODES:
-      raise ValueError(
-          f"sft.lora_save={mode!r}; expected one of {LORA_SAVE_MODES}"
-      )
+    mode = validated_lora_save(mode)
     modules = self._lora_modules()
     if not modules or mode == "full":
       return
@@ -527,81 +538,104 @@ class SFTTPUTrainer(TPUTrainer):
     )
     return loss
 
+  # -- per-step bookkeeping ----------------------------------------------
   def train_step(self, data_iterator: Iterator[dict[str, Any]]):
     self._maybe_validate(before_step=True)
-    if isinstance(self.dataloader, MicrobatchesPerStep):
-      per_step = self.dataloader.microbatches_for_step()
-      self.gradient_accumulation_steps = per_step
-    before = getattr(self.dataloader, "stats", None)
-    snapshot = (
-        (before.documents, before.tokens, before.valid_tokens)
-        if before
-        else (0, 0, 0)
-    )
-    batch_log = getattr(self.dataloader, "batch_log", None)
-    log_start = len(batch_log) if batch_log is not None else 0
-    lr_used = (
-        self.lr_schedulers.get_metrics() if self._records_all_ranks else {}
-    )
+    loader = self.dataloader
+    if isinstance(loader, MicrobatchesPerStep):
+      self.gradient_accumulation_steps = loader.num_microbatches_per_step()
+    start = self._note_step_start()
     self._step_loss = None
     self._last_grad_norm = None
     result = super().train_step(data_iterator)
-    stats = getattr(self.dataloader, "stats", None)
-    record: dict[str, Any] = dict(step=self.step)
-    if self._step_loss is not None:
-      # This rank's share of the step's global mean loss (the shares of
-      # all data-parallel ranks sum to it). The trainer already reads the
-      # loss back every log step, so this adds no device sync there.
-      record["loss_local"] = float(self._step_loss)
-    if stats is not None:
-      record.update(
-          epoch=stats.epoch,
-          documents=stats.documents - snapshot[0],
-          tokens=stats.tokens - snapshot[1],
-          valid_tokens_local=stats.valid_tokens - snapshot[2],
-          dropped_total=stats.dropped,
-          truncated_total=stats.truncated,
-      )
+    record = self._step_record(start)
     self.sft_records.append(record)
-    logger.info("[sft] step=%d %s", self.step, record)
-    if self._records_all_ranks:
-      self._append_rank_record(
-          record,
-          batch_log[log_start:] if batch_log is not None else [],
-          lr_used,
-      )
-    if batch_log is not None:
-      del batch_log[:]
-    if self._rank == 0 and self.config.dump_folder:
-      path = Path(self.config.dump_folder) / "sft-records-rank0.json"
-      path.parent.mkdir(parents=True, exist_ok=True)
-      path.write_text(
-          json.dumps(
-              {"parameters": self.parameter_report, "steps": self.sft_records},
-              indent=2,
-          )
-      )
+    logger.info("[sft] step %d: %s", self.step, record)
+    batches = self._take_step_batches(start)
+    self._append_rank_line(record, batches, start.learning_rates)
+    self._rewrite_rank0_records()
     self._maybe_validate(before_step=False)
     return result
 
-  def _append_rank_record(
+  def _note_step_start(self) -> _StepStart:
+    stats = getattr(self.dataloader, "stats", None)
+    log = getattr(self.dataloader, "batch_log", None)
+    counters = (
+        {}
+        if stats is None
+        else dict(
+            documents=stats.documents,
+            tokens=stats.tokens,
+            valid_tokens=stats.valid_tokens,
+        )
+    )
+    rates = self.lr_schedulers.get_metrics() if self._records_all_ranks else {}
+    return _StepStart(
+        log_length=None if log is None else len(log),
+        learning_rates=rates,
+        **counters,
+    )
+
+  def _step_record(self, start: _StepStart) -> dict[str, Any]:
+    """This step's entry of ``sft_records``; loader counts are step deltas."""
+    record: dict[str, Any] = {"step": self.step}
+    if self._step_loss is not None:
+      record["loss_local"] = float(self._step_loss)
+    stats = getattr(self.dataloader, "stats", None)
+    if stats is not None:
+      record.update(
+          epoch=stats.epoch,
+          documents=stats.documents - (start.documents or 0),
+          tokens=stats.tokens - (start.tokens or 0),
+          valid_tokens_local=stats.valid_tokens - (start.valid_tokens or 0),
+          dropped_total=stats.dropped,
+          truncated_total=stats.truncated,
+      )
+    return record
+
+  def _take_step_batches(self, start: _StepStart) -> list[dict[str, Any]]:
+    """The batch-log entries this step added; the loader's log is emptied."""
+    log = getattr(self.dataloader, "batch_log", None)
+    if log is None:
+      return []
+    drawn = log[start.log_length or 0 :]
+    log.clear()
+    return drawn
+
+  def _append_rank_line(
       self,
       record: dict[str, Any],
       batches: list[dict[str, Any]],
-      lr_used: dict[str, float],
+      learning_rates: dict[str, float],
   ) -> None:
-    line = dict(record, rank=self._rank, batches=batches, lr=lr_used)
-    if self._last_grad_norm is not None:
-      line["grad_norm"] = float(self._last_grad_norm.item())
-    root = Path(
-        os.environ.get("SFT_RECORDS_DIR")
-        or Path(self.config.dump_folder or ".") / "sft-records"
+    """With ``SFT_RECORDS_ALL_RANKS=1``, add this step's line to the rank's
+    JSONL file (in ``$SFT_RECORDS_DIR``, else ``<dump_folder>/sft-records``)."""
+    if not self._records_all_ranks:
+      return
+    root = os.environ.get("SFT_RECORDS_DIR") or os.path.join(
+        self.config.dump_folder or ".", "sft-records"
     )
-    root.mkdir(parents=True, exist_ok=True)
-    with open(
-        root / f"rank-{self._rank:05d}.jsonl", "a", encoding="utf-8"
-    ) as handle:
-      handle.write(json.dumps(line, sort_keys=True) + "\n")
+    os.makedirs(root, exist_ok=True)
+    extra: dict[str, Any] = {
+        "rank": self._rank,
+        "batches": batches,
+        "lr": learning_rates,
+    }
+    if self._last_grad_norm is not None:
+      extra["grad_norm"] = float(self._last_grad_norm)
+    line = json.dumps({**record, **extra}, sort_keys=True)
+    with open(os.path.join(root, f"rank-{self._rank:05d}.jsonl"), "a") as out:
+      out.write(line + "\n")
+
+  def _rewrite_rank0_records(self) -> None:
+    """Rank 0 keeps ``<dump_folder>/sft-records-rank0.json`` up to date."""
+    folder = self.config.dump_folder
+    if self._rank != 0 or not folder:
+      return
+    os.makedirs(folder, exist_ok=True)
+    summary = {"parameters": self.parameter_report, "steps": self.sft_records}
+    with open(os.path.join(folder, "sft-records-rank0.json"), "w") as out:
+      json.dump(summary, out, indent=2)
 
 
 @contextlib.contextmanager

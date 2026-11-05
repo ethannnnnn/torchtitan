@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import types
 import unittest
 from pathlib import Path
 
@@ -134,6 +135,53 @@ class PackingTest(unittest.TestCase):
     )
     self.assertEqual(sum(len(r) for r in placed), 1)
     self.assertEqual(len(left), 2)
+
+
+class LoaderArgumentTest(unittest.TestCase):
+  """Constructor checks that fail before any record or tokenizer is read."""
+
+  def _loader(self, *, tokens=1024, template_source="", tokenizer=None):
+    config = sft_data.ChatSFTDataLoader.Config(
+        data_path="/nonexistent/sft.jsonl", hf_tokenizer_path=template_source
+    )
+    return sft_data.ChatSFTDataLoader(
+        config,
+        dp_world_size=1,
+        dp_rank=0,
+        tokenizer=tokenizer,
+        max_context_length=512,
+        num_tokens_per_batch=tokens,
+    )
+
+  def test_token_budget_must_fill_whole_rows(self):
+    with self.assertRaisesRegex(ValueError, "1000") as caught:
+      self._loader(tokens=1000, template_source="/unused")
+    self.assertIn("512", str(caught.exception))
+
+  def test_chat_template_source_required(self):
+    # The data path does not exist, so a ValueError (not FileNotFoundError)
+    # shows that the check runs before any data is read.
+    for tokenizer in (None, object(), types.SimpleNamespace(tokenizer_path="")):
+      with self.subTest(tokenizer=tokenizer):
+        with self.assertRaisesRegex(ValueError, "hf-tokenizer-path"):
+          self._loader(tokenizer=tokenizer)
+
+
+class MicrobatchHookTest(unittest.TestCase):
+  """The per-step microbatch count that SFTTPUTrainer reads from its loader."""
+
+  def test_protocol_needs_the_method(self):
+    from torchtitan.experiments.tpu.post_training.sft_train import (
+        MicrobatchesPerStep,
+    )
+
+    class FixedCount:
+
+      def num_microbatches_per_step(self) -> int:
+        return 3
+
+    self.assertIsInstance(FixedCount(), MicrobatchesPerStep)
+    self.assertNotIsInstance(object(), MicrobatchesPerStep)
 
 
 @unittest.skipUnless(ASSETS, "SPARK_TEST_ASSETS is not set")
@@ -346,6 +394,15 @@ class ChatSFTDataLoaderTest(unittest.TestCase):
       loader.load_state_dict(dict(state, version=2))
     with self.assertRaises(ValueError):
       loader.load_state_dict(dict(state, dp_world_size=2))
+
+  def test_microbatch_hook(self):
+    from torchtitan.experiments.tpu.post_training.sft_train import (
+        MicrobatchesPerStep,
+    )
+
+    loader = self._loader(self.path, microbatches_per_step=3)
+    self.assertIsInstance(loader, MicrobatchesPerStep)
+    self.assertEqual(loader.num_microbatches_per_step(), 3)
 
 
 if __name__ == "__main__":
