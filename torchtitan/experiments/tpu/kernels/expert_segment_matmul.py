@@ -191,39 +191,21 @@ def _grouped_mm_dgrad(
     )
 
 
-def _weight_needs_grad(ctx) -> bool:
-    """True unless autograd reports that ``rhs`` needs no gradient."""
-    needs = getattr(ctx, "needs_input_grad", None)
-    return True if needs is None else bool(needs[1])
-
-
 def _setup_context(ctx, inputs, output):
     del output
     lhs, rhs, group_sizes, *static_args = inputs
-    # Frozen weights (e.g. LoRA): dInput needs only the weights, so the
-    # (capacity-sized) LHS rows are not kept alive for the backward.
-    ctx.lhs_saved = _weight_needs_grad(ctx)
-    if ctx.lhs_saved:
-        ctx.save_for_backward(lhs, rhs, group_sizes)
-    else:
-        ctx.save_for_backward(rhs, group_sizes)
+    # Only the dWeight TGMM reads the LHS. For frozen weights (e.g. LoRA), the
+    # (capacity-sized) LHS rows are therefore not kept alive for the backward.
+    saved_lhs = lhs if ctx.needs_input_grad[1] else None
+    ctx.save_for_backward(saved_lhs, rhs, group_sizes)
     ctx.static_args = tuple(static_args)
 
 
 def _backward(ctx, grad_output):
-    if not ctx.lhs_saved:
-        if _weight_needs_grad(ctx):
-            raise RuntimeError(
-                "grouped_mm: weight gradient requested but LHS not saved"
-            )
-        rhs, group_sizes = ctx.saved_tensors
-        # Frozen weights: the dWeight TGMM would be computed inside the same
-        # JAX program and then discarded. It costs as many FLOPs as the
-        # forward GEMM.
-        grad_lhs = _grouped_mm_dgrad(grad_output, rhs, group_sizes, *ctx.static_args)
-        return grad_lhs, None, None, None, None, None, None, None, None, None
     lhs, rhs, group_sizes = ctx.saved_tensors
-    if not _weight_needs_grad(ctx):
+    if not ctx.needs_input_grad[1]:
+        # Frozen weights: skip the dWeight TGMM. It costs as many FLOPs as the
+        # forward GEMM, and autograd would discard its result.
         grad_lhs = _grouped_mm_dgrad(grad_output, rhs, group_sizes, *ctx.static_args)
         return grad_lhs, None, None, None, None, None, None, None, None, None
     grad_lhs, grad_rhs = _grouped_mm_bwd(

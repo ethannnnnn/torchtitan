@@ -290,16 +290,6 @@ class FrozenExpertWeightsTest(parameterized.TestCase):
         ]
         self.assertNotIn(tuple(self.lhs.shape), saved_shapes)
 
-    def test_weight_gradient_without_saved_lhs_is_an_error(self):
-        ctx = types.SimpleNamespace(
-            lhs_saved=False,
-            needs_input_grad=(True, True) + (False,) * 8,
-            saved_tensors=(self.weights_EKN, self.group_sizes),
-            static_args=(_TILE_M, 0, 0, 128, 128, 128, False),
-        )
-        with self.assertRaisesRegex(RuntimeError, "LHS not saved"):
-            self.kernels._backward(ctx, self.grad_output)
-
 
 if __name__ == "__main__":
     absltest.main()
