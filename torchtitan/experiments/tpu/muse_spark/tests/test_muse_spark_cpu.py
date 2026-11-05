@@ -655,6 +655,13 @@ class ChatTemplateTest(unittest.TestCase):
         [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "yo"}]
     )
     self.assertEqual(out, "<user>hi<assistant>yo")
+    # As in Transformers, a variable set inside the block keeps its outer
+    # value after it (the Muse Spark template sets several inside its blocks).
+    tok.set_chat_template(
+        "{% set x = 'outer' %}{% generation %}{% set x = 'inner' %}{{ x }}"
+        "{% endgeneration %}|{{ x }}"
+    )
+    self.assertEqual(tok.apply_chat_template([]), "inner|outer")
 
   @unittest.skipUnless(TINY_DIR and transformers is not None, "set MUSE_SPARK_TINY_DIR")
   def test_muse_spark_template_matches_transformers(self):
