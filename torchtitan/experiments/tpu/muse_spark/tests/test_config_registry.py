@@ -75,7 +75,7 @@ class MuseSparkTrainerConfigTest(unittest.TestCase):
     self.assertTrue(splash.use_tokamax_splash_attention_kernel)
     self.assertEqual((splash.sa_block_q, splash.sa_block_kv), (512, 1024))
     self.assertEqual(splash.sa_num_stacked_q_heads, 4)
-    if {"sa_use_base2_exp", "sa_max_logit_const"} <= _field_names(type(splash)):
+    if tpu7x.splash_knobs_available():
       self.assertFalse(splash.sa_use_base2_exp)
       self.assertEqual(splash.sa_max_logit_const, 0.0)
 
@@ -104,13 +104,9 @@ class MuseSparkTrainerConfigTest(unittest.TestCase):
     # pylint: disable-next=g-import-not-at-top
     from torchtitan.experiments.tpu.muse_spark import tpu7x
     # pylint: disable-next=g-import-not-at-top
-    from torchtitan.experiments.tpu.tpu_job_config import SplashAttentionKernelConfig
-    # pylint: disable-next=g-import-not-at-top
     from torchtitan.tools.logging import logger
 
-    missing_splash = not {"sa_use_base2_exp", "sa_max_logit_const"} <= (
-        _field_names(SplashAttentionKernelConfig)
-    )
+    missing_splash = not tpu7x.splash_knobs_available()
     missing_gmm_v2 = "use_tokamax_gmm_v2" not in _field_names(
         TpuGroupedExperts.Config
     )

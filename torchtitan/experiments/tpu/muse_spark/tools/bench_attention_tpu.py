@@ -25,7 +25,6 @@ for an unpacked row. Results are wall-clock medians with a device sync around ea
 """
 
 import argparse
-import dataclasses
 import json
 import statistics
 import time
@@ -62,10 +61,9 @@ SPARK_TOKAMAX = dict(use_base2_exp=False, max_logit_const=0.0, num_stacked_q_hea
 
 def _spark_tokamax_knobs_available():
   """Whether the Tokamax patch reads use_base2_exp / max_logit_const."""
-  from torchtitan.experiments.tpu.tpu_job_config import SplashAttentionKernelConfig
+  from torchtitan.experiments.tpu.muse_spark import tpu7x
 
-  fields = {f.name for f in dataclasses.fields(SplashAttentionKernelConfig)}
-  return {"sa_use_base2_exp", "sa_max_logit_const"} <= fields
+  return tpu7x.splash_knobs_available()
 
 
 def _make_attend(path, window, cfg):

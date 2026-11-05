@@ -57,10 +57,14 @@ spec = model_registry("debugmodel")                # 4 layers, 8 experts, random
 spec = model_registry("tiny-hf")                   # trl-internal-testing/tiny-MuseSparkForConditionalGeneration
 ```
 
+* The package imports `torch_tpu` (through `tpu/muse_glimmer` and the TPU MoE
+  kernels). On a machine without it, put the CPU import stand-in
+  `torchtitan/experiments/tpu/tests/cpu_stubs` first on `PYTHONPATH` (see
+  Validation).
 * `seq_len` sizes the per-layer RoPE tables; use the training context length.
 * `tpu_moe_kernels=True` (default) applies `TpuTokenDispatcherConverter` and
-  `TpuGroupedExpertsConverter`; they import `torch_tpu`, so pass
-  `tpu_moe_kernels=False` on machines without it.
+  `TpuGroupedExpertsConverter`; `tpu_moe_kernels=False` keeps the model's
+  plain token dispatcher and grouped experts.
 * `load_balance_coeff=None` (default) keeps the checkpoint's routing bias
   fixed, as fine-tuning should; set it to update the bias from token counts.
 * `residual_dtype=None` (default) keeps the residual stream in the compute
@@ -104,14 +108,14 @@ FSDP / HSDP (SimpleFSDP or FSDP2) with FSDP-sharded experts (expert
 parallelism 1), as in the TPU Qwen3.5-35B-A3B recipes. The 202,048-row
 vocabulary switches to dim-1 sharding when dim 0 is uneven (e.g. FSDP 128).
 
-Expert parallelism (`--parallelism.expert_parallel_degree N` > 1) is not part
-of this package yet: it needs `expert_parallel.py` (EP token dispatchers and
-expert placement), which `MuseSparkModel.Config.update_from_config`,
-`parallelize_muse_spark` and the state-dict adapter import only when EP or a
-placement file is requested; without it they raise `NotImplementedError`. The
-model already keeps the shared post-expert norm on the token-owning rank under
-EP (`MuseSparkRoutedExperts`), and the adapter reads HF checkpoints into a
-non-contiguous expert placement (`ExpertPermutingHFStorageReader`).
+Expert parallelism (`--parallelism.expert_parallel_degree N` > 1) lives in a
+separate module, `expert_parallel.py` (EP token dispatchers and expert
+placement). `MuseSparkModel.Config.update_from_config`,
+`parallelize_muse_spark` and the state-dict adapter import it only when EP or
+a placement file is requested, and raise `NotImplementedError` if it is
+absent. The model keeps the shared post-expert norm on the token-owning rank
+under EP (`MuseSparkRoutedExperts`), and the adapter reads HF checkpoints into
+a non-contiguous expert placement (`ExpertPermutingHFStorageReader`).
 `MuseSparkModel.Config.ep_grad_reduce_dtype` sets the dtype of the EP-sharded
 experts' gradient reduce-scatter (`"bfloat16"` or `"float32"`); None, the
 default, follows `training.mixed_precision_reduce`.
@@ -139,7 +143,7 @@ python -m pytest -q torchtitan/experiments/tpu/muse_spark/tests --ignore-glob='*
 | random 4-layer config (sliding/full x RoPE/NoPE, a dense layer, 16 experts top-4, packed documents; reference experts eager and grouped_mm) | max abs logit diff 2.5e-5 (logits up to 7.0); worst relative gradient diff 2.2e-5 over all 67 parameters |
 | public tiny checkpoint | max abs logit diff 1.4e-8 (logits up to 0.022); worst relative gradient diff 1.1e-6 |
 | first two released layers at real dimensions (256 experts, real vocabulary; experts, embedding and head frozen to bound memory) | max abs logit diff 2.9e-5 (logits up to 7.4); losses equal; worst relative gradient diff 1.2e-5 over the other 31 parameters |
-| released checkpoint metadata (opt-in, `MUSE_SPARK_CKPT_META_DIR`) | all 1,119 text tensor names match the index and every shape matches the shard headers (measured with the original port; not re-run for this change); the text parameter count, 819,990,552,064 elements with the routing biases, is checked on every run |
+| released checkpoint metadata (opt-in, `MUSE_SPARK_CKPT_META_DIR`) | all 1,119 text tensor names match the index and every shape matches the shard headers; the text parameter count, 819,990,552,064 elements with the routing biases, is checked on every run |
 | TPU MoE converters (Pallas off) | logits within 1e-5 and gradients within 1e-4 (relative) of the plain BF16-expert model |
 | SimpleFSDP, 2 ranks | gradients identical to a single-process reference (worst relative diff 0 over 70 parameters); negative control 0.89 |
 | trainer (CPU, TPU trainer entry with the CPU import stand-in) | `muse_spark_debugmodel` 5 steps: loss 12.64 -> 8.77 on 1 rank, 12.65 -> 8.70 on 2 ranks (SimpleFSDP); `muse_spark_tiny_hf` loads the tiny checkpoint through the HF path (step-1 loss 12.216) |
@@ -154,12 +158,11 @@ compares the Splash attention entry points (stock Splash patch, Tokamax
 Splash patch with default and Spark settings, splash bias-dropout kernel)
 with the Transformers attention on Spark's attention shapes, forward and
 backward, packed documents included; `tools/bench_attention_tpu.py` times them.
-These need a TPU and were not run for this change.
+Both need a TPU.
 
 ## Open work
 
-* Expert parallelism (`expert_parallel.py`, see Parallelism) and TP for the
-  128-head attention.
+* Tensor parallelism for the 128-head attention.
 * `bld_layout` (the TPU `[B, L]` block layout) does not apply to these blocks.
 * Under BF16 mixed precision the router weight and residual gates are cast to
   BF16 for compute; the reference keeps them in FP32. Keeping them in FP32

@@ -19,7 +19,7 @@ Checks:
 2. Tiny public checkpoint parity (``MUSE_SPARK_TINY_DIR`` =
    ``trl-internal-testing/tiny-MuseSparkForConditionalGeneration``).
 3. Truncated real dimensions (opt-in ``MUSE_SPARK_REAL_DIMS=1``; about
-   140 GB of host memory): the first two released layers (sliding + RoPE,
+   125 GB of host memory): the first two released layers (sliding + RoPE,
    full + NoPE) at hidden 8192, 128/16 heads, 256 experts of 4096x4096, the
    real vocabulary, a shrunk sliding window so that it is exercised; random
    weights shared by both models (the expert and embedding weights are frozen
@@ -356,7 +356,7 @@ class MuseSparkHFParityTest(unittest.TestCase):
     )
     print("tiny_checkpoint_parity", report)
 
-  @unittest.skipUnless(REAL_DIMS, "set MUSE_SPARK_REAL_DIMS=1 (~140 GB RAM)")
+  @unittest.skipUnless(REAL_DIMS, "set MUSE_SPARK_REAL_DIMS=1 (~125 GB RAM)")
   def test_truncated_real_dims_parity(self):
     args = MuseSparkArgs(num_hidden_layers=2, sliding_window=48)
     text = {

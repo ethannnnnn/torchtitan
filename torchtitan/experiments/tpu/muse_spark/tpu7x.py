@@ -65,6 +65,9 @@ SPLASH_ATTENTION = dict(
 )
 """Tokamax Splash settings for Spark attention (see the module docstring)."""
 
+SPLASH_KNOBS = ("sa_use_base2_exp", "sa_max_logit_const")
+"""The settings above that need the Tokamax Splash knob fields (see the module docstring)."""
+
 GMM_TILES = (512, 1024, 1024)
 """(m, k, n) tiles of the MegaBlox grouped matmuls (fallback), also the dWeight tiling."""
 
@@ -79,6 +82,14 @@ LIBTPU_FLAGS = tpu_flags.merge_flags(
 
 def _field_names(config_cls: type) -> set[str]:
   return {field.name for field in dataclasses.fields(config_cls)}
+
+
+def splash_knobs_available() -> bool:
+  """Whether ``SplashAttentionKernelConfig`` has the ``SPLASH_KNOBS`` fields."""
+  # pylint: disable-next=g-import-not-at-top
+  from torchtitan.experiments.tpu.tpu_job_config import SplashAttentionKernelConfig
+
+  return set(SPLASH_KNOBS) <= _field_names(SplashAttentionKernelConfig)
 
 
 def splash_attention_config() -> Any:
