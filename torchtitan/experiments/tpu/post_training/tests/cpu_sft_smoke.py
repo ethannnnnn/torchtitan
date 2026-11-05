@@ -237,9 +237,8 @@ def _discard(folder: pathlib.Path) -> None:
 
 def main() -> int:
   args = _parse_cli()
-  work = pathlib.Path(args.work)
+  work, tokenizer_dir = map(pathlib.Path, (args.work, args.tokenizer_dir))
   _discard(work)
-  tokenizer_dir = pathlib.Path(args.tokenizer_dir)
   qwen_assets, data = work / "assets", work / "sft.jsonl"
   qwen_initial = smoke_common.make_debug_checkpoint(qwen_assets, tokenizer_dir)
   write_conversations(data)
