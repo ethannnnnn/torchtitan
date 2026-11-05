@@ -8,12 +8,12 @@ repository root unless noted. The launch kit is described in
 
 ## 0. What you need
 
-- A GKE cluster with TPU7x capacity: 4 chips (`2x2x1`) for the two-layer
-  smoke and 64 chips (`4x4x4`, 16 hosts, 128 ranks) for the full 62-layer
-  model, as node pools of those shapes or through dynamic slice provisioning
-  (`render.py --slice-provisioning dynamic`). With dynamic slice provisioning,
-  64-chip slices came up in under a minute while some small slices were never
-  provisioned.
+- A GKE cluster with TPU7x capacity: 4 chips (`2x2x1`; `2x2x2`, two hosts,
+  as a fallback) for the two-layer smoke and 64 chips (`4x4x4`, 16 hosts,
+  128 ranks) for the full 62-layer model, as node pools of those shapes or
+  through dynamic slice provisioning (`render.py --slice-provisioning
+  dynamic`). With dynamic slice provisioning, 64-chip slices came up in under
+  a minute while some small slices were never provisioned.
 - JobSet, Kueue, and the GCSFuse CSI driver; a Kubernetes service account that
   can read your model, data, and runtime prefixes and write the run prefix.
   The pods need outbound HTTPS: they fetch the base commit from the public
@@ -134,7 +134,9 @@ bash ./rendered-2l/own-configmaps.sh --context <KUBE_CONTEXT>
 
 `own-configmaps.sh` makes the JobSet the owner of its code ConfigMaps, so they
 are deleted together with it (by hand or an hour after the run, through
-`ttlSecondsAfterFinished`).
+`ttlSecondsAfterFinished`). If no `2x2x1` slice comes up within a few
+minutes, delete the JobSet and render the same recipe with `--topology 2x2x2`
+(two hosts, 16 ranks); the two-layer recipe has run on both shapes.
 
 ### Full model (`s2_sft_full`, one `4x4x4` slice)
 

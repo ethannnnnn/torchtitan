@@ -188,7 +188,12 @@ python -m pip list --format=freeze --exclude pip > NAME-lock.txt
 #    add --extra-index-url https://download.pytorch.org/whl/cpu for the torch CPU wheel:
 python -m pip download --no-deps --only-binary=:all: --find-links ./given-wheels \
   -r NAME-lock.txt -d wheels
-# 3. Digest lists, and the digests of the lists for render.py (without system
+# 3. Optional system packages (for example the tcmalloc allocator, which
+#    runtime_install.sh preloads when present): the .deb files for the trainer
+#    image's distribution, with every dependency they need (dpkg -i installs
+#    exactly these files), e.g. in a container of that image:
+mkdir -p debs && (cd debs && apt-get update && apt-get download <PACKAGE>...)
+# 4. Digest lists, and the digests of the lists for render.py (without system
 #    packages, leave out debs/ and NAME-debs.sha256):
 (cd wheels && sha256sum *.whl) > NAME-wheels.sha256
 (cd debs && sha256sum *.deb) > NAME-debs.sha256
