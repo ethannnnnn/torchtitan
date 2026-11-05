@@ -112,6 +112,9 @@ placement file is requested; without it they raise `NotImplementedError`. The
 model already keeps the shared post-expert norm on the token-owning rank under
 EP (`MuseSparkRoutedExperts`), and the adapter reads HF checkpoints into a
 non-contiguous expert placement (`ExpertPermutingHFStorageReader`).
+`MuseSparkModel.Config.ep_grad_reduce_dtype` sets the dtype of the EP-sharded
+experts' gradient reduce-scatter (`"bfloat16"` or `"float32"`); None, the
+default, follows `training.mixed_precision_reduce`.
 
 Not supported yet (raise `NotImplementedError`): tensor, context and pipeline
 parallelism.

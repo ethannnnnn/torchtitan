@@ -604,6 +604,24 @@ class MuseSparkConfigTest(unittest.TestCase):
     with self.assertRaisesRegex(NotImplementedError, "expert_parallel.py"):
       MuseSparkStateDictAdapter(placed, None)
 
+  def test_ep_grad_reduce_dtype_reaches_the_built_model(self):
+    """None by default: the expert gradients follow the training reduce dtype.
+
+    Expert parallelism reads a recipe's override from the built model's
+    config, so the field must survive ``build``.
+    """
+    for flavor in ("debugmodel", "tiny-hf", "816B-A42B-2L", "816B-A42B"):
+      config = model_registry(flavor, tpu_moe_kernels=False).model
+      self.assertIsNone(config.ep_grad_reduce_dtype, flavor)
+      self.assertIn(
+          "ep_grad_reduce_dtype", {f.name for f in dataclasses.fields(config)}
+      )
+    config = model_registry("debugmodel", tpu_moe_kernels=False).model
+    config.ep_grad_reduce_dtype = "bfloat16"
+    with torch.device("meta"):
+      model = config.build()
+    self.assertEqual(model.config.ep_grad_reduce_dtype, "bfloat16")
+
 
 class ChatTemplateTest(unittest.TestCase):
   """TorchTitan's tokenizer must compile HF ``{% generation %}`` blocks.
