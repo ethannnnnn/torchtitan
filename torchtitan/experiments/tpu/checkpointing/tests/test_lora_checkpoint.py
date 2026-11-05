@@ -16,7 +16,8 @@ Model-agnostic (always run):
   DCP I/O; PEFT adapter export and import.
 * ``PeftLayoutTest``: TorchTitan <-> PEFT adapter tensors, including adapters
   that permute rows (RoPE) and re-layouts that cannot be supported.
-* ``CanonicalNamesTest``: activation-checkpoint wrappers in parameter names.
+* ``CanonicalNamesTest``: activation-checkpoint and torch.compile wrappers in
+  parameter names.
 
 ``ResumeTest`` repeats the resume checks on Muse Spark and needs
 ``MUSE_SPARK_TINY_DIR`` (public tiny test checkpoint), the Muse Spark port
@@ -139,35 +140,56 @@ def _model_keys(metadata) -> list[str]:
     return [k for k in metadata if not k.startswith(("optimizer", "lr_scheduler", "dataloader", "train_state"))]
 
 
+class _TinyLoRABlock(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.wq = torch.nn.Linear(4, 4, bias=False)
+        self.lora_a = torch.nn.Linear(4, 2, bias=False)
+        self.lora_b = torch.nn.Linear(2, 4, bias=False)
+
+
+def _wrapped_blocks(wrap) -> torch.nn.Module:
+    model = torch.nn.Module()
+    model.layers = torch.nn.ModuleList([wrap(_TinyLoRABlock()) for _ in range(2)])
+    for name, param in model.named_parameters():
+        param.requires_grad_(".lora_" in name)
+    return model
+
+
 class CanonicalNamesTest(unittest.TestCase):
-    """Adapter-only checkpoints with activation-checkpoint wrappers (every TPU recipe uses them)."""
+    """Adapter-only checkpoints keep the ``state_dict()`` keys of models with wrapped blocks."""
 
     def test_trainable_wrapper_with_checkpoint_wrappers(self):
+        """Every TPU recipe wraps its blocks for activation checkpointing."""
         from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoint_wrapper
 
-        from torchtitan.experiments.tpu.checkpointing.lora_checkpoint import (
-            TrainableModelWrapper,
-            canonical_fqn,
-        )
+        from torchtitan.experiments.tpu.checkpointing.lora_checkpoint import TrainableModelWrapper
 
-        class Block(torch.nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.wq = torch.nn.Linear(4, 4, bias=False)
-                self.lora_a = torch.nn.Linear(4, 2, bias=False)
-                self.lora_b = torch.nn.Linear(2, 4, bias=False)
-
-        model = torch.nn.Module()
-        model.layers = torch.nn.ModuleList([checkpoint_wrapper(Block()) for _ in range(2)])
-        for name, param in model.named_parameters():
-            param.requires_grad_(".lora_" in name)
+        model = _wrapped_blocks(checkpoint_wrapper)
         raw = [n for n, p in model.named_parameters() if p.requires_grad]
         self.assertTrue(all("_checkpoint_wrapped_module." in n for n in raw))
-        self.assertEqual(canonical_fqn("layers.0._checkpoint_wrapped_module._orig_mod.wq.weight"),
-                         "layers.0.wq.weight")
         state = TrainableModelWrapper([model]).state_dict()
         self.assertEqual(sorted(state), sorted(k for k in model.state_dict() if ".lora_" in k))
         self.assertEqual(len(state), 4)
+
+    def test_trainable_wrapper_with_compile_wrappers(self):
+        """A wrapping torch.compile keeps ``_orig_mod`` in named_parameters() and state_dict()."""
+        from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoint_wrapper
+
+        from torchtitan.experiments.tpu.checkpointing.lora_checkpoint import TrainableModelWrapper
+
+        wraps = {
+            "compile": torch.compile,
+            "checkpoint(compile)": lambda block: checkpoint_wrapper(torch.compile(block)),
+            "compile(checkpoint)": lambda block: torch.compile(checkpoint_wrapper(block)),
+        }
+        for label, wrap in wraps.items():
+            with self.subTest(wrap=label):
+                model = _wrapped_blocks(wrap)
+                want = sorted(k for k in model.state_dict() if ".lora_" in k)
+                self.assertEqual(len(want), 4)
+                self.assertTrue(all("._orig_mod." in k for k in want), want)
+                self.assertEqual(sorted(TrainableModelWrapper([model]).state_dict()), want)
 
 
 class Llama3AdapterOnlyTest(unittest.TestCase):

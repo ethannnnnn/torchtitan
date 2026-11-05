@@ -53,6 +53,7 @@ import torch.nn as nn
 
 # MODEL: TorchTitan's key for the model state in CheckpointManager.states.
 from torchtitan.components.checkpointer.base import MODEL, ModelWrapper
+from torchtitan.components.checkpointer.utils import canonical_fqn
 
 logger = logging.getLogger(__name__)
 
@@ -60,7 +61,6 @@ __all__ = [
     "LORA_A",
     "LORA_B",
     "is_lora_key",
-    "canonical_fqn",
     "TrainableModelWrapper",
     "enable_adapter_only_checkpoints",
     "gather_lora_state_dict",
@@ -85,25 +85,14 @@ def is_lora_key(key: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
-# Module wrappers whose names appear in ``named_parameters()`` but not in
-# ``state_dict()`` keys: activation checkpointing, torch.compile, FSDP1.
-_WRAPPER_SEGMENTS = ("_checkpoint_wrapped_module.", "_orig_mod.", "_fsdp_wrapped_module.")
-
-
-def canonical_fqn(name: str) -> str:
-    """Parameter name without wrapper segments, i.e. as it appears in ``state_dict()``.
-
-    ``named_parameters()`` of a model whose blocks are wrapped for activation
-    checkpointing (or compiled) keeps the wrapper's attribute in the path
-    (``layers.0._checkpoint_wrapped_module.attention...``), while the
-    wrappers' state-dict hooks strip it.
-    """
-    for segment in _WRAPPER_SEGMENTS:
-        name = name.replace(segment, "")
-    return name
-
-
 def _trainable_names(model_parts: list[nn.Module]) -> set[str]:
+    """``state_dict()`` keys of the trainable parameters.
+
+    ``named_parameters()`` keeps the activation-checkpoint wrapper's segment
+    (``layers.0._checkpoint_wrapped_module.attention...``), which the wrapper's
+    state-dict hook drops; TorchTitan's ``canonical_fqn`` (also behind the
+    optimizer's parameter names) strips exactly that segment.
+    """
     return {
         canonical_fqn(n) for m in model_parts for n, p in m.named_parameters() if p.requires_grad
     }
@@ -201,7 +190,7 @@ def enable_adapter_only_checkpoints(checkpointer: Any, model_parts: list[nn.Modu
 
 
 def gather_lora_state_dict(model_parts: nn.Module | list[nn.Module], *, to_cpu: bool = True) -> dict[str, torch.Tensor]:
-    """Full (unsharded) LoRA tensors keyed by canonical model FQN (``canonical_fqn``).
+    """Full (unsharded) LoRA tensors keyed by their ``state_dict()`` key (``canonical_fqn``).
 
     Collective when parameters are DTensors: every rank must call it.
     """
