@@ -160,14 +160,17 @@ class FrozenExpertWeightsTest(parameterized.TestCase):
         super().setUp()
         torch.compiler.reset()
         _KERNEL_CALLS.clear()
+        self._make_tensors(_DIM_K, _DIM_N)
+
+    def _make_tensors(self, dim_k, dim_n):
         generator = torch.Generator().manual_seed(0)
         rows = sum(_GROUP_SIZES)
         self.group_sizes = torch.tensor(_GROUP_SIZES, dtype=torch.int32)
-        self.lhs = torch.randn(rows, _DIM_K, generator=generator).bfloat16()
+        self.lhs = torch.randn(rows, dim_k, generator=generator).bfloat16()
         self.weights_EKN = torch.randn(
-            len(_GROUP_SIZES), _DIM_K, _DIM_N, generator=generator
+            len(_GROUP_SIZES), dim_k, dim_n, generator=generator
         ).bfloat16()
-        self.grad_output = torch.randn(rows, _DIM_N, generator=generator).bfloat16()
+        self.grad_output = torch.randn(rows, dim_n, generator=generator).bfloat16()
 
     def _inputs(self, *, transpose_rhs, train_weights):
         lhs = self.lhs.clone().requires_grad_()
@@ -177,14 +180,21 @@ class FrozenExpertWeightsTest(parameterized.TestCase):
             rhs = self.weights_EKN.clone()
         return lhs, rhs.requires_grad_(train_weights)
 
-    def _forward_backward(self, *, transpose_rhs, train_weights, grouped_mm=None):
+    def _forward_backward(
+        self, *, transpose_rhs, train_weights, grouped_mm=None, **tiles
+    ):
         """Returns the output and the gradients of lhs and rhs."""
         grouped_mm = grouped_mm or self.kernels.segment_matmul_pallas_2d
         lhs, rhs = self._inputs(
             transpose_rhs=transpose_rhs, train_weights=train_weights
         )
         out = grouped_mm(
-            lhs, rhs, self.group_sizes, tile_m=_TILE_M, transpose_rhs=transpose_rhs
+            lhs,
+            rhs,
+            self.group_sizes,
+            tile_m=_TILE_M,
+            transpose_rhs=transpose_rhs,
+            **tiles,
         )
         out.backward(self.grad_output)
         return out.detach(), lhs.grad, rhs.grad
@@ -227,6 +237,29 @@ class FrozenExpertWeightsTest(parameterized.TestCase):
         torch.testing.assert_close(
             dweight_full.float(), want_dweight, rtol=8e-3, atol=1e-3
         )
+
+    @parameterized.named_parameters(("kn", False), ("nk", True))
+    def test_frozen_weights_get_the_full_dinput_with_k_and_n_tiles(self, transpose_rhs):
+        """K and N tiled below their sizes, with a different tile for each.
+
+        The default zero tiles resolve to the full dimensions, so they cannot
+        tell the K and N tiles of the dInput GMM apart.
+        """
+        self._make_tensors(dim_k=256, dim_n=512)
+        tiles = {"tile_k": 128, "tile_n": 256}
+        _, dinput_full, _ = self._forward_backward(
+            transpose_rhs=transpose_rhs, train_weights=True, **tiles
+        )
+        _KERNEL_CALLS.clear()
+        _, dinput, dweight = self._forward_backward(
+            transpose_rhs=transpose_rhs, train_weights=False, **tiles
+        )
+
+        self.assertEqual(_KERNEL_CALLS, {"grouped_mm": 1, "grouped_mm_dgrad": 1})
+        self.assertIsNone(dweight)
+        torch.testing.assert_close(dinput, dinput_full, rtol=0, atol=0)
+        want_dinput, _ = self._fp32_reference()
+        torch.testing.assert_close(dinput.float(), want_dinput, rtol=8e-3, atol=1e-3)
 
     @parameterized.named_parameters(("trainable", True), ("frozen", False))
     def test_lhs_is_saved_for_backward_only_for_trainable_weights(self, train_weights):
@@ -282,13 +315,15 @@ class FrozenExpertWeightsTest(parameterized.TestCase):
         }
         self.assertTrue(any("grouped_mm_dgrad" in t for t in targets), targets)
         self.assertFalse(any("grouped_mm_bwd" in t for t in targets), targets)
-        # The forward keeps nothing of LHS shape alive for the backward.
-        saved_shapes = [
+        # The backward graph reads no LHS-shaped tensor, so the compiled
+        # forward keeps none alive for it. (AOTAutograd saves only what the
+        # backward graph reads; the saved-tensors test covers eager mode.)
+        backward_input_shapes = [
             tuple(getattr(node.meta.get("val"), "shape", ()))
             for node in backward.nodes
             if node.op == "placeholder"
         ]
-        self.assertNotIn(tuple(self.lhs.shape), saved_shapes)
+        self.assertNotIn(tuple(self.lhs.shape), backward_input_shapes)
 
 
 if __name__ == "__main__":
