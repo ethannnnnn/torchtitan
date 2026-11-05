@@ -14,7 +14,10 @@ Code reaches the pods inline: ``--code-overlay`` is the output of
 ``build_overlay.py`` (the candidate's changed files relative to a public base
 commit). It is split into ConfigMaps that the pods mount; each pod fetches the
 base commit, applies the overlay and starts only if the resulting git tree is
-the candidate's tree (``bootstrap.sh``).
+the candidate's tree (``bootstrap.sh``). The container command is this
+directory's ``bootstrap.sh`` and the JobSet comes from this directory's
+template, so rendering stops unless both are the candidate's own copies (the
+blob ids in the overlay manifest).
 
 Output goes to a new directory: ``trainer.json`` (a ``v1`` List: the overlay
 ConfigMaps, then the suspended JobSet), ``own-configmaps.sh`` (run once after
@@ -44,6 +47,9 @@ DNS_LABEL = re.compile(r"[a-z0-9](?:[-a-z0-9]*[a-z0-9])?")
 ENV_NAME = re.compile(r"[A-Z_][A-Z0-9_]*")
 SECRET_NAME = re.compile(r"TOKEN|SECRET|PASSWORD|CREDENTIAL|PRIVATE_KEY")
 SHA256 = re.compile(r"[0-9a-f]{64}")
+# In container arguments the kubelet replaces $(NAME) by the value of the container variable NAME
+# and $$ by $; the embedded bootstrap.sh must reach the pod unchanged.
+KUBELET_EXPANSION = re.compile(r"\$\$|\$\(([A-Za-z_][A-Za-z0-9_]*)\)")
 DEFAULT_BASE_REPO = "https://github.com/google-pytorch/torchtitan.git"
 CHUNK_BYTES = 700 * 1024
 """Raw overlay bytes per ConfigMap; base64 keeps each object under the 1 MiB ConfigMap limit."""
@@ -97,6 +103,39 @@ def render_template(name, settings):
 
 def _relative_dir(value: str) -> bool:
     return not value.startswith("/") and all(part not in ("", ".", "..") for part in value.split("/"))
+
+
+def check_kit(manifest: dict) -> dict[str, str]:
+    """Blob ids of this directory's launch files, which must be the candidate's (see build_overlay.KIT_FILES).
+
+    bootstrap.sh is the script that checks the candidate's tree in every pod; an
+    entry script or pod template from another revision or a dirty checkout
+    would bypass that check, so it has to come from the verified candidate too.
+    """
+    recorded = {f["path"]: f["blob"] for f in manifest["files"]}
+    recorded.update(manifest.get("kit", {}))
+    blobs = {}
+    for name in build_overlay.KIT_FILES:
+        path = f"{build_overlay.KIT_DIR}/{name}"
+        have = build_overlay.blob_id((HERE / name).read_bytes())
+        want = recorded.get(path)
+        if want is None:
+            raise ValueError(f"the overlay does not record the candidate's {path}; "
+                             "build it again with this checkout's build_overlay.py")
+        if have != want:
+            raise ValueError(f"{HERE / name} (blob {have[:12]}) differs from the candidate's {path} "
+                             f"(blob {want[:12]}); render from a clean checkout of the candidate "
+                             f"{manifest['candidate_commit'][:12]}")
+        blobs[path] = have
+    return blobs
+
+
+def check_command(command: str, env_names: set[str]) -> None:
+    """The kubelet must pass the container command on unchanged (bootstrap.sh compares itself with the tree)."""
+    for match in KUBELET_EXPANSION.finditer(command):
+        if match.group(1) is None or match.group(1) in env_names:
+            raise SystemExit(f"bootstrap.sh contains {match.group()!r}, which the kubelet would rewrite in the "
+                             "container command; write it differently")
 
 
 def parse_args(argv=None):
@@ -200,6 +239,7 @@ def parse_args(argv=None):
         p.error("need 0 < --budget-seconds < --deadline-seconds")
     try:
         args.overlay_manifest, args.overlay_archive = build_overlay.load_manifest(args.code_overlay)
+        args.kit = check_kit(args.overlay_manifest)
     except (OSError, ValueError, KeyError) as exc:
         p.error(f"--code-overlay: {exc}")
     if args.pip_overlay is not None:
@@ -275,6 +315,7 @@ def main(argv=None):
     runtime_dir = args.runtime_dir or f"{args.prefix}/runtime"
     base_labels = {"app": "muse-spark-trainer", "muse-spark-run": args.run, "muse-spark-mode": args.mode}
     maps = overlay_configmaps(args, {**base_labels, "component": "code", **args.labels})
+    command = (HERE / "bootstrap.sh").read_text()
     settings = {
         "<RUN_NAME>": args.run, "<MODE>": args.mode, "<ENTRY_MODULE>": entry,
         "<CONFIG_MODULE>": config_module, "<CONFIG>": args.config, "<EXTRA_ARGS>": args.extra_args,
@@ -289,7 +330,7 @@ def main(argv=None):
         "<RUNTIME_DIR>": runtime_dir, "<K8S_NAMESPACE>": args.namespace,
         "<LOCAL_QUEUE>": args.local_queue, "<GCP_PROJECT>": args.project, "<TRAINER_IMAGE>": args.trainer_image,
         "<SERVICE_ACCOUNT>": args.service_account, "<SHM_SIZE>": args.shm_size, "<WORK_SIZE>": args.work_size,
-        "<TRAINER_COMMAND>": (HERE / "bootstrap.sh").read_text(),
+        "<TRAINER_COMMAND>": command,
     }
     trainer = render_template("trainer_jobset.json.in", settings)
     pod_spec = trainer["spec"]["replicatedJobs"][0]["template"]["spec"]["template"]["spec"]
@@ -312,6 +353,7 @@ def main(argv=None):
                          + ", ".join(reserved))
     container_env.extend({"name": key, "value": value} for key, value in kit_env.items())
     container_env.extend({"name": key, "value": value} for key, value in sorted(args.environment.items()))
+    check_command(command, {env["name"] for env in container_env})
     if args.priority_class:
         pod_spec["priorityClassName"] = args.priority_class
     if args.labels:
@@ -331,6 +373,7 @@ def main(argv=None):
             "files": len(manifest["files"]), "deleted": len(manifest["deleted"]),
             "configmaps": [m["metadata"]["name"] for m in maps],
             "configmap_owner_script": "own-configmaps.sh",
+            "launch_files": args.kit,
         },
         "runtime": {"mode": args.runtime_mode, "dir": f"gs://{args.bucket}/{runtime_dir}/", "name": args.runtime_name,
                     "pins": {k: v for k, v in kit_env.items() if k.endswith("_SHA256")},

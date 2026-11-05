@@ -48,10 +48,14 @@ No code goes to the bucket.
 
 `build_overlay.py` compares the candidate commit (your branch) with a public
 base commit and packs every file the candidate adds or changes; deletions are
-listed in the manifest. `render.py` splits the archive into ConfigMaps of at
-most 700 KiB (each stays under the 1 MiB ConfigMap limit; the overlay may be
-up to 3 MiB compressed) that every trainer pod mounts at `/mnt/overlay`. In
-each pod `bootstrap.sh`:
+listed in the manifest, together with the candidate's blob ids of
+`bootstrap.sh` and `trainer_jobset.json.in`. `render.py` splits the archive
+into ConfigMaps of at most 700 KiB (each stays under the 1 MiB ConfigMap
+limit; the overlay may be up to 3 MiB compressed) that every trainer pod
+mounts at `/mnt/overlay`. The container command is `render.py`'s own
+`bootstrap.sh` and the JobSet comes from its own template, so it refuses to
+render unless both files are the candidate's copies: render from a clean
+checkout of the candidate. In each pod `bootstrap.sh`:
 
 1. fetches the base commit (`git fetch --depth=1`) and checks its commit and
    tree ids;
@@ -60,11 +64,13 @@ each pod `bootstrap.sh`:
    and blob id against the manifest;
 4. stages the changed paths and compares `git write-tree` with the
    candidate's tree, and stops unless they are equal;
-5. starts `spark_pod.sh` from that tree.
+5. checks that the script it is running (the container command) is that
+   tree's `launch/bootstrap.sh`;
+6. starts `spark_pod.sh` from that tree.
 
-So the pods run exactly the candidate's tree, and the rendered manifest
-records which tree that is (`receipt.json`, JobSet annotations, and the
-`versions-hostN.json` of every host).
+So the pods run exactly the candidate's tree, entry script included, and the
+rendered manifest records which tree that is (`receipt.json`, JobSet
+annotations, and the `versions-hostN.json` of every host).
 
 ## Render and launch
 
