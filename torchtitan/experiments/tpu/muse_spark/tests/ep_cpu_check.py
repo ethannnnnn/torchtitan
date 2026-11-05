@@ -6,12 +6,13 @@
 
 """CPU (gloo) check of Muse Spark expert parallelism (EP > 1) against EP = 1.
 
-For each config and EP degree, every rank runs different packed documents
-through ``parallelize_muse_spark`` with SimpleFSDP over all ranks and the
-routed experts sharded over ``ep`` (each EP token dispatcher; the ragged
-all-to-all uses its CPU reference transport), in FP32. The loss is normalized by the global token
-count. Checked against a single-process EP = 1 model that runs every rank's
-documents with the same weights and the TPU lane's EP = 1 dispatcher:
+For each config, EP degree and EP token dispatcher in ``--dispatchers``, every
+rank runs different packed documents through ``parallelize_muse_spark`` with
+SimpleFSDP over all ranks and the routed experts sharded over ``ep`` (the
+ragged all-to-all uses its CPU reference transport), in FP32. The loss is
+normalized by the global token count. Checked against a single-process EP = 1
+model that runs every rank's documents with the same weights and the TPU
+lane's EP = 1 dispatcher:
 
 * the global loss, every rank's logits (= the reference logits of its
   documents), and the reduced gradient of every parameter (including the
@@ -25,6 +26,13 @@ Configs: ``small`` (4 layers: sliding + full, RoPE + NoPE, a dense layer,
 released model's first 4 layer types and routing hyperparameters with all
 256 experts, top-8, at reduced widths). Weights are random at O(1) scale
 (``tiny``: the checkpoint's), routing biases included.
+
+``--capacity`` below 1 is a smoke test of the overflow handling: routes are
+dropped, so only finiteness is checked. It runs the dispatchers that drop
+routes, ``ragged`` and ``allgather`` by default. ``ragged_a2a`` (the
+all-to-all count exchange) cannot drop routes; it raises when a receive
+buffer would overflow, so it is left out of the overflow smoke (a known
+limitation) and needs a ``--capacity`` that covers the busiest rank.
 
 Run (the CPU stand-in provides TorchTPU's import-time names; drop it from
 ``PYTHONPATH`` where TorchTPU is installed):
@@ -371,12 +379,22 @@ def main() -> None:
   parser.add_argument("--ac", default="none,full")
   # allgather_bf16 (BF16 reduce-scatter combine) is meant for BF16 models; in
   # this FP32 check its rounding is amplified by the random weights.
-  parser.add_argument("--dispatchers", default="ragged,ragged_a2a,allgather")
+  # Default: ragged,ragged_a2a,allgather (ragged,allgather below capacity 1).
+  parser.add_argument("--dispatchers", default=None)
   # < 1 forces dropped routes: then only finiteness is checked (smoke test of
   # the overflow handling), not equality with EP = 1.
   parser.add_argument("--capacity", type=float, default=2.0)
   parser.add_argument("--placement", default="contiguous")
   opts = parser.parse_args()
+  if opts.dispatchers is None:
+    opts.dispatchers = (
+        "ragged,allgather" if opts.capacity < 1.0 else "ragged,ragged_a2a,allgather"
+    )
+  elif opts.capacity < 1.0 and "ragged_a2a" in opts.dispatchers.split(","):
+    parser.error(
+        "ragged_a2a cannot drop routes (it raises when a receive buffer would"
+        " overflow): leave it out of the --capacity < 1 overflow smoke"
+    )
   rank, world = int(os.environ["RANK"]), int(os.environ["WORLD_SIZE"])
   dist.init_process_group("gloo")
   torch.manual_seed(0)
