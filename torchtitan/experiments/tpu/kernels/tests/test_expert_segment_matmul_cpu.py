@@ -4,33 +4,49 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""CPU tests of the frozen-weight backward of ``segment_matmul_pallas_2d``.
+"""CPU checks that segment_matmul_pallas_2d computes only dInput for frozen experts.
 
-``segment_matmul_pallas_2d`` is the grouped matmul of the routed experts. When
-the expert weights do not require grad (frozen experts, as under LoRA), its
-backward has to compute the input gradient on its own, bit for bit equal to
-the input gradient of the complete backward, and no weight gradient, while
-its forward keeps nothing of the LHS for later. The tests check this eagerly
-and under AOTAutograd, the tracing path that compiled training goes through.
+``segment_matmul_pallas_2d`` multiplies the token rows of each routed expert
+(``lhs``, split by ``group_sizes``) with that expert's weight matrix (``rhs``).
+When ``rhs`` has ``requires_grad=False``, as for base weights frozen under LoRA,
+its backward must compute dInput, the gradient of ``lhs``, and nothing else.
+That dInput must match, bit for bit, the dInput that the backward returns for
+trainable weights; ``rhs.grad`` must stay ``None``; and the forward must not keep
+``lhs`` for the backward. The tests verify this in eager mode and through
+AOTAutograd, which ``torch.compile`` uses to trace the backward of a compiled
+training step.
 
-While a test runs, the module's three TorchTPU ops are replaced by test-local
-ops that call the same jitted JAX functions on the CPU, where the Pallas TPU
-kernels are interpreted instead of compiled for a TPU. The forward replacement
-carries the module's own autograd functions; the rest of the module is used
-unchanged.
+Importing ``expert_segment_matmul`` needs TorchTPU, since the kernel module
+imports ``torch_tpu._internal.pallas`` at load time. With TorchTPU installed,
+run this file as a module (``python -m`` and its dotted name) from the checkout
+root. On a host without TorchTPU, run it from the checkout root with two
+``PYTHONPATH`` entries: first the directory of the import-only ``torch_tpu``
+stand-in that the CPU tests of TPU modules share, then the root itself::
 
-Importing the kernel module needs TorchTPU. Where TorchTPU is installed, the
-tests run as they are. Elsewhere, run them from the repository root with the
-shared CPU stand-in ahead of the repository root on ``PYTHONPATH``::
+    PYTHONPATH=torchtitan/experiments/tpu/tests/cpu_stubs:. \\
+      python -m torchtitan.experiments.tpu.kernels.tests.test_expert_segment_matmul_cpu
 
-    PYTHONPATH=torchtitan/experiments/tpu/tests/cpu_stubs:. python -m \\
-        torchtitan.experiments.tpu.kernels.tests.test_expert_segment_matmul_cpu
+Any directory holding the stand-in's ``torch_tpu`` package can take the first
+place. Without any importable ``torch_tpu``, the whole test class is skipped,
+and the skip reason shows the command above. Other import errors, such as a
+missing JAX or a stand-in that refuses to load beside a real TorchTPU, are
+reported as errors rather than skips.
 
-With neither of the two, every test is skipped.
+Each TorchTPU op of the module (``_grouped_mm_fwd``, ``_grouped_mm_bwd``,
+``_grouped_mm_dgrad``) keeps the ``jax.jit`` form of the JAX function it wraps
+at ``_init_fn.jit_fn``. Around that function the test defines a separate CPU op
+with ``torch.library.custom_op``, whose implementation calls it inside
+``jax.experimental.pallas.tpu.force_tpu_interpret_mode()``; the Pallas kernels
+are then interpreted on JAX's CPU backend. For the duration of each test,
+``unittest.mock`` swaps the three CPU ops in for those module attributes.
+``register_autograd`` gives the CPU forward op the module's own ``_backward`` and
+``_setup_context``, so ``segment_matmul_pallas_2d``, ``_setup_context`` and
+``_backward`` execute as written in the module.
 
-Not covered on CPU: lowering and compiling the kernels for a TPU, their speed
-and memory use, and the module's registration of its autograd functions on its
-TorchTPU op. The TPU test ``test_expert_segment_matmul`` covers those.
+A CPU run cannot check how the kernels lower and compile for a TPU, their speed
+or memory use, or the module's own ``register_autograd`` call on its TorchTPU
+forward op. The TPU test ``test_expert_segment_matmul`` runs the kernels and
+that registration on a TPU.
 """
 
 import collections
