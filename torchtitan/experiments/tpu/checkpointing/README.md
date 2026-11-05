@@ -14,7 +14,7 @@ specific: models plug in through their TorchTitan `StateDictAdapter`.
 | `dcp_io_bench.py` | DCP save/load throughput benchmark (Cloud Storage FUSE, `gs://` via gcsfs, local staging + parallel upload) |
 | `gcs.py` | Cloud Storage credentials for GKE pods and parallel multipart transfers |
 | `flush.py` | Makes every rank leave a DCP save together on TorchTPU |
-| `resume_check.py` | Environment-gated kill and batch-record hooks for checkpoint/resume tests of any TorchTitan trainer |
+| `resume_check.py` | Environment-gated kill and batch-record hooks for checkpoint/resume tests of TorchTitan trainers |
 
 ## LoRA runs
 
@@ -125,8 +125,8 @@ reads it back, so every rank leaves the save together. It changes no numerics.
 
 ## Resume checks
 
-`resume_check.install()` patches `torchtitan.trainer.Trainer` (and so every
-subclass) only when the environment asks for it:
+`resume_check.install()` patches `torchtitan.trainer.Trainer` only when the
+environment asks for it:
 
 * `TT_FAULT_KILL_STEP=N`: every rank sends itself SIGKILL when step N draws its
   first batch, a hard crash for restart tests (relaunch with the same dump
@@ -135,6 +135,12 @@ subclass) only when the environment asks for it:
   the SHA-256 of each batch it drew to `<dir>/rank-NNNNN.jsonl`, and rank 0 logs
   `[resume-check] step=N loss=... grad_norm=...` at full precision, so two runs
   can be compared batch by batch and bit for bit across a restart.
+
+The hooks live in `Trainer.batch_generator` and `Trainer.train_step`, so a
+subclass gets them only through those methods: one that overrides
+`batch_generator` without calling the base method is never killed and hashes
+no batches, and one that overrides `train_step` that way (for example
+`TpuGraphTrainer` with the optimizer in the graph) writes no batch records.
 
 ## Benchmark
 

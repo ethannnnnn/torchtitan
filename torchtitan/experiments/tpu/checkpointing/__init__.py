@@ -23,7 +23,7 @@
 * ``gcs``: Cloud Storage credentials and parallel transfer helpers.
 * ``flush``: makes every rank leave a DCP save together on TorchTPU.
 * ``resume_check``: environment-gated kill and batch-record hooks for
-  checkpoint/resume tests of any TorchTitan trainer.
+  checkpoint/resume tests of TorchTitan trainers.
 
 Nothing in this package is model specific; models plug in through their
 TorchTitan ``StateDictAdapter``.

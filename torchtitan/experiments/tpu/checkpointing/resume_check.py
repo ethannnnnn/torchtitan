@@ -4,10 +4,10 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Test hooks for checkpoint / resume checks on any TorchTitan trainer.
+"""Test hooks for checkpoint / resume checks of TorchTitan trainers.
 
-``install()`` patches ``torchtitan.trainer.Trainer`` (so every subclass) only
-when the environment asks for it; otherwise it changes nothing:
+``install()`` patches ``torchtitan.trainer.Trainer`` only when the environment
+asks for it; otherwise it changes nothing:
 
 * ``TT_FAULT_KILL_STEP=N``: the process sends itself SIGKILL when step N draws
   its first microbatch. Every rank does the same, so the job dies after step
@@ -21,6 +21,12 @@ when the environment asks for it; otherwise it changes nothing:
 Rank 0 also logs ``[resume-check] step=N loss=... grad_norm=...`` with full
 float precision whenever the trainer logs metrics (``TT_BATCH_RECORDS_DIR``
 set), for bitwise loss comparisons.
+
+The hooks live in ``Trainer.batch_generator`` and ``Trainer.train_step``, so a
+subclass gets them only through those methods: one that overrides
+``batch_generator`` without calling the base method is never killed and
+hashes no batches, and one that overrides ``train_step`` that way (e.g.
+``TpuGraphTrainer`` with the optimizer in the graph) writes no batch records.
 """
 
 from __future__ import annotations
