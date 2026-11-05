@@ -44,107 +44,116 @@ COMPILE_BACKENDS = ("", "tpu", "inductor")
 
 
 def _lowbit_class(base_cls: type, backend: str) -> type:
-    """``base_cls`` with its step running ``single_param_adam`` on ``backend``."""
-    from torchao.optim.adam import single_param_adam
+  """``base_cls`` with its step running ``single_param_adam`` on ``backend``."""
+  from torchao.optim.adam import single_param_adam
 
-    update: Callable[..., Any] = (
-        single_param_adam
-        if not backend
-        else torch.compile(single_param_adam, backend=backend, fullgraph=True, dynamic=False)
-    )
+  update: Callable[..., Any] = (
+      single_param_adam
+      if not backend
+      else torch.compile(
+          single_param_adam, backend=backend, fullgraph=True, dynamic=False
+      )
+  )
 
-    class LowBitAdamW(base_cls):  # type: ignore[valid-type, misc]
-        @torch.no_grad()
-        def step(self, closure=None):
-            loss = None
-            if closure is not None:
-                with torch.enable_grad():
-                    loss = closure()
-            for group in self.param_groups:
-                lr = group["lr"]
-                if not isinstance(lr, torch.Tensor):
-                    raise RuntimeError("lr must stay a tensor; update it with fill_()")
-                beta1, beta2 = group["betas"]
-                for p in group["params"]:
-                    if p.grad is None:
-                        continue
-                    if p.grad.is_sparse:
-                        raise RuntimeError("sparse gradients are not supported")
-                    state = self.state[p]
-                    if len(state) == 0:
-                        state["step"] = torch.tensor(0.0)
-                        state["exp_avg"] = self._new_buffer(p, True)
-                        state["exp_avg_sq"] = self._new_buffer(p, False)
-                        if group["amsgrad"]:
-                            state["max_exp_avg_sq"] = self._new_buffer(p, False)
-                    state["step"] += 1
-                    update(
-                        p.detach(),
-                        p.grad,
-                        state["step"],
-                        state["exp_avg"],
-                        state["exp_avg_sq"],
-                        state.get("max_exp_avg_sq", None),
-                        lr,
-                        beta1,
-                        beta2,
-                        group["weight_decay"],
-                        group["eps"],
-                        self.is_adamw,
-                        self.bf16_stochastic_round and p.dtype is torch.bfloat16,
-                    )
-            return loss
+  class LowBitAdamW(base_cls):  # type: ignore[valid-type, misc]
 
-    LowBitAdamW.__name__ = f"{base_cls.__name__}Step"
-    LowBitAdamW.__qualname__ = LowBitAdamW.__name__
-    return LowBitAdamW
+    @torch.no_grad()
+    def step(self, closure=None):
+      loss = None
+      if closure is not None:
+        with torch.enable_grad():
+          loss = closure()
+      for group in self.param_groups:
+        lr = group["lr"]
+        if not isinstance(lr, torch.Tensor):
+          raise RuntimeError("lr must stay a tensor; update it with fill_()")
+        beta1, beta2 = group["betas"]
+        for p in group["params"]:
+          if p.grad is None:
+            continue
+          if p.grad.is_sparse:
+            raise RuntimeError("sparse gradients are not supported")
+          state = self.state[p]
+          if len(state) == 0:
+            state["step"] = torch.tensor(0.0)
+            state["exp_avg"] = self._new_buffer(p, True)
+            state["exp_avg_sq"] = self._new_buffer(p, False)
+            if group["amsgrad"]:
+              state["max_exp_avg_sq"] = self._new_buffer(p, False)
+          state["step"] += 1
+          update(
+              p.detach(),
+              p.grad,
+              state["step"],
+              state["exp_avg"],
+              state["exp_avg_sq"],
+              state.get("max_exp_avg_sq", None),
+              lr,
+              beta1,
+              beta2,
+              group["weight_decay"],
+              group["eps"],
+              self.is_adamw,
+              self.bf16_stochastic_round and p.dtype is torch.bfloat16,
+          )
+      return loss
+
+  LowBitAdamW.__name__ = f"{base_cls.__name__}Step"
+  LowBitAdamW.__qualname__ = LowBitAdamW.__name__
+  return LowBitAdamW
 
 
 def lowbit_factory(name: str, backend: str = "") -> Callable[..., Optimizer]:
-    if backend not in COMPILE_BACKENDS:
-        raise ValueError(f"lowbit_compile_backend must be one of {COMPILE_BACKENDS}")
-    from torchao.optim import AdamW8bit, _AdamW
+  if backend not in COMPILE_BACKENDS:
+    raise ValueError(
+        f"lowbit_compile_backend must be one of {COMPILE_BACKENDS}"
+    )
+  from torchao.optim import AdamW8bit, _AdamW
 
-    if name == "AdamW8bit":
-        cls = _lowbit_class(AdamW8bit, backend)
+  if name == "AdamW8bit":
+    cls = _lowbit_class(AdamW8bit, backend)
 
-        def build(params, **kwargs):
-            kwargs.pop("fused", None)
-            kwargs.pop("foreach", None)
-            return cls(params, **kwargs)
+    def build(params, **kwargs):
+      kwargs.pop("fused", None)
+      kwargs.pop("foreach", None)
+      return cls(params, **kwargs)
 
-        return build
-    if name == "AdamWBf16":
-        cls = _lowbit_class(_AdamW, backend)
+    return build
+  if name == "AdamWBf16":
+    cls = _lowbit_class(_AdamW, backend)
 
-        def build_bf16(params, **kwargs):
-            kwargs.pop("fused", None)
-            kwargs.pop("foreach", None)
-            kwargs.setdefault("bf16_stochastic_round", True)
-            return cls(params, **kwargs)
+    def build_bf16(params, **kwargs):
+      kwargs.pop("fused", None)
+      kwargs.pop("foreach", None)
+      kwargs.setdefault("bf16_stochastic_round", True)
+      return cls(params, **kwargs)
 
-        return build_bf16
-    raise NotImplementedError(f"unknown low-bit optimizer {name}")
+    return build_bf16
+  raise NotImplementedError(f"unknown low-bit optimizer {name}")
 
 
 class PostTrainingOptimizersContainer(OptimizersContainer):
-    """``OptimizersContainer`` that also resolves the torchao AdamW variants."""
+  """``OptimizersContainer`` that also resolves the torchao AdamW variants."""
 
-    @dataclass(kw_only=True, slots=True)
-    class Config(OptimizersContainer.Config):
-        lowbit_compile_backend: str = ""
-        """"" eager, "tpu" or "inductor" for the AdamW8bit / AdamWBf16 update."""
+  @dataclass(kw_only=True, slots=True)
+  class Config(OptimizersContainer.Config):
+    lowbit_compile_backend: str = ""
+    """"" eager, "tpu" or "inductor" for the AdamW8bit / AdamWBf16 update."""
 
-    def __init__(self, config: Config, *, model_parts: list[torch.nn.Module]) -> None:
-        self._lowbit_backend = config.lowbit_compile_backend
-        if self._lowbit_backend not in COMPILE_BACKENDS:
-            raise ValueError(f"lowbit_compile_backend must be one of {COMPILE_BACKENDS}")
-        super().__init__(config, model_parts=model_parts)
+  def __init__(
+      self, config: Config, *, model_parts: list[torch.nn.Module]
+  ) -> None:
+    self._lowbit_backend = config.lowbit_compile_backend
+    if self._lowbit_backend not in COMPILE_BACKENDS:
+      raise ValueError(
+          f"lowbit_compile_backend must be one of {COMPILE_BACKENDS}"
+      )
+    super().__init__(config, model_parts=model_parts)
 
-    def _resolve_optimizer_factory(self, name: str) -> Callable[..., Optimizer]:  # type: ignore[override]
-        if name in LOWBIT_OPTIMIZERS:
-            return lowbit_factory(name, self._lowbit_backend)
-        return OptimizersContainer._resolve_optimizer_factory(name)
+  def _resolve_optimizer_factory(self, name: str) -> Callable[..., Optimizer]:  # type: ignore[override]
+    if name in LOWBIT_OPTIMIZERS:
+      return lowbit_factory(name, self._lowbit_backend)
+    return OptimizersContainer._resolve_optimizer_factory(name)
 
 
 def adamw_config(
@@ -157,18 +166,27 @@ def adamw_config(
     implementation: str = "foreach",
     lowbit_compile_backend: str = "",
 ) -> OptimizersContainer.Config:
-    """One catch-all AdamW group: ``name`` is AdamW, AdamW8bit or AdamWBf16."""
-    if name not in ("AdamW",) + LOWBIT_OPTIMIZERS:
-        raise ValueError(f"optimizer name {name!r} must be AdamW or one of {LOWBIT_OPTIMIZERS}")
-    group = ParamGroupConfig(
-        pattern=r".*",
-        optimizer_name=name,
-        optimizer_kwargs={"lr": lr, "betas": betas, "eps": eps, "weight_decay": weight_decay},
+  """One catch-all AdamW group: ``name`` is AdamW, AdamW8bit or AdamWBf16."""
+  if name not in ("AdamW",) + LOWBIT_OPTIMIZERS:
+    raise ValueError(
+        f"optimizer name {name!r} must be AdamW or one of {LOWBIT_OPTIMIZERS}"
     )
-    if name == "AdamW":
-        return OptimizersContainer.Config(param_groups=[group], implementation=implementation)
-    return PostTrainingOptimizersContainer.Config(
-        param_groups=[group],
-        implementation="for-loop",
-        lowbit_compile_backend=lowbit_compile_backend,
+  group = ParamGroupConfig(
+      pattern=r".*",
+      optimizer_name=name,
+      optimizer_kwargs={
+          "lr": lr,
+          "betas": betas,
+          "eps": eps,
+          "weight_decay": weight_decay,
+      },
+  )
+  if name == "AdamW":
+    return OptimizersContainer.Config(
+        param_groups=[group], implementation=implementation
     )
+  return PostTrainingOptimizersContainer.Config(
+      param_groups=[group],
+      implementation="for-loop",
+      lowbit_compile_backend=lowbit_compile_backend,
+  )
