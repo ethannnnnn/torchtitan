@@ -135,6 +135,32 @@ class BalancedPlacementTest(unittest.TestCase):
     finally:
       MetricsProcessor.log = original_log
 
+  def test_writer_measures_once_at_the_next_logged_step(self):
+    from torchtitan.components.metrics import MetricsProcessor
+
+    original_log = MetricsProcessor.log
+    MetricsProcessor.log = lambda self, step, *args, **kwargs: None
+    try:
+      env = {
+          "SPARK_EXPERT_PLACEMENT_OUT": "placement.json",
+          "SPARK_EXPERT_STATS_STEP": "3",
+          "SPARK_EXPERT_STATS_EP": "2",
+      }
+      with mock.patch.dict(os.environ, env), mock.patch.object(
+          pl, "_measure_and_write"
+      ) as measure:
+        cfg = types.SimpleNamespace(
+            model_spec=types.SimpleNamespace(parallelize_fn=lambda model, **kw: None)
+        )
+        pl.install_placement_writer(cfg)
+        model = _two_moe_layers()
+        cfg.model_spec.parallelize_fn(model, parallel_dims=None)
+        for step in (1, 2, 5, 10):  # metrics.log_freq=5 logs steps 1, 5, 10, ...
+          MetricsProcessor.log(None, step)
+        measure.assert_called_once_with(model, 5, "placement.json", 2)
+    finally:
+      MetricsProcessor.log = original_log
+
 
 class ExpertGradReduceDtypeTest(unittest.TestCase):
 

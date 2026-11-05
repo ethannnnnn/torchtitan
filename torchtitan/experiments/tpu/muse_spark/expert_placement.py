@@ -17,17 +17,21 @@ long runs use a 2x buffer or re-measure.
 
 ``install_placement_writer`` hooks a trainer config: train a few steps with
 ``SPARK_EXPERT_PLACEMENT_OUT=<path>`` (expert parallel degree 1 is fine; the
-counts come from the router, before dispatch). At step
-``SPARK_EXPERT_STATS_STEP`` (default 2) every rank all-reduces its MoE layers'
-``tokens_per_expert_E`` counters and rank 0 bin-packs them for
+counts come from the router, before dispatch). At the first logged step at or
+after ``SPARK_EXPERT_STATS_STEP`` (default 2) every rank all-reduces its MoE
+layers' ``tokens_per_expert_E`` counters and rank 0 bin-packs them for
 ``SPARK_EXPERT_STATS_EP`` (default 8) ranks with
 ``expert_parallel.balanced_expert_placement``, prints the skew, and writes the
 JSON read by ``ep_expert_placement="file:<path>"``.
 
 ``install_ep_monitor`` prints the dispatchers' receive-buffer fill and largest
-dropped-route fraction every step (rank 0, and any rank whose buffer
+dropped-route fraction at every logged step (rank 0, and any rank whose buffer
 overflowed): ``[EP] rank=R step=S max_buffer_fill=F max_dropped_frac=D``. A fill
 above 1.0 means routes were dropped on that rank.
+
+Both hooks run in TorchTitan's metrics logging, which the trainer calls on
+every rank at step 1 and every ``metrics.log_freq`` steps (every step in the
+Muse Spark recipes).
 """
 
 from __future__ import annotations
@@ -85,7 +89,10 @@ def install_placement_writer(cfg: Any) -> Any:
   """Write a measured placement during training when ``SPARK_EXPERT_PLACEMENT_OUT`` is set.
 
   Wraps the model spec's ``parallelize_fn`` to keep a handle on the model and
-  hooks TorchTitan's metrics logging (called on every rank each step).
+  hooks TorchTitan's metrics logging (called on every rank at each logged
+  step). The placement is measured once, at the first logged step at or after
+  ``SPARK_EXPERT_STATS_STEP``, so a ``metrics.log_freq`` that skips that step
+  delays the measurement instead of losing it.
   """
   path = os.environ.get("SPARK_EXPERT_PLACEMENT_OUT", "")
   if not path:
@@ -106,10 +113,12 @@ def install_placement_writer(cfg: Any) -> Any:
 
   if not getattr(MetricsProcessor.log, "_expert_placement", False):
     original = MetricsProcessor.log
+    measured: list[int] = []
 
     def log(self, step, *args, **kwargs):
       out = original(self, step, *args, **kwargs)
-      if step == step_to_measure and holder:
+      if step >= step_to_measure and holder and not measured:
+        measured.append(step)
         _measure_and_write(holder[0], step, path, ep_degree)
       return out
 
@@ -119,7 +128,7 @@ def install_placement_writer(cfg: Any) -> Any:
 
 
 def install_ep_monitor() -> None:
-  """Print the expert-parallel buffer fill and dropped-route fraction after every step."""
+  """Print the expert-parallel buffer fill and dropped-route fraction at every logged step."""
   # pylint: disable-next=g-import-not-at-top
   from torchtitan.components.metrics import MetricsProcessor
 
