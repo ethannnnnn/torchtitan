@@ -7,9 +7,11 @@ Covers:
    controls), for dense, MoE, and MoE with ``TpuGroupedExpertsConverter``;
    plus the adapter round trip.
 2. ``chunked_gated_delta`` against the exact per-token recurrence, also with
-   packed documents, and the slice-based causal convolution's backward against
-   autograd of ``conv1d``, also with packed documents, and in bf16 against the
-   accuracy of the autograd it replaces.
+   packed documents, and bitwise against its inter-chunk loop indexing every
+   chunk, whose backward writes a full-size buffer per chunk; and the
+   slice-based causal convolution's backward against autograd of ``conv1d``,
+   also with packed documents, and in bf16 against the accuracy of the
+   autograd it replaces.
 3. Row isolation in the GatedDeltaNet and packed-document isolation in the
    causal convolution, the GatedDeltaNet, the attention and the whole model
    (with negative controls), plus Splash parity on TPU.
@@ -17,6 +19,7 @@ Covers:
 """
 
 import copy
+from unittest import mock
 
 from absl.testing import absltest
 from absl.testing import parameterized
@@ -88,6 +91,49 @@ def _recurrent_gated_delta_reference(
     state = state + k[:, t, :, :, None] * delta[:, :, None, :]
     outs.append((state * q[:, t, :, :, None]).sum(-2))
   return torch.stack(outs, dim=1)
+
+
+def _indexed_inter_chunk_recurrence(
+    wq: torch.Tensor,
+    u: torch.Tensor,
+    qk: torch.Tensor,
+    k_decayed_t: torch.Tensor,
+    chunk_decay: torch.Tensor,
+) -> torch.Tensor:
+  """``gated_delta._inter_chunk_recurrence`` indexing each chunk in the loop.
+
+  The loop as it was before it took its chunks from ``unbind``: autograd turns
+  every ``t[:, :, i]`` into a ``select_backward`` of the size of all of ``t``.
+  """
+  bs, n_heads, num_chunks, chunk, d_v = u.shape
+  state = torch.zeros(
+      bs, n_heads, wq.shape[-1], d_v, dtype=wq.dtype, device=wq.device
+  )
+  outs = []
+  for i in range(num_chunks):
+    wq_state = wq[:, :, i] @ state
+    v_new = u[:, :, i] - wq_state[..., :chunk, :]
+    outs.append(wq_state[..., chunk:, :] + qk[:, :, i] @ v_new)
+    state = state * chunk_decay[:, :, i] + k_decayed_t[:, :, i] @ v_new
+  return torch.stack(outs, dim=2)
+
+
+def _gated_delta_inputs(
+    bs: int,
+    seq_len: int,
+    n_heads: int,
+    d_k: int,
+    d_v: int,
+    dtype: torch.dtype = torch.float32,
+) -> tuple[torch.Tensor, ...]:
+  """Random ``chunked_gated_delta`` inputs ``(q, k, v, g, beta)``."""
+  return (
+      torch.randn(bs, seq_len, n_heads, d_k, dtype=dtype),
+      torch.randn(bs, seq_len, n_heads, d_k, dtype=dtype),
+      torch.randn(bs, seq_len, n_heads, d_v, dtype=dtype),
+      (-F.softplus(torch.randn(bs, seq_len, n_heads))).to(dtype),
+      torch.sigmoid(torch.randn(bs, seq_len, n_heads)).to(dtype),
+  )
 
 
 def _packed_positions(doc_lens: tuple[int, ...]) -> torch.Tensor:
@@ -626,6 +672,130 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
             torch.autograd.grad(out, (x, weight), grad),
             torch.autograd.grad(expected, (x, weight), grad),
         )
+
+  @parameterized.named_parameters(
+      dict(testcase_name="_fp32", dtype=torch.float32, packed=False),
+      dict(testcase_name="_fp32_packed", dtype=torch.float32, packed=True),
+      dict(testcase_name="_bf16_packed", dtype=torch.bfloat16, packed=True),
+  )
+  def test_chunked_gated_delta_matches_indexed_loop_bitwise(
+      self, dtype: torch.dtype, packed: bool
+  ):
+    """Tests that taking the chunks from ``unbind`` changes no bit.
+
+    The forward and all five input gradients of ``chunked_gated_delta`` must
+    have the same bit patterns as with the inter-chunk loop indexing every
+    chunk (``_indexed_inter_chunk_recurrence``). Runs on CPU with one thread,
+    where the kernels themselves are deterministic.
+    """
+    num_threads = torch.get_num_threads()
+    torch.set_num_threads(1)
+    self.addCleanup(torch.set_num_threads, num_threads)
+    torch.manual_seed(0)
+    # Five 16-token chunks, the last one padded.
+    bs, seq_len, n_heads, d_k, d_v = 2, 70, 2, 16, 16
+    segment_ids = None
+    if packed:
+      # Documents start mid-chunk and at chunk starts (16 and 48).
+      segment_ids = segment_ids_from_positions(
+          _packed_positions((5, 11, 1, 31, 22))
+      ).expand(bs, -1)
+    leaves = _gated_delta_inputs(bs, seq_len, n_heads, d_k, d_v, dtype)
+    grad = torch.randn(bs, seq_len, n_heads, d_v, dtype=dtype)
+
+    def forward_and_grads():
+      inputs = tuple(x.clone().requires_grad_() for x in leaves)
+      out = gated_delta.chunked_gated_delta(
+          *inputs, chunk_size=16, segment_ids=segment_ids
+      )
+      return (out.detach(), *torch.autograd.grad(out, inputs, grad))
+
+    results = forward_and_grads()
+    with mock.patch.object(
+        gated_delta,
+        "_inter_chunk_recurrence",
+        wraps=_indexed_inter_chunk_recurrence,
+    ) as indexed:
+      indexed_results = forward_and_grads()
+    indexed.assert_called_once()
+    names = ("out", "q grad", "k grad", "v grad", "g grad", "beta grad")
+    for name, actual, expected in zip(
+        names, results, indexed_results, strict=True
+    ):
+      self.assertEqual(actual.dtype, dtype, msg=name)
+      self.assertEqual(actual.shape, expected.shape, msg=name)
+      # Compares bit patterns, which unlike values also tell -0.0 from 0.0.
+      self.assertTrue(
+          torch.equal(
+              actual.contiguous().view(torch.uint8),
+              expected.contiguous().view(torch.uint8),
+          ),
+          msg=f"{name} differs from the indexed loop's",
+      )
+
+  def test_chunked_gated_delta_backward_avoids_select_backward(self):
+    """Tests that the backward writes no full-size buffer per chunk.
+
+    Autograd of an in-loop ``t[:, :, i]`` is a ``select_backward`` that writes
+    a zero buffer the size of all of ``t`` for one chunk, so the backward of
+    the inter-chunk loop would write O(seq_len^2 / chunk_size) bytes. The
+    traced backward of ``chunked_gated_delta`` must have no such op, with or
+    without documents, while that of the indexed loop has them.
+    """
+    select_ops = {
+        torch.ops.aten.select_backward.default,
+        torch.ops.aten.select_scatter.default,
+    }
+    n_heads, d_k, d_v, chunk_size = 2, 8, 8, 16
+
+    def select_writes(recurrence, seq_len, packed):
+      """Number and total bytes of the select ops in the traced backward."""
+      leaves = tuple(
+          x.requires_grad_()
+          for x in _gated_delta_inputs(1, seq_len, n_heads, d_k, d_v)
+      )
+      grad = torch.randn(1, seq_len, n_heads, d_v)
+      segment_ids = None
+      if packed:
+        segment_ids = segment_ids_from_positions(
+            _packed_positions((20, seq_len - 20)).unsqueeze(0)
+        )
+
+      def grads(q, k, v, g, beta, grad_in):
+        out = gated_delta.chunked_gated_delta(
+            q, k, v, g, beta, chunk_size=chunk_size, segment_ids=segment_ids
+        )
+        return torch.autograd.grad(out, (q, k, v, g, beta), grad_in)
+
+      with mock.patch.object(
+          gated_delta, "_inter_chunk_recurrence", recurrence
+      ):
+        graph = make_fx(grads)(*leaves, grad).graph
+      nodes = [
+          node
+          for node in graph.nodes
+          if node.op == "call_function" and node.target in select_ops
+      ]
+      return len(nodes), sum(node.meta["val"].nbytes for node in nodes)
+
+    unbind = gated_delta._inter_chunk_recurrence  # pylint: disable=protected-access
+    seq_len = 64
+    for packed in (False, True):
+      with self.subTest(packed=packed):
+        self.assertEqual(select_writes(unbind, seq_len, packed), (0, 0))
+        self.assertEqual(select_writes(unbind, 2 * seq_len, packed), (0, 0))
+        # Negative control: the indexed loop writes a buffer of all of `wq`,
+        # `u` and `qk` for each chunk, so twice the tokens write at least four
+        # times the bytes.
+        num_selects, num_bytes = select_writes(
+            _indexed_inter_chunk_recurrence, seq_len, packed
+        )
+        num_selects_2x, num_bytes_2x = select_writes(
+            _indexed_inter_chunk_recurrence, 2 * seq_len, packed
+        )
+        self.assertGreaterEqual(num_selects, 3 * (seq_len // chunk_size))
+        self.assertGreaterEqual(num_selects_2x, 2 * num_selects)
+        self.assertGreaterEqual(num_bytes_2x, 4 * num_bytes)
 
   @parameterized.named_parameters(
       # Documents start mid-chunk and at chunk starts (16 and 48 with 16-token
