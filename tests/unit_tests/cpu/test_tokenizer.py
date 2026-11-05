@@ -487,6 +487,29 @@ class TestBaseTokenizerChatTemplate(unittest.TestCase):
             tok.set_chat_template(template)
             self.assertEqual(tok.apply_chat_template(SAMPLE_MESSAGES), expected)
 
+    def test_generation_block_is_its_own_scope(self):
+        """Variables set inside {% generation %} stay inside, as in Transformers.
+
+        Namespace attributes and loop variables still work across the block.
+        """
+        cases = {
+            "{% set x = 'outer' %}{% generation %}{% set x = 'inner' %}"
+            "{{ x }}{% endgeneration %}|x={{ x }}": "inner|x=outer",
+            "{% generation %}{% set y = 'inner' %}{% endgeneration %}"
+            "|y={{ y | default('unset') }}": "|y=unset",
+            "{% set ns = namespace(n=0) %}{% for m in messages %}"
+            "{% generation %}{% set ns.n = ns.n + 1 %}{{ m.content }}"
+            "{% endgeneration %}{% endfor %}|n={{ ns.n }}": "HelloHi there|n=2",
+            "{% for m in messages %}{%- generation %}{{ loop.index }}:"
+            "{{ m.content }};{% endgeneration %}{% endfor %}": "1:Hello;2:Hi there;",
+        }
+        for template, expected in cases.items():
+            tok = DummyTokenizer()
+            tok.set_chat_template(template)
+            self.assertEqual(
+                tok.apply_chat_template(SAMPLE_MESSAGES), expected, template
+            )
+
 
 class TestHuggingFaceChatTemplateAutoLoad(unittest.TestCase):
     """Tests for HuggingFaceTokenizer auto-loading chat_template from config."""
