@@ -95,7 +95,7 @@ class TokamaxConfig:
   # second bf16 rounding of q. With large logits (e.g. QK-normed attention with
   # a q gain, |logit| up to ~44) that rounding dominates the kernel error:
   # natural exp (False) cuts the bf16 output error ~2.6x, to the stock splash
-  # kernel's level, for 0-6% more attention time on TPU7x (head_dim 64).
+  # kernel's level, for up to ~3% more attention time on TPU7x (head_dim 64).
   use_base2_exp: bool = True
   # Constant used in place of the running row max (tokamax `max_logit_const`,
   # in units of the softmax logits scale * q.k): skips the per-block max and
