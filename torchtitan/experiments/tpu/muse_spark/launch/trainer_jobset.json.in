@@ -1,0 +1,317 @@
+{
+  "apiVersion": "jobset.x-k8s.io/v1alpha2",
+  "kind": "JobSet",
+  "metadata": {
+    "name": "<RUN_NAME>",
+    "namespace": "<K8S_NAMESPACE>",
+    "labels": {
+      "app": "muse-spark-trainer",
+      "muse-spark-run": "<RUN_NAME>",
+      "muse-spark-mode": "<MODE>",
+      "kueue.x-k8s.io/queue-name": "<LOCAL_QUEUE>",
+      "x.tpu.cloud.google.com/slice-autoprovisioning": "async"
+    },
+    "annotations": {
+      "muse-spark/base-commit": "<BASE_COMMIT>",
+      "muse-spark/candidate-tree": "<CANDIDATE_TREE>",
+      "muse-spark/config": "<CONFIG>",
+      "muse-spark/topology": "<TPU_TOPOLOGY>",
+      "muse-spark/project": "<GCP_PROJECT>"
+    }
+  },
+  "spec": {
+    "suspend": true,
+    "ttlSecondsAfterFinished": 3600,
+    "failurePolicy": {
+      "maxRestarts": 0
+    },
+    "network": {
+      "enableDNSHostnames": true,
+      "publishNotReadyAddresses": true
+    },
+    "replicatedJobs": [
+      {
+        "name": "trainer",
+        "replicas": 1,
+        "template": {
+          "metadata": {
+            "labels": {
+              "x.tpu.google.com/inject-slice-selector": "true"
+            }
+          },
+          "spec": {
+            "activeDeadlineSeconds": "<DEADLINE_S>",
+            "backoffLimit": 0,
+            "completionMode": "Indexed",
+            "completions": "<NNODES>",
+            "parallelism": "<NNODES>",
+            "template": {
+              "metadata": {
+                "labels": {
+                  "app": "muse-spark-trainer",
+                  "muse-spark-run": "<RUN_NAME>",
+                  "muse-spark-mode": "<MODE>",
+                  "component": "trainer"
+                },
+                "annotations": {
+                  "cloud.google.com/gke-tpu-slice-topology": "<TPU_TOPOLOGY>",
+                  "gke-gcsfuse/volumes": "true"
+                }
+              },
+              "spec": {
+                "hostNetwork": true,
+                "dnsPolicy": "ClusterFirstWithHostNet",
+                "restartPolicy": "Never",
+                "terminationGracePeriodSeconds": 120,
+                "nodeSelector": {
+                  "cloud.google.com/gke-tpu-accelerator": "tpu7x",
+                  "cloud.google.com/gke-tpu-topology": "<TPU_TOPOLOGY>",
+                  "cloud.google.com/gke-accelerator-topology-mode": "PROVISION_ONLY"
+                },
+                "tolerations": [
+                  {
+                    "key": "google.com/tpu",
+                    "operator": "Exists",
+                    "effect": "NoSchedule"
+                  }
+                ],
+                "volumes": [
+                  {
+                    "name": "overlay",
+                    "projected": {
+                      "defaultMode": 420,
+                      "sources": "<OVERLAY_SOURCES>"
+                    }
+                  },
+                  {
+                    "name": "runtime",
+                    "csi": {
+                      "driver": "gcsfuse.csi.storage.gke.io",
+                      "readOnly": true,
+                      "volumeAttributes": {
+                        "bucketName": "<GCS_BUCKET>",
+                        "mountOptions": "implicit-dirs,only-dir=<RUNTIME_DIR>"
+                      }
+                    }
+                  },
+                  {
+                    "name": "model",
+                    "csi": {
+                      "driver": "gcsfuse.csi.storage.gke.io",
+                      "readOnly": true,
+                      "volumeAttributes": {
+                        "bucketName": "<GCS_BUCKET>",
+                        "mountOptions": "implicit-dirs,only-dir=<MODEL_DIR>"
+                      }
+                    }
+                  },
+                  {
+                    "name": "data",
+                    "csi": {
+                      "driver": "gcsfuse.csi.storage.gke.io",
+                      "readOnly": true,
+                      "volumeAttributes": {
+                        "bucketName": "<GCS_BUCKET>",
+                        "mountOptions": "implicit-dirs,only-dir=<DATA_DIR>"
+                      }
+                    }
+                  },
+                  {
+                    "name": "out",
+                    "csi": {
+                      "driver": "gcsfuse.csi.storage.gke.io",
+                      "readOnly": false,
+                      "volumeAttributes": {
+                        "bucketName": "<GCS_BUCKET>",
+                        "mountOptions": "implicit-dirs,only-dir=<PREFIX>/runs/<RUN_NAME>"
+                      }
+                    }
+                  },
+                  {
+                    "name": "shm",
+                    "emptyDir": {
+                      "medium": "Memory",
+                      "sizeLimit": "<SHM_SIZE>"
+                    }
+                  },
+                  {
+                    "name": "work",
+                    "emptyDir": {
+                      "sizeLimit": "<WORK_SIZE>"
+                    }
+                  }
+                ],
+                "containers": [
+                  {
+                    "name": "trainer",
+                    "image": "<TRAINER_IMAGE>",
+                    "imagePullPolicy": "IfNotPresent",
+                    "command": [
+                      "/bin/bash",
+                      "-c"
+                    ],
+                    "args": [
+                      "<TRAINER_COMMAND>"
+                    ],
+                    "env": [
+                      {
+                        "name": "SPARK_RUN",
+                        "value": "<RUN_NAME>"
+                      },
+                      {
+                        "name": "SPARK_MODE",
+                        "value": "<MODE>"
+                      },
+                      {
+                        "name": "SPARK_ENTRY",
+                        "value": "<ENTRY_MODULE>"
+                      },
+                      {
+                        "name": "SPARK_CONFIG_MODULE",
+                        "value": "<CONFIG_MODULE>"
+                      },
+                      {
+                        "name": "SPARK_CONFIG",
+                        "value": "<CONFIG>"
+                      },
+                      {
+                        "name": "SPARK_EXTRA_ARGS",
+                        "value": "<EXTRA_ARGS>"
+                      },
+                      {
+                        "name": "SPARK_TOPOLOGY",
+                        "value": "<TPU_TOPOLOGY>"
+                      },
+                      {
+                        "name": "SPARK_BASE_REPO",
+                        "value": "<BASE_REPO>"
+                      },
+                      {
+                        "name": "SPARK_BASE_COMMIT",
+                        "value": "<BASE_COMMIT>"
+                      },
+                      {
+                        "name": "SPARK_BASE_TREE",
+                        "value": "<BASE_TREE>"
+                      },
+                      {
+                        "name": "SPARK_CANDIDATE_COMMIT",
+                        "value": "<CANDIDATE_COMMIT>"
+                      },
+                      {
+                        "name": "SPARK_CANDIDATE_TREE",
+                        "value": "<CANDIDATE_TREE>"
+                      },
+                      {
+                        "name": "SPARK_OVERLAY_SHA256",
+                        "value": "<OVERLAY_SHA256>"
+                      },
+                      {
+                        "name": "SPARK_OVERLAY_CHUNKS",
+                        "value": "<OVERLAY_CHUNKS>"
+                      },
+                      {
+                        "name": "SPARK_BUDGET_S",
+                        "value": "<BUDGET_S>"
+                      },
+                      {
+                        "name": "NNODES",
+                        "value": "<NNODES>"
+                      },
+                      {
+                        "name": "JOB_COMPLETION_INDEX",
+                        "valueFrom": {
+                          "fieldRef": {
+                            "fieldPath": "metadata.labels['batch.kubernetes.io/job-completion-index']"
+                          }
+                        }
+                      },
+                      {
+                        "name": "WORKERS_0_HOSTNAME",
+                        "value": "<RUN_NAME>-trainer-0-0.<RUN_NAME>"
+                      },
+                      {
+                        "name": "HF_HUB_OFFLINE",
+                        "value": "1"
+                      },
+                      {
+                        "name": "HF_DATASETS_OFFLINE",
+                        "value": "1"
+                      },
+                      {
+                        "name": "PYTHONUNBUFFERED",
+                        "value": "1"
+                      },
+                      {
+                        "name": "TOKENIZERS_PARALLELISM",
+                        "value": "false"
+                      },
+                      {
+                        "name": "PIP_NO_CACHE_DIR",
+                        "value": "1"
+                      },
+                      {
+                        "name": "PIP_DISABLE_PIP_VERSION_CHECK",
+                        "value": "1"
+                      },
+                      {
+                        "name": "PIP_ROOT_USER_ACTION",
+                        "value": "ignore"
+                      }
+                    ],
+                    "volumeMounts": [
+                      {
+                        "name": "overlay",
+                        "mountPath": "/mnt/overlay",
+                        "readOnly": true
+                      },
+                      {
+                        "name": "runtime",
+                        "mountPath": "/mnt/runtime",
+                        "readOnly": true
+                      },
+                      {
+                        "name": "model",
+                        "mountPath": "/mnt/model",
+                        "readOnly": true
+                      },
+                      {
+                        "name": "data",
+                        "mountPath": "/mnt/data",
+                        "readOnly": true
+                      },
+                      {
+                        "name": "out",
+                        "mountPath": "/mnt/out"
+                      },
+                      {
+                        "name": "shm",
+                        "mountPath": "/dev/shm"
+                      },
+                      {
+                        "name": "work",
+                        "mountPath": "/work"
+                      }
+                    ],
+                    "resources": {
+                      "requests": {
+                        "google.com/tpu": "4"
+                      },
+                      "limits": {
+                        "google.com/tpu": "4"
+                      }
+                    }
+                  }
+                ],
+                "serviceAccountName": "<SERVICE_ACCOUNT>"
+              }
+            }
+          }
+        }
+      }
+    ],
+    "successPolicy": {
+      "operator": "All"
+    }
+  }
+}

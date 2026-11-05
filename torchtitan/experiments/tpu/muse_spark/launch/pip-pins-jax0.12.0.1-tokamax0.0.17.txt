@@ -1,0 +1,37 @@
+# Hash-pinned wheels installed in the pod with --no-deps --require-hashes --only-binary=:all:
+# (render.py --pip-overlay): JAX and jaxlib 0.12.0.1 and Tokamax 0.0.17, the versions
+# torchtitan/experiments/tpu/requirements.txt pins, on top of the trainer runtime.
+# Every hash is a file that PyPI serves for the pinned version; pip takes the wheel
+# that matches the pod's Python and platform.
+# Regenerate with: printf 'jax==0.12.0.1\njaxlib==0.12.0.1\ntokamax==0.0.17\n' |
+#   uv pip compile - --no-deps --generate-hashes --universal --no-header
+
+jax==0.12.0.1 \
+    --hash=sha256:e9dfd256ba090259b10f97f0755d4fc92535b8cb38c0a40df6488a8c8a7dd8ae \
+    --hash=sha256:f543fb1151c351d328b7dd9e40865c01bf9ae10cdf7e21637196172891d51914
+jaxlib==0.12.0.1 \
+    --hash=sha256:00acba6d262f20110289e5d3384cd92298ae362226b66f77f92c518fab55c2c6 \
+    --hash=sha256:085c5196ac9e735a9313dee67a536e70ca09fe61c4ce19e694849509add2ecac \
+    --hash=sha256:3011a4ef1fc3dbe7c03fee30dee8f0b85a9ce92e5673271f5065d4cb400587a5 \
+    --hash=sha256:40812201c3bcd4cb104b88f71f58fec4cbd0c32ba90e5c92b3fa8f40819f6774 \
+    --hash=sha256:44d3d534664fe762f32c5b831d556384bd96f9afad2e40aa207050f0b6e2c9f6 \
+    --hash=sha256:609deffaea388d1ed9d1c5104d8f6041791f00771adc305f7316b742f502fd6b \
+    --hash=sha256:78318e9ac79c92972f81c77090f557bdb4a5a49821751c6ee3f6a9c66a948842 \
+    --hash=sha256:78d16c6d6342cbe8de117f23b5c6d98339e582453221e977920dcbe5e05d72d6 \
+    --hash=sha256:7978a182ce9d1a8314dd693ab466ff24b961950ce6617f03498395e467f72e42 \
+    --hash=sha256:8be160b0b847bc57168e4305713756f6da0d0bba26715e64f9d2f46c0a7a6b42 \
+    --hash=sha256:93b8da183f0235603c460b530da8cd6eb23ea7f1c6adc4f82a43a6035497d466 \
+    --hash=sha256:9fa1147a3ccc916c77ab2063229d6ddaf82699d6b485bf6ad4dac265cfd8e0ee \
+    --hash=sha256:aa24baf4aafd78bbf7104a81f01eadc40332b8b90098634d14d585cd0477eeaf \
+    --hash=sha256:b6079a7669d624ebd42d1571339566e62cfe7225f4b5a20b8e16773ea9a8357a \
+    --hash=sha256:b8435a50e7f09481156ab15a7522e3dd96ee6655f57f494933c5b9ffc6101332 \
+    --hash=sha256:c8de1cad382713114f657f406383edc53ee9fda4679db4e2b09d1dfefe1c4e45 \
+    --hash=sha256:cfba501b599e4083a4463cd58c36a1271249a415a69f2c8054083554f281efcc \
+    --hash=sha256:d35f6faca955676b4b46418028bf7fa7af88c6c9bb6b691c6e3005fc37839fce \
+    --hash=sha256:d8f14f5253c032f9a6f688734e3b63d911dbdcac9fd698ceb71f660f1956ddef \
+    --hash=sha256:db2cc8584d7d0d166293ef2475b726988a10f6f9b5a8e3b8e3712415e5570380 \
+    --hash=sha256:f5d9e527c1736eca5ca82bdc6d6f45421d8962ec7c9a8db153e4547311cc6876 \
+    --hash=sha256:fdc56999ba690bd915f7029613269848eaaf85d231ec8abc46610d3b840c189c
+tokamax==0.0.17 \
+    --hash=sha256:1d20c3d6c5cae4ddf2f09245adf8b35fc5b3c26997b34a4e4b3322d597aa6271 \
+    --hash=sha256:232a1be65c52b3c436f3836f96889a521c77199df91be8d40a1af63016f0c2d6
