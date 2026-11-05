@@ -66,7 +66,8 @@ class SparkRecipeTest(unittest.TestCase):
   def test_all_spark_recipes_resolve(self):
     from torchtitan.experiments.tpu.grouped_experts import TpuGroupedExperts
 
-    self.assertEqual(len(SPARK_RECIPES), 4)
+    # The full-parameter recipes are registered in full_param_sft.py.
+    self.assertEqual(SPARK_RECIPES, ["muse_spark_816b_a42b_sft_lora_tpu7x"])
     for name in SPARK_RECIPES:
       with self.subTest(name=name):
         config = getattr(cr, name)()
@@ -115,29 +116,40 @@ class SparkRecipeTest(unittest.TestCase):
               ),
               (512, 1024, 1024),
           )
-        full_bf16 = "lora" not in name
-        self.assertEqual(
-            config.training.mixed_precision_reduce,
-            "bfloat16" if full_bf16 else "float32",
-        )
+        self.assertEqual(config.training.mixed_precision_reduce, "float32")
         group = config.optimizer.param_groups[0]
         self.assertEqual(group.optimizer_kwargs["betas"], (0.9, 0.95))
         self.assertEqual(group.optimizer_kwargs["weight_decay"], 0.0)
         lora = _lora_configs(config.model_spec.model)
-        if "lora" in name:
-          # q, wkv (k and v) and o in each of the 2 layers.
-          self.assertEqual(len(lora), 6, lora)
-          self.assertTrue(
-              all(
-                  f.endswith(
-                      ("qkv_linear.wq", "qkv_linear.wkv", "attention.wo")
-                  )
-                  for f in lora
-              )
-          )
-        else:
-          self.assertEqual(lora, [])
+        # q, wkv (k and v) and o in each of the 2 layers.
+        self.assertEqual(len(lora), 6, lora)
+        self.assertTrue(
+            all(
+                f.endswith(("qkv_linear.wq", "qkv_linear.wkv", "attention.wo"))
+                for f in lora
+            )
+        )
         self.assertEqual(config.training.dtype, "bfloat16")
+
+  def test_full_param_settings(self):
+    # The full-parameter recipes of full_param_sft.py build on these.
+    config = cr.build_sft_config(
+        cr.SFTRecipe(
+            model=cr.spark(),
+            shape=cr.SFT_FULL_SHAPE,
+            precision=cr.BF16,
+            parallel=cr.spark_parallel(),
+        )
+    )
+    self.assertEqual(config.training.mixed_precision_reduce, "float32")
+    cr.spark_tpu_settings(
+        config, full_param=True, fused_ce=True, frozen_head=False
+    )
+    self.assertEqual(config.training.mixed_precision_reduce, "bfloat16")
+    self.assertEqual(_lora_configs(config.model_spec.model), [])
+    self.assertIsInstance(
+        config.model_spec.model.lm_head, FusedLossLinearWrapper.Config
+    )
 
   def test_sft_recipes(self):
     for name in SPARK_RECIPES:

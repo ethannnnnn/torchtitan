@@ -226,7 +226,7 @@ class ChatTemplateTest(unittest.TestCase):
         stop, self.tok.convert_tokens_to_ids(["<|end_of_text|>", "<|eot|>"])
     )
     self.assertNotIn(self.tok.convert_tokens_to_ids("<|eom|>"), stop)
-    reply = '{"p_click": 0.4}'
+    reply = '{"answer": 0.4}'
     ids = self.tok(
         " to=self<|message|>hmm<|eom|><|start|>assistant to=user<|message|>"
         + reply

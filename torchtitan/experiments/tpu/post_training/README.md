@@ -12,7 +12,7 @@ and the CPU checks use the TPU Qwen3.5 debug model (`../qwen3_5/`).
 | SFT trainer | `sft_train.py`, `sft_config.py` | `SFTTPUTrainer`: restores the chunked loss, LoRA adapter saves (PEFT export plus adapter-only resume state), held-out loss, per-step records, resume-check hooks |
 | LoRA | `lora.py` | TorchTitan `LoRAConverter` on attention q/k/v/o by full module path; LoRA-aware state-dict adapter (load skips adapters, export merges them); merge and PEFT export helpers, including fused `wqkv` |
 | Optimizers | `optimizers.py` | AdamW, `AdamW8bit` (8-bit moments) and `AdamWBf16` (bf16 weights, stochastic rounding) |
-| Recipes | `config_registry.py` | `build_sft_config` and the registered Muse Spark SFT recipes |
+| Recipes | `config_registry.py` | `build_sft_config`, the helpers other recipe modules build on, and the registered Muse Spark LoRA SFT recipe |
 
 ## Model contract
 
@@ -118,27 +118,29 @@ caps the microbatches per rank and pass.
 ```bash
 torchrun --nproc_per_node=<RANKS_PER_HOST> -m torchtitan.experiments.tpu.post_training.sft_train \
   --module torchtitan.experiments.tpu.post_training.config_registry \
-  --config muse_spark_816b_a42b_ctr_sft_lora_tpu7x \
+  --config muse_spark_816b_a42b_sft_lora_tpu7x \
   --hf_assets_path <MODEL_DIR> --dataloader.data-path <SFT_JSONL> --dump_folder <OUT_DIR>
 ```
 
-Registered SFT recipes (they need the Muse Spark TPU package):
-`muse_spark_816b_a42b_ctr_sft_lora_tpu7x` (LoRA r 16, alpha 32 on q/k/v/o over
-a frozen bf16 base, AdamW on the adapters, lr 1e-4 with warmup and cosine
-decay), `..._ctr_sft_full_bf16_tpu7x` (bf16 weights, gradients and AdamW
-states), `..._ctr_sft_full_bf16sr_tpu7x` (`AdamWBf16`) and
-`..._ctr_sft_full_adamw8bit_tpu7x`. Set the flavor with `SPARK_FLAVOR`
-(default `816B-A42B`; truncated flavors such as `816B-A42B-2L` for small
-slices), the expert-parallel degree with `SPARK_EP`, and `SPARK_COMPILE=1` to
-compile per block.
+Registered SFT recipe (it needs the Muse Spark TPU package):
+`muse_spark_816b_a42b_sft_lora_tpu7x` (LoRA r 16, alpha 32 on q/k/v/o over a
+frozen bf16 base, AdamW on the adapters, lr 1e-4 with warmup and cosine
+decay). Set the flavor with `SPARK_FLAVOR` (default `816B-A42B`; truncated
+flavors such as `816B-A42B-2L` for small slices), the expert-parallel degree
+with `SPARK_EP`, and `SPARK_COMPILE=1` to compile per block.
 
-The Spark recipes apply TPU7x settings measured with the 816B model on one
+The Spark recipe applies TPU7x settings measured with the 816B model on one
 4x4x4 slice (`spark_tpu_settings`): full activation checkpointing, reshard
 after forward, `DEFER_AND_FUSE`, compiled gradient norm, the shared kernel
-settings of `muse_spark/tpu7x.py`, the TPU topology mesh, bf16 gradient
-reduction for full-parameter runs, and the Pallas fused linear cross-entropy
-with the head's multiplier and soft cap (`FusedLossLinearWrapper` +
-`PallasCrossEntropyLoss`).
+settings of `muse_spark/tpu7x.py`, the TPU topology mesh, and the Pallas fused
+linear cross-entropy with the head's multiplier and soft cap
+(`FusedLossLinearWrapper` + `PallasCrossEntropyLoss`).
+
+Full-parameter SFT of the same model (`LowPrecisionAdamW`, fp32 gradient
+reduction, expert parallelism with a measured expert placement) has its own
+recipes in `full_param_sft.py`
+(`--module torchtitan.experiments.tpu.post_training.full_param_sft`; its module
+docstring lists them).
 
 ## Optimizers
 

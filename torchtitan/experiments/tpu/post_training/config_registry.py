@@ -327,15 +327,13 @@ def build_sft_config(recipe: SFTRecipe) -> SFTTrainerConfig:
 # Muse Spark Open 816B-A42B on TPU7x. The flavor comes from SPARK_FLAVOR
 # (default 816B-A42B; 816B-A42B-2L / -4L / -8L truncate it for small slices),
 # SPARK_EP sets the expert-parallel degree and SPARK_COMPILE=1 compiles blocks.
-# Optimizer settings follow upstream TorchTitan's Muse Spark LoRA SFT recipe
-# in torchtitan_recipes/models/muse_spark.py (lr 1e-4 with warmup and cosine
-# decay to 0.1x; AdamW betas 0.9 / 0.95, no weight decay). Memory decides the
-# precision on TPU: fp32 master weights and Adam moments take 16 bytes per
-# parameter (13 TB at 816B, beyond 64 v7x chips), bf16 weights with AdamWBf16
-# take 8 and AdamW8bit 6. LoRA and the bf16 full-parameter recipes use the
-# plain AdamW optimizer, as measured on TPU7x; AdamWBf16 / AdamW8bit await
-# TPU validation. The recipes were tuned on chat SFT data rendered with
-# reasoning effort "low" (the shopping CTR SFT set); any chat JSONL works.
+# LoRA SFT trains the adapters with AdamW (lr 1e-4 with warmup and cosine
+# decay to 0.1x, betas 0.9 / 0.95, no weight decay) over a frozen bf16 base.
+# The recipe was tuned on chat SFT data rendered with reasoning effort "low";
+# any chat JSONL works. The full-parameter SFT recipes (LowPrecisionAdamW,
+# fp32 gradient reduction, expert parallelism with a measured placement) are
+# registered in full_param_sft.py
+# (--module torchtitan.experiments.tpu.post_training.full_param_sft).
 
 
 def spark() -> ModelChoice:
@@ -373,12 +371,13 @@ def spark_tpu_settings(
   attention with the Spark blocks, unpaired Pallas grouped matmuls with
   512 x 1024 x 1024 tiles and kernel-native expert weights, a 64 MiB
   scoped-VMEM limit, power state 7), a fused route-score backward and the TPU
-  topology mesh. Full-parameter runs
-  reduce gradients in bf16: with expert parallel degree 1 every layer's
-  unsharded expert gradients are large and an fp32 reduction doubles them.
-  ``fused_ce`` swaps the soft-capped LM head for ``FusedLossLinearWrapper``
-  and the loss for the Pallas fused linear cross-entropy carrying the head's
-  multiplier and cap.
+  topology mesh. ``full_param`` reduces gradients in bf16: with expert
+  parallel degree 1 every layer's unsharded expert gradients are large and an
+  fp32 reduction doubles them (recipes that keep an fp32 reduction set
+  ``training.mixed_precision_reduce`` afterwards). ``fused_ce`` swaps the
+  soft-capped LM head for ``FusedLossLinearWrapper`` and the loss for the
+  Pallas fused linear cross-entropy carrying the head's multiplier and cap;
+  ``frozen_head`` keeps that head frozen (LoRA runs).
   """
   from torchtitan.components.lora import _make_frozen_config
   from torchtitan.config import derive
@@ -416,53 +415,26 @@ SPARK_LORA = LoRAOptions(rank=16, alpha=32.0)
 SFT_LORA_SHAPE = TrainShape(
     lr=1e-4, steps=1000, warmup_steps=100, lr_min_factor=0.1
 )
+# The base shape of the full-parameter recipes (full_param_sft.py).
 SFT_FULL_SHAPE = TrainShape(
     lr=1e-5, steps=1000, warmup_steps=100, lr_min_factor=0.1
 )
 BF16 = Precision(dtype="bfloat16", optimizer="AdamW")
-BF16_SR = Precision(dtype="bfloat16", optimizer="AdamWBf16")
-ADAMW8BIT = Precision(dtype="bfloat16", optimizer="AdamW8bit")
 
 
-def _spark_sft(
-    *, precision: Precision, lora: LoRAOptions | None
-) -> SFTTrainerConfig:
-  shape = SFT_LORA_SHAPE if lora is not None else SFT_FULL_SHAPE
+def muse_spark_816b_a42b_sft_lora_tpu7x() -> SFTTrainerConfig:
+  """Chat SFT with LoRA r 16 / alpha 32 on q, k, v, o over a frozen bf16 base;
+  AdamW on the adapters; Pallas fused cross-entropy; 8192-token packed rows."""
   config = build_sft_config(
       SFTRecipe(
           model=spark(),
-          shape=shape,
-          precision=precision,
+          shape=SFT_LORA_SHAPE,
+          precision=BF16,
           parallel=spark_parallel(),
-          lora=lora,
+          lora=SPARK_LORA,
           reasoning_effort="low",
       )
   )
   return spark_tpu_settings(
-      config,
-      full_param=lora is None and precision.dtype == "bfloat16",
-      fused_ce=True,
-      frozen_head=lora is not None,
+      config, full_param=False, fused_ce=True, frozen_head=True
   )
-
-
-def muse_spark_816b_a42b_ctr_sft_lora_tpu7x() -> SFTTrainerConfig:
-  """Chat SFT with LoRA r 16 / alpha 32 on q, k, v, o over a frozen bf16 base;
-  AdamW on the adapters; Pallas fused cross-entropy; 8192-token packed rows."""
-  return _spark_sft(precision=BF16, lora=SPARK_LORA)
-
-
-def muse_spark_816b_a42b_ctr_sft_full_bf16_tpu7x() -> SFTTrainerConfig:
-  """Full-parameter chat SFT with bf16 weights, gradients and AdamW states."""
-  return _spark_sft(precision=BF16, lora=None)
-
-
-def muse_spark_816b_a42b_ctr_sft_full_bf16sr_tpu7x() -> SFTTrainerConfig:
-  """Full-parameter chat SFT with AdamWBf16 (fp32 update math, stochastic
-  rounding into bf16 weights)."""
-  return _spark_sft(precision=BF16_SR, lora=None)
-
-
-def muse_spark_816b_a42b_ctr_sft_full_adamw8bit_tpu7x() -> SFTTrainerConfig:
-  """Full-parameter chat SFT with bf16 weights and 8-bit AdamW moments."""
-  return _spark_sft(precision=ADAMW8BIT, lora=None)
