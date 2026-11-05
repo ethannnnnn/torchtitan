@@ -89,12 +89,17 @@ bash ./rendered/own-configmaps.sh --context <KUBE_CONTEXT>
 
 `<BASE_COMMIT>` must be a commit the pods can fetch from `--base-repo` (for
 example the upstream commit your branch starts from). `trainer.json` is a
-`v1` List: the code ConfigMaps (`<RUN_NAME>-code-N`) followed by the JobSet,
-which stays suspended until the queue admits it. `own-configmaps.sh` looks up
-the new JobSet's uid and makes it the owner of those ConfigMaps, so Kubernetes
-deletes them together with the JobSet, whether you delete it
+`v1` List: the code ConfigMaps (`<RUN_NAME>-code-<RENDER_ID>-N`) followed by
+the JobSet, which stays suspended until the queue admits it. Every render has
+its own id (random, or `--render-id`; recorded in `receipt.json` and in the
+`muse-spark-render` label), so ConfigMaps left over from an earlier launch
+under the same run name are never mounted. `own-configmaps.sh` looks up the
+new JobSet and makes it the owner of those ConfigMaps, so Kubernetes deletes
+them together with the JobSet, whether you delete it
 (`kubectl delete jobset <RUN_NAME>`) or `ttlSecondsAfterFinished` removes it
-an hour after the run. If the script did not run, delete them by label:
+an hour after the run; it refuses a JobSet of another render (an old JobSet
+of the same name that still existed when you ran `kubectl create`). If the
+script did not run, delete the ConfigMaps by label:
 `kubectl delete configmap -l muse-spark-run=<RUN_NAME>`.
 
 `--mode` picks the entry point and the TorchTitan `--module`; `--entry` and
@@ -110,7 +115,8 @@ an hour after the run. If the script did not run, delete them by label:
 
 `--priority-class` sets the pod priority class when your operator requires
 one, `--label KEY=VALUE` adds labels to the JobSet, its pods and the
-ConfigMaps, and `--env KEY=VALUE` adds a trainer environment variable such as
+ConfigMaps (not the labels the kit sets itself), and `--env KEY=VALUE` adds a
+trainer environment variable such as
 the `SPARK_*` knobs of `spark_e2e/recipes.py` (variables the kit sets itself
 and names that look like credentials are rejected; use a Kubernetes Secret
 for tokens). TPU node boot disks often have only about 20 GB free, so the

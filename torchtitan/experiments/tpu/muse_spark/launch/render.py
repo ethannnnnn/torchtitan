@@ -23,7 +23,10 @@ Output goes to a new directory: ``trainer.json`` (a ``v1`` List: the overlay
 ConfigMaps, then the suspended JobSet), ``own-configmaps.sh`` (run once after
 ``kubectl create``: makes the JobSet the owner of its code ConfigMaps, so they
 are deleted with it, also when ``ttlSecondsAfterFinished`` removes a finished
-JobSet) and ``receipt.json`` (geometry, code, inputs, file digests).
+JobSet) and ``receipt.json`` (geometry, code, inputs, file digests). Every
+render gets its own id (``--render-id``, random by default) in the ConfigMap
+names and in a ``muse-spark-render`` label, so a relaunch under the same run
+name never mounts or adopts an earlier render's ConfigMaps.
 """
 from __future__ import annotations
 
@@ -33,6 +36,7 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import shlex
 import sys
 from pathlib import Path
@@ -46,6 +50,10 @@ PLACEHOLDER = re.compile(r"<[A-Z][A-Z0-9_]*>")
 DNS_LABEL = re.compile(r"[a-z0-9](?:[-a-z0-9]*[a-z0-9])?")
 ENV_NAME = re.compile(r"[A-Z_][A-Z0-9_]*")
 SECRET_NAME = re.compile(r"TOKEN|SECRET|PASSWORD|CREDENTIAL|PRIVATE_KEY")
+RENDER_ID = re.compile(r"[a-z0-9]{1,8}")
+KIT_LABELS = frozenset({"app", "component", "muse-spark-run", "muse-spark-mode", "muse-spark-render",
+                        "kueue.x-k8s.io/queue-name"})
+"""Labels the kit sets itself (cleanup and ownership rely on them); --label cannot override them."""
 SHA256 = re.compile(r"[0-9a-f]{64}")
 # In container arguments the kubelet replaces $(NAME) by the value of the container variable NAME
 # and $$ by $; the embedded bootstrap.sh must reach the pod unchanged.
@@ -182,9 +190,12 @@ def parse_args(argv=None):
     p.add_argument("--work-size", default="15Gi",
                    help="/work emptyDir limit; TPU node boot disks often have only ~20 GB free")
     p.add_argument("--label", action="append", default=[], metavar="KEY=VALUE",
-                   help="extra label on the JobSet, its pods and the ConfigMaps (repeatable)")
+                   help="extra label on the JobSet, its pods and the ConfigMaps (repeatable; not one of the "
+                        "labels the kit sets itself)")
     p.add_argument("--env", action="append", default=[], metavar="KEY=VALUE",
                    help="extra trainer environment variable, e.g. SPARK_STEPS=20 (repeatable; not for secrets)")
+    p.add_argument("--render-id", help="1 to 8 lowercase letters or digits in this render's ConfigMap names and "
+                                       "labels (default: random, so every render's ConfigMaps are new objects)")
     p.add_argument("--service-account", default="default")
     p.add_argument("--priority-class", help="optional pod priority class chosen by the cluster operator")
     p.add_argument("--out", type=Path, required=True, help="new output directory")
@@ -198,6 +209,8 @@ def parse_args(argv=None):
         if not sep or not re.fullmatch(r"([a-z0-9.-]+/)?[A-Za-z0-9]([-A-Za-z0-9_.]*[A-Za-z0-9])?", key) \
                 or not re.fullmatch(r"([A-Za-z0-9]([-A-Za-z0-9_.]*[A-Za-z0-9])?)?", value) or len(value) > 63:
             p.error(f"--label {item!r} must be KEY=VALUE with Kubernetes label syntax")
+        if key in KIT_LABELS:
+            p.error(f"--label {key}: the kit sets this label itself")
         labels[key] = value
     args.labels = labels
     env = {}
@@ -213,6 +226,9 @@ def parse_args(argv=None):
         value = getattr(args, option)
         if not DNS_LABEL.fullmatch(value) or len(value) > limit:
             p.error(f"--{option.replace('_', '-')} must be a DNS label of at most {limit} characters")
+    if args.render_id is not None and not RENDER_ID.fullmatch(args.render_id):
+        p.error("--render-id must be 1 to 8 lowercase letters or digits")
+    args.render_id = args.render_id or secrets.token_hex(4)
     if not args.base_repo.startswith("https://"):
         p.error("--base-repo must be an https:// URL")
     for option in ("prefix", "model_dir", "data_dir", "runtime_dir"):
@@ -259,7 +275,8 @@ def overlay_configmaps(args, labels: dict[str, str]) -> list[dict]:
         item = {
             "apiVersion": "v1",
             "kind": "ConfigMap",
-            "metadata": {"name": f"{args.run}-code-{index}", "namespace": args.namespace, "labels": dict(labels)},
+            "metadata": {"name": f"{args.run}-code-{args.render_id}-{index}", "namespace": args.namespace,
+                         "labels": dict(labels)},
             "binaryData": {f"overlay.tar.gz.{index}": base64.b64encode(chunk).decode()},
         }
         if index == 0:
@@ -281,14 +298,24 @@ def projected_sources(maps: list[dict]) -> list[dict]:
 
 
 OWNER_SCRIPT = """#!/usr/bin/env bash
-# Written by render.py for JobSet {run} in namespace {namespace}. Run it once after
-# `kubectl create -f trainer.json`: it makes the JobSet the owner of its code ConfigMaps,
-# so Kubernetes deletes them together with the JobSet (deleted by hand, or by
+# Written by render.py for JobSet {run} (render {render_id}) in namespace {namespace}. Run it
+# once after `kubectl create -f trainer.json`: it makes the JobSet the owner of its code
+# ConfigMaps, so Kubernetes deletes them together with the JobSet (deleted by hand, or by
 # ttlSecondsAfterFinished after the run). Arguments go to every kubectl call,
 # e.g. --context NAME.
 set -euo pipefail
-uid=$(kubectl "$@" -n {namespace} get jobset {run} -o jsonpath='{{.metadata.uid}}')
+found=$(kubectl "$@" -n {namespace} get jobset {run} \\
+  -o jsonpath='{{.metadata.uid}} {{.metadata.labels.muse-spark-render}}')
+uid=${{found%% *}}
+render=${{found#* }}
 [[ -n "$uid" ]] || {{ echo "JobSet {run} not found in {namespace}" >&2; exit 1; }}
+if [[ "$render" != {render_id} ]]; then
+  echo "JobSet {run} in {namespace} comes from render '$render', not {render_id}: the old JobSet was still" \\
+    "there when trainer.json was created. Delete this render's ConfigMaps" \\
+    "(kubectl -n {namespace} delete configmap -l muse-spark-render={render_id}), delete the old JobSet," \\
+    "then create trainer.json again." >&2
+  exit 1
+fi
 patch='{{"metadata":{{"ownerReferences":[{{"apiVersion":"{api_version}","kind":"JobSet","name":"{name}","uid":"'"$uid"'"}}]}}}}'
 for configmap in {configmaps}; do
   kubectl "$@" -n {namespace} patch configmap "$configmap" --type=merge -p "$patch"
@@ -302,7 +329,7 @@ def owner_script(jobset: dict, maps: list[dict]) -> str:
     meta = jobset["metadata"]
     return OWNER_SCRIPT.format(
         run=shlex.quote(meta["name"]), namespace=shlex.quote(meta["namespace"]),
-        name=meta["name"], api_version=jobset["apiVersion"],
+        name=meta["name"], api_version=jobset["apiVersion"], render_id=meta["labels"]["muse-spark-render"],
         configmaps=" ".join(shlex.quote(m["metadata"]["name"]) for m in maps))
 
 
@@ -313,11 +340,12 @@ def main(argv=None):
     config_module = args.config_module or MODES[args.mode][1]
     manifest = args.overlay_manifest
     runtime_dir = args.runtime_dir or f"{args.prefix}/runtime"
-    base_labels = {"app": "muse-spark-trainer", "muse-spark-run": args.run, "muse-spark-mode": args.mode}
+    base_labels = {"app": "muse-spark-trainer", "muse-spark-run": args.run, "muse-spark-mode": args.mode,
+                   "muse-spark-render": args.render_id}
     maps = overlay_configmaps(args, {**base_labels, "component": "code", **args.labels})
     command = (HERE / "bootstrap.sh").read_text()
     settings = {
-        "<RUN_NAME>": args.run, "<MODE>": args.mode, "<ENTRY_MODULE>": entry,
+        "<RUN_NAME>": args.run, "<RENDER_ID>": args.render_id, "<MODE>": args.mode, "<ENTRY_MODULE>": entry,
         "<CONFIG_MODULE>": config_module, "<CONFIG>": args.config, "<EXTRA_ARGS>": args.extra_args,
         "<TPU_TOPOLOGY>": args.topology,
         "<BASE_REPO>": args.base_repo, "<BASE_COMMIT>": manifest["base_commit"], "<BASE_TREE>": manifest["base_tree"],
@@ -362,6 +390,7 @@ def main(argv=None):
     document = {"apiVersion": "v1", "kind": "List", "items": [*maps, trainer]}
     receipt = {
         "kind": "muse-spark-render", "status": "RENDERED", "mode": args.mode, "run": args.run,
+        "render_id": args.render_id,
         "topology": args.topology, "hosts": hosts, "chips": 4 * hosts, "ranks": 8 * hosts,
         "accelerator_type": accelerator, "entry": entry, "config_module": config_module, "config": args.config,
         "extra_args": args.extra_args, "image": args.trainer_image,
@@ -399,7 +428,8 @@ def main(argv=None):
                         "own-configmaps.sh": hashlib.sha256(script).hexdigest()}
     (args.out / "receipt.json").write_text(json.dumps(receipt, indent=2) + "\n")
     print(f"rendered {args.mode} {args.config} on {args.topology} ({hosts} hosts, {4 * hosts} chips) "
-          f"under {args.out}: {len(maps)} code ConfigMap(s) + the JobSet, suspended until the queue admits it; "
+          f"under {args.out}: {len(maps)} code ConfigMap(s) of render {args.render_id} + the JobSet, "
+          "suspended until the queue admits it; "
           f"candidate tree {manifest['candidate_tree']}. After `kubectl create -f {args.out / 'trainer.json'}`, "
           f"run `bash {args.out / 'own-configmaps.sh'} [--context NAME]` so the ConfigMaps go with the JobSet.")
     return 0

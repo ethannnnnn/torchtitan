@@ -8,6 +8,7 @@
       "app": "muse-spark-trainer",
       "muse-spark-run": "<RUN_NAME>",
       "muse-spark-mode": "<MODE>",
+      "muse-spark-render": "<RENDER_ID>",
       "kueue.x-k8s.io/queue-name": "<LOCAL_QUEUE>",
       "x.tpu.cloud.google.com/slice-autoprovisioning": "async"
     },

@@ -237,6 +237,43 @@ class RenderTest(LaunchTestCase):
         self.assertEqual(command, (LAUNCH / "bootstrap.sh").read_text())
         self.assertEqual(maps[0]["metadata"]["labels"]["muse-spark-run"], "inline")
 
+    def test_every_render_has_its_own_configmaps(self):
+        """A relaunch under the same run name gets new ConfigMap objects, never an earlier render's."""
+        first, first_maps, first_receipt, _ = self._render("--mode", "e2e", "--run", "again", "--topology", "2x2x1",
+                                                           "--config", "s1_sft_trunc2")
+        second, second_maps, second_receipt, _ = self._render("--mode", "e2e", "--run", "again", "--topology",
+                                                              "2x2x1", "--config", "s1_sft_trunc2")
+        self.assertNotEqual(first_receipt["render_id"], second_receipt["render_id"])
+        for jobset, maps, receipt in ((first, first_maps, first_receipt), (second, second_maps, second_receipt)):
+            render_id = receipt["render_id"]
+            self.assertRegex(render_id, render.RENDER_ID)
+            names = [f"again-code-{render_id}-{i}" for i in range(len(maps))]
+            self.assertEqual([m["metadata"]["name"] for m in maps], names)
+            self.assertEqual(receipt["code"]["configmaps"], names)
+            sources = pod_of(jobset)["volumes"][0]["projected"]["sources"]
+            self.assertEqual([s["configMap"]["name"] for s in sources], names)
+            self.assertEqual(jobset["metadata"]["labels"]["muse-spark-render"], render_id)
+            self.assertTrue(all(m["metadata"]["labels"]["muse-spark-render"] == render_id for m in maps))
+        _, fixed, receipt, _ = self._render("--mode", "e2e", "--run", "again", "--topology", "2x2x1",
+                                            "--config", "s1_sft_trunc2", "--render-id", "r2d2")
+        self.assertEqual((receipt["render_id"], fixed[0]["metadata"]["name"]), ("r2d2", "again-code-r2d2-0"))
+
+    def _owner_script_run(self, script: Path, name: str, render_id: str) -> tuple[subprocess.CompletedProcess, list]:
+        """Runs own-configmaps.sh with a stand-in kubectl that records its arguments and reports a JobSet
+        with a fixed uid and the given render id."""
+        bindir = self.tmp / f"fake-kubectl-{name}"
+        bindir.mkdir()
+        calls = self.tmp / f"kubectl-calls-{name}.jsonl"
+        calls.write_text("")
+        (bindir / "kubectl").write_text(
+            f"#!{sys.executable}\nimport json, sys\n"
+            f"open({str(calls)!r}, 'a').write(json.dumps(sys.argv[1:]) + '\\n')\n"
+            f"if 'get' in sys.argv: print('0f0f0f0f-1111-2222-3333-444455556666 {render_id}', end='')\n")
+        (bindir / "kubectl").chmod(0o755)
+        result = subprocess.run(["bash", str(script), "--context", "example-context"], capture_output=True, text=True,
+                                env=dict(os.environ, PATH=f"{bindir}:{os.environ.get('PATH', '')}"), timeout=60)
+        return result, [json.loads(line) for line in calls.read_text().splitlines()]
+
     @unittest.skipIf(shutil.which("bash") is None, "bash not installed")
     def test_owner_script_hands_the_configmaps_to_the_jobset(self):
         jobset, maps, receipt, out = self._render("--mode", "e2e", "--run", "owned", "--topology", "2x2x1",
@@ -244,21 +281,10 @@ class RenderTest(LaunchTestCase):
         script = out / "own-configmaps.sh"
         self.assertEqual(receipt["code"]["configmap_owner_script"], script.name)
         subprocess.run(["bash", "-n", str(script)], check=True)
-        # A stand-in kubectl that records its arguments and knows the JobSet's uid.
-        bindir = self.tmp / "fake-kubectl"
-        bindir.mkdir()
-        calls = self.tmp / "kubectl-calls.jsonl"
-        (bindir / "kubectl").write_text(
-            f"#!{sys.executable}\nimport json, sys\n"
-            f"open({str(calls)!r}, 'a').write(json.dumps(sys.argv[1:]) + '\\n')\n"
-            "if 'get' in sys.argv: print('0f0f0f0f-1111-2222-3333-444455556666', end='')\n")
-        (bindir / "kubectl").chmod(0o755)
-        result = subprocess.run(["bash", str(script), "--context", "example-context"], capture_output=True, text=True,
-                                env=dict(os.environ, PATH=f"{bindir}:{os.environ.get('PATH', '')}"), timeout=60)
+        result, recorded = self._owner_script_run(script, "owned", receipt["render_id"])
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        recorded = [json.loads(line) for line in calls.read_text().splitlines()]
         self.assertEqual(recorded[0], ["--context", "example-context", "-n", "example-ns", "get", "jobset", "owned",
-                                       "-o", "jsonpath={.metadata.uid}"])
+                                       "-o", "jsonpath={.metadata.uid} {.metadata.labels.muse-spark-render}"])
         patched = []
         for call in recorded[1:]:
             self.assertEqual(call[:6], ["--context", "example-context", "-n", "example-ns", "patch", "configmap"])
@@ -268,6 +294,11 @@ class RenderTest(LaunchTestCase):
             self.assertEqual(owner, {"apiVersion": jobset["apiVersion"], "kind": "JobSet", "name": "owned",
                                      "uid": "0f0f0f0f-1111-2222-3333-444455556666"})
         self.assertEqual(patched, [m["metadata"]["name"] for m in maps])
+        # A JobSet of the same name from another render (it was not deleted before kubectl create): no patch.
+        result, recorded = self._owner_script_run(script, "other", "0ld0ld00")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn(f"comes from render '0ld0ld00', not {receipt['render_id']}", result.stderr)
+        self.assertEqual([call[4] for call in recorded], ["get"])
 
     def test_large_overlay_uses_several_configmaps(self):
         big = self.tmp / "big-repo"
@@ -423,6 +454,10 @@ class RenderTest(LaunchTestCase):
             ["--pip-overlay", "does/not/exist.txt"],
             ["--pip-find-links", "/mnt/runtime"],
             ["--code-overlay", "/nonexistent"],
+            ["--render-id", "Not-Valid"],
+            ["--render-id", "toolongid"],
+            ["--label", "muse-spark-run=other"],
+            ["--label", "muse-spark-render=other"],
         ]
         for override in bad:
             args = ["--mode", "sft", "--run", "ok", "--topology", "2x2x1", "--config", "c", *BASE_ARGS,
@@ -439,7 +474,7 @@ class RenderTest(LaunchTestCase):
         self.assertFalse((self.tmp / "never").exists())
 
     def test_templates_use_only_known_placeholders(self):
-        known = {"<RUN_NAME>", "<MODE>", "<ENTRY_MODULE>", "<CONFIG_MODULE>", "<CONFIG>", "<EXTRA_ARGS>",
+        known = {"<RUN_NAME>", "<RENDER_ID>", "<MODE>", "<ENTRY_MODULE>", "<CONFIG_MODULE>", "<CONFIG>", "<EXTRA_ARGS>",
                  "<TPU_TOPOLOGY>", "<BASE_REPO>", "<BASE_COMMIT>", "<BASE_TREE>", "<CANDIDATE_COMMIT>",
                  "<CANDIDATE_TREE>", "<OVERLAY_SHA256>", "<OVERLAY_CHUNKS>", "<OVERLAY_SOURCES>", "<BUDGET_S>",
                  "<DEADLINE_S>", "<NNODES>", "<GCS_BUCKET>", "<PREFIX>", "<MODEL_DIR>", "<DATA_DIR>",

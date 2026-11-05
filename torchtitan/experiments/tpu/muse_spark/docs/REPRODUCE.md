@@ -155,9 +155,22 @@ Watch host 0's log (`kubectl logs` of pod `<RUN_NAME>-trainer-0-0-*`, or
 
 A relaunch with the same `--run` and prefix resumes: every start reads the
 base from the Hugging Face checkpoint, then the newest complete
-`checkpoint/step-N`. To start from an adapter instead (for example an earlier
-run's export copied under the data prefix), pass
-`--env SPARK_ADAPTER_INIT=/mnt/data/<ADAPTER_DIR>`.
+`checkpoint/step-N`. Delete the previous JobSet first and wait until its
+pods are gone, remove its code ConfigMaps, then render again into a new
+`--out` (each render names its ConfigMaps uniquely) and create:
+
+```bash
+kubectl --context <KUBE_CONTEXT> -n <K8S_NAMESPACE> delete jobset <RUN_NAME> --cascade=foreground --wait
+kubectl --context <KUBE_CONTEXT> -n <K8S_NAMESPACE> delete configmap -l muse-spark-run=<RUN_NAME>
+```
+
+`kubectl create` must print `created` for every object. If it reports
+`AlreadyExists` for the JobSet, the old one was still there and
+`own-configmaps.sh` refuses to hand it the new ConfigMaps: delete them
+(`kubectl delete configmap -l muse-spark-render=<RENDER_ID>`, the id is in
+`receipt.json`), delete the old JobSet as above, and create again. To start
+from an adapter instead (for example an earlier run's export copied under the
+data prefix), pass `--env SPARK_ADAPTER_INIT=/mnt/data/<ADAPTER_DIR>`.
 
 The other knobs (`SPARK_LR`, `SPARK_LORA_RANK`, `SPARK_SFT_ROWS` for two
 packed rows per rank, `SPARK_EXPORT_EVERY`, ...) are listed in the
