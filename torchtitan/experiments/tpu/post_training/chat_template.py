@@ -4,7 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Chat-template rendering for SFT and RL.
+"""Chat-template rendering for SFT.
 
 Every prompt and every SFT conversation is rendered by the checkpoint's own
 Hugging Face chat template (for Muse Spark: the public template shipped with
@@ -24,7 +24,7 @@ of ``apply_chat_template``:
   the full conversation; ``"auto"`` picks ``"generation"`` when the template has
   the blocks. By default the generation prompt that opens an assistant turn
   (``<|start|>assistant`` for Muse Spark) is not trained: at inference the
-  prompt supplies it, and RL rollouts start right after it.
+  prompt supplies it.
 
 The response helpers split a sampled completion into the assistant messages of
 a header-style template (``<|start|>assistant to=RECIPIENT<|message|>BODY``
@@ -138,7 +138,7 @@ def render_prompt_ids(
     messages: Sequence[dict[str, Any]],
     options: ChatTemplateOptions,
 ) -> list[int]:
-  """Prompt ids ending with the generation prompt (the RL rollout prompt)."""
+  """Prompt ids ending with the generation prompt, where sampling starts."""
   return encode_rendered(
       tokenizer,
       render_text(tokenizer, messages, options, add_generation_prompt=True),

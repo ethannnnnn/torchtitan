@@ -23,9 +23,9 @@ recipes need around it:
 * ``apply_lora`` converts a ``ModelSpec`` in place and wraps its state-dict
   adapter: the Hugging Face load path skips the adapter tensors (the base
   checkpoint has none; ``ModelWrapper`` loads non-strictly, so they keep their
-  initialization), and ``to_hf_for_export`` -- used by the RL weight publisher
-  -- folds ``W + alpha / r * B @ A`` into the base weights so the rollout
-  engine receives ordinary merged weights.
+  initialization), and ``to_hf_for_export`` (merged-weight exports) folds
+  ``W + alpha / r * B @ A`` into the base weights, so inference engines
+  receive ordinary merged weights.
 * ``merge_lora_state_dict`` / ``split_lora_state_dict`` operate on gathered
   state dicts; ``peft_adapter_state_dict`` renames adapter tensors to the
   PEFT layout (``base_model.model.<hf module>.lora_A.weight``) and lays out

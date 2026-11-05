@@ -51,10 +51,7 @@ from .optimizers import adamw_config
 from .sft_config import SFTConfig, SFTTrainerConfig, as_sft_config
 from .sft_data import ChatSFTDataLoader
 
-SPARK_MODEL_MODULES = (
-    "torchtitan.experiments.tpu.muse_spark",
-    "torchtitan.models.muse_spark",
-)
+SPARK_MODEL_MODULES = ("torchtitan.experiments.tpu.muse_spark",)
 MODEL_ASSETS = "/mnt/model"
 SFT_DATA = "/mnt/data/sft/train.jsonl"
 

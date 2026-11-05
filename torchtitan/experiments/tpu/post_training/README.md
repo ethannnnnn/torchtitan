@@ -99,7 +99,11 @@ gradient norm, the learning rate, and a SHA-256 fingerprint plus the document
 ids of every microbatch it trained on), so two runs can be compared batch by
 batch (`SFT_RECORDS_DIR` moves them). `SFT_FAULT_KILL_STEP=N` sends SIGKILL to
 every rank inside the forward/backward of step N, after that step's batches
-were drawn.
+were drawn. A resumed run rewrites the rank-0 summaries
+`<dump_folder>/sft-records-rank0.json` and `sft-val-rank0.json` from its own
+steps and evaluations, so the entries from before the restart are only in the
+earlier run's log; the per-rank `sft-records/` files are appended to and keep
+them.
 
 ### Held-out loss
 

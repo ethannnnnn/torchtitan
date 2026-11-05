@@ -51,6 +51,10 @@ Runs the upstream TPU trainer startup with ``SFTTPUTrainer``:
   when the dump folder is an object-store mount). ``SFT_FAULT_KILL_STEP=N``
   sends SIGKILL to every rank inside the forward/backward of step N (after
   that step's batches were drawn): a hard crash for fault-tolerance tests.
+* A resumed run rewrites ``sft-records-rank0.json`` and ``sft-val-rank0.json``
+  from its own steps and evaluations, so the entries from before the restart
+  are only in the earlier run's log; the per-rank ``sft-records/`` files are
+  appended to and keep them.
 
 Launch with torchrun, module torchtitan.experiments.tpu.post_training.sft_train,
 ``--module torchtitan.experiments.tpu.post_training.config_registry`` and an

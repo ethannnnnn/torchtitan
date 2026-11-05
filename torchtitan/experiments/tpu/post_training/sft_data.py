@@ -22,9 +22,9 @@ assistant tokens, and packs conversations into the native fixed-shape batch:
 dp_rank``). A document never crosses a row; positions reset per document, so
 models that derive document masks from position resets (flex / splash /
 varlen attention) never attend across documents. The tail pad continues the
-last document's positions, as in the native RL packer, so it creates no
-phantom document. The trainer sums ``num_valid_tokens`` over microbatches and
-data-parallel ranks and divides the summed cross-entropy by that global count.
+last document's positions, so it creates no phantom document. The trainer
+sums ``num_valid_tokens`` over microbatches and data-parallel ranks and
+divides the summed cross-entropy by that global count.
 
 Packing is first-fit decreasing over a lookahead window of documents, at most
 ``max_documents_per_row`` documents per row; documents that do not fit wait
