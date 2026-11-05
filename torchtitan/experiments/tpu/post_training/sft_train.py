@@ -4,73 +4,81 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Entry point for chat SFT on TPU.
+"""Chat supervised fine-tuning on TPU: ``SFTTPUTrainer`` and its entry point.
 
-Runs the upstream TPU trainer startup with ``SFTTPUTrainer``:
+``start_trainer`` runs upstream's TPU launcher,
+``torchtitan.experiments.tpu.train.start_trainer``, so that it constructs
+``SFTTPUTrainer`` in place of ``TPUTrainer`` (``tpu_trainer_class``).
 
-* ``TPUTrainer.__init__`` replaces any configured loss with plain
-  cross-entropy (or the Pallas fused kernel when selected). After
-  ``Trainer.__init__`` has already wired a configured ``ChunkedLossWrapper``
-  (``model._skip_lm_head = True``), that replacement would feed hidden states
-  to a logits loss, so ``SFTTPUTrainer`` restores the configured chunked loss
-  and its lm_head binding. The loss is the summed cross-entropy of the
-  supervised tokens divided by the step's global supervised-token count.
-* The accumulation count per optimizer step comes from the dataloader
-  (``ChatSFTDataLoader.Config.microbatches_per_step``).
-* Each step logs (and rank 0 writes to ``<dump_folder>/sft-records-rank0.json``)
-  the packed documents, tokens, supervised tokens and this rank's loss share;
-  the trainable / frozen parameter counts are logged once (LoRA runs).
-* LoRA runs save only the adapter (``sft.lora_save="adapter"``, default): at
-  every checkpoint step TorchTitan's DCP save writes the adapter-only resume
-  state (adapter tensors, their optimizer state, the LR schedule, the
-  dataloader position and the step counter; never the frozen base) to
-  ``<dump_folder>/checkpoint/step-N`` (``checkpointing/lora_checkpoint.py``),
-  then all ranks gather the adapter tensors (a collective over the sorted
-  adapter keys) and rank 0 writes them in the PEFT layout, named through the
-  model's state-dict adapter, to ``<dump_folder>/lora_adapter/step-N``. Every
-  start reads the base from the Hugging Face checkpoint and then restores the
-  newest complete ``step-N``, so relaunching with the same dump folder resumes
-  a killed run. ``"peft"`` writes only the PEFT adapter (no resume state),
-  ``"full"`` keeps TorchTitan's DCP save of the whole model, ``"none"`` saves
-  nothing.
-* On TPU every rank leaves each checkpoint save together
-  (``checkpointing/flush.py``; ``SFT_CHECKPOINT_FLUSH=1`` forces it on any
-  device, ``0`` turns it off).
-* Held-out loss (``sft.val_data_path``, e.g. the dataset's ``sft/val.jsonl``):
-  before the first step, every ``sft.val_every`` steps and after the last
-  step, a forward-only pass over every held-out record (packed like the
-  training data, each data-parallel rank a strided share) gives the summed
-  cross-entropy of the assistant tokens divided by their count. It is logged
-  as ``validate step: N loss: X`` and ``[sft] validation ...`` and written by
-  rank 0 to ``<dump_folder>/sft-val-rank0.json``.
-* Resume checks: with ``SFT_RECORDS_ALL_RANKS=1`` every rank appends one JSON
-  line per step to ``<dump_folder>/sft-records/rank-NNNNN.jsonl`` (its loss
-  share, the gradient norm, the learning rate, and a SHA-256 fingerprint plus
-  the document ids of every microbatch it trained on), so two runs can be
-  compared batch by batch (``SFT_RECORDS_DIR`` moves them, e.g. to local disk
-  when the dump folder is an object-store mount). ``SFT_FAULT_KILL_STEP=N``
-  sends SIGKILL to every rank inside the forward/backward of step N (after
-  that step's batches were drawn): a hard crash for fault-tolerance tests.
-* A resumed run rewrites ``sft-records-rank0.json`` and ``sft-val-rank0.json``
-  from its own steps and evaluations, so the entries from before the restart
-  are only in the earlier run's log; the per-rank ``sft-records/`` files are
-  appended to and keep them.
+Loss
+  A job whose loss is configured as ``ChunkedLossWrapper`` gets that loss back
+  once ``TPUTrainer.__init__`` has run. Upstream ``Trainer`` builds the wrapper,
+  hands it the model's ``lm_head`` and makes the model stop short of that
+  projection; ``TPUTrainer`` then replaces the wrapper by cross-entropy over
+  logits (or by its fused kernel), which would be fed hidden states. Each
+  token's cross-entropy is summed over the supervised targets, and the sum is
+  divided by how many supervised targets the optimizer step holds over all
+  microbatches and data-parallel ranks.
 
-Launch with torchrun, module torchtitan.experiments.tpu.post_training.sft_train,
-``--module torchtitan.experiments.tpu.post_training.config_registry`` and an
-SFT recipe; see README.md.
+Microbatches
+  An optimizer step consumes ``ChatSFTDataLoader.Config.microbatches_per_step``
+  microbatches per rank.
+
+Records
+  Every step logs its documents, tokens, supervised targets and the share of
+  the loss computed on this rank. Rank 0 also writes them to
+  ``<dump_folder>/sft-records-rank0.json``. Trainable and frozen parameter
+  counts are reported once, at construction.
+
+LoRA saves, ``sft.lora_save``
+  ``"adapter"`` (default) writes two things at a checkpoint step: DCP resume
+  state in ``<dump_folder>/checkpoint/step-N`` (step counter, data position,
+  LR schedule, LoRA tensors and their optimizer state; the frozen base is
+  never included) and a PEFT copy in ``<dump_folder>/lora_adapter/step-N``.
+  ``"peft"`` writes the PEFT copy only, ``"full"`` uses TorchTitan's DCP save
+  of the whole model, and ``"none"`` writes nothing. Whatever the mode, a start
+  loads the frozen base from the released Hugging Face weights and then
+  restores the newest complete ``step-N`` over it.
+
+Checkpoint flush, ``SFT_CHECKPOINT_FLUSH``
+  On TPU, all ranks finish each checkpoint save in lockstep
+  (``checkpointing/flush.py``). ``1`` enables this on any device; ``0``
+  disables it.
+
+Held-out loss, ``sft.val_data_path`` and ``sft.val_every``
+  Evaluated once ahead of step 1, at each multiple of ``val_every`` and once
+  more after the final step, with forward passes only. Held-out records are
+  packed like training data; with n data-parallel ranks, rank r evaluates
+  records r, r + n, r + 2n and so on. The figure is the cross-entropy summed
+  over assistant targets, divided by their number. It appears in upstream's
+  ``validate step: N loss: X`` line and in a ``[sft] validation ...`` line,
+  and rank 0 keeps the history in ``<dump_folder>/sft-val-rank0.json``.
+
+Resume checks
+  ``SFT_RECORDS_ALL_RANKS=1`` appends one line per step to each rank's
+  ``<dump_folder>/sft-records/rank-NNNNN.jsonl``; ``SFT_RECORDS_DIR`` moves
+  those files. ``SFT_FAULT_KILL_STEP=N`` makes every rank SIGKILL itself while
+  running step N. After a restart, the two rank-0 JSON files describe the new
+  process only, whereas the per-rank JSONL files keep accumulating.
+
+Launch
+  ``torchrun ... -m torchtitan.experiments.tpu.post_training.sft_train``
+  ``--module torchtitan.experiments.tpu.post_training.config_registry``
+  ``--config <recipe>`` plus overrides; README.md has a full command.
 """
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import json
 import logging
 import os
 import signal
 import time
+from collections.abc import Iterator
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol, runtime_checkable
 
 import torch
 
@@ -79,9 +87,11 @@ from torch.distributed.tensor import DTensor
 
 from torchtitan.components.checkpointer.base import ModelWrapper
 from torchtitan.components.loss import ChunkedLossWrapper
+from torchtitan.config.configurable import Configurable
 from torchtitan.distributed import utils as dist_utils
 from torchtitan.experiments.tpu import gmain
-from torchtitan.experiments.tpu import train as native_train
+import torchtitan.experiments.tpu.train as tpu_entry
+from torchtitan.experiments.tpu.tpu_job_config import TPUTrainerConfig
 from torchtitan.experiments.tpu.train import TPUTrainer
 
 from . import lora as lora_mod
@@ -91,35 +101,35 @@ from .sft_config import LORA_SAVE_MODES
 logger = logging.getLogger(__name__)
 
 
+@runtime_checkable
+class MicrobatchesPerStep(Protocol):
+  """A dataloader that decides how many microbatches form one optimizer step.
+
+  ``SFTTPUTrainer.train_step`` sets ``gradient_accumulation_steps`` from it
+  before every step; ``ChatSFTDataLoader`` implements it.
+  """
+
+  def microbatches_for_step(self) -> int:
+    ...
+
+
 class SFTTPUTrainer(TPUTrainer):
   """TPU trainer for supervised fine-tuning with a chunked loss."""
 
-  def __init__(self, job_config: Any) -> None:
+  def __init__(self, job_config: Configurable.Config):
     super().__init__(job_config)
-    config = self.config
-    if isinstance(config.loss, ChunkedLossWrapper.Config):
-      rebuilt = config.loss.build(compile_config=config.compile)
-      assert len(self.model_parts) == 1, "SFT path expects one model part"
-      lm_head = getattr(self.model_parts[0], "lm_head", None)
-      assert lm_head is not None, "ChunkedLossWrapper needs model.lm_head"
-      rebuilt.set_lm_head(lm_head)
-      self.model_parts[0]._skip_lm_head = True
-      self.loss_fn = rebuilt
-      logger.info(
-          "[sft] loss restored to ChunkedLossWrapper(%d chunks)",
-          rebuilt.num_chunks,
-      )
+    self._reinstall_chunked_loss(job_config)
     self.parameter_report = lora_parameter_report(self.model_parts[0])
     logger.info("[sft] parameters: %s", self.parameter_report)
+    rank = int(os.getenv("RANK", "0"))
+    self._rank = rank
     self.sft_records: list[dict[str, Any]] = []
     self._step_loss: torch.Tensor | None = None
-    self._rank = int(os.environ.get("RANK", "0"))
     self.lora_exports: list[str] = []
-    self._install_lora_save(config)
-    # TorchTPU: every rank leaves each checkpoint save together, so a crash
-    # right after a save cannot strand ranks 1..N-1 in DCP's last collective
-    # (checkpointing/flush.py). SFT_CHECKPOINT_FLUSH=1 forces it on any
-    # device, 0 turns it off.
+    self._install_lora_save(job_config)
+    # On TPU, all ranks finish each checkpoint save in lockstep; see
+    # checkpointing/flush.py. It must wrap the save that the LoRA hook above
+    # installed, hence its place after that hook.
     flush = os.environ.get("SFT_CHECKPOINT_FLUSH", "")
     if flush == "1" or (
         flush != "0" and getattr(self.device, "type", "") == "tpu"
@@ -128,9 +138,9 @@ class SFTTPUTrainer(TPUTrainer):
         from torchtitan.experiments.tpu.checkpointing.flush import flush_after_saves
       except ImportError as exc:
         raise ImportError(
-            "every rank leaves a checkpoint save together through "
-            "torchtitan.experiments.tpu.checkpointing.flush; "
-            "SFT_CHECKPOINT_FLUSH=0 turns this off"
+            "SFT_CHECKPOINT_FLUSH asks for the lockstep checkpoint exit, but "
+            "torchtitan.experiments.tpu.checkpointing.flush failed to import; "
+            "run with SFT_CHECKPOINT_FLUSH=0 to go without it"
         ) from exc
 
       flush_after_saves(self.checkpointer, self.device)
@@ -144,7 +154,43 @@ class SFTTPUTrainer(TPUTrainer):
           "[sft] fault injection: every rank is killed (SIGKILL) at step %d",
           self._fault_kill_step,
       )
-    self._setup_validation(config)
+    self._setup_validation(job_config)
+
+  # -- loss -------------------------------------------------------------
+  def _reinstall_chunked_loss(self, job_config: Configurable.Config) -> None:
+    """Give a ``ChunkedLossWrapper`` job its loss back after TPUTrainer.
+
+    ``Trainer.__init__`` bound the configured wrapper to the model's
+    ``lm_head`` and set ``_skip_lm_head``, so the model returns hidden
+    states; ``TPUTrainer.__init__`` then installed a loss over logits. The
+    wrapper is rebuilt with the same call ``Trainer`` uses (same chunks,
+    inner loss and compile settings) and bound the same way. Other loss
+    configurations keep TPUTrainer's choice.
+    """
+    loss_config = job_config.loss
+    if not isinstance(loss_config, ChunkedLossWrapper.Config):
+      return
+    if len(self.model_parts) != 1:
+      raise ValueError(
+          "SFTTPUTrainer applies the chunked loss to a single model part; "
+          f"this job has {len(self.model_parts)} (pipeline parallelism)"
+      )
+    part = self.model_parts[0]
+    head = getattr(part, "lm_head", None)
+    if head is None:
+      raise ValueError(
+          f"{type(part).__name__} has no lm_head module, which the chunked "
+          "loss applies to each chunk of hidden states"
+      )
+    chunked = loss_config.build(compile_config=job_config.compile)
+    chunked.set_lm_head(head)
+    part._skip_lm_head = True
+    self.loss_fn = chunked
+    logger.info(
+        "[sft] loss: ChunkedLossWrapper back in place of TPUTrainer's loss, "
+        "%d chunks",
+        chunked.num_chunks,
+    )
 
   # -- LoRA adapter saves ----------------------------------------------
   def _lora_modules(self) -> list[tuple[str, torch.nn.Module]]:
@@ -204,39 +250,54 @@ class SFTTPUTrainer(TPUTrainer):
     )
 
   def export_lora_adapter(self, step: int) -> str | None:
-    """Gather the adapter on every rank; rank 0 writes the PEFT files."""
-    state = ModelWrapper(self.model_parts).state_dict()
-    gathered: dict[str, torch.Tensor] = {}
-    for key in sorted(k for k in state if lora_mod.is_lora_key(k)):
-      value = state[key]
-      full = value.full_tensor() if isinstance(value, DTensor) else value
-      if self._rank == 0:
-        gathered[key] = full.detach().to("cpu", torch.float32)
-      del full
-    out = None
-    if self._rank == 0:
-      tensors = lora_mod.peft_adapter_state_dict(
-          gathered, adapter=self.checkpointer.sd_adapter
+    """Write this step's LoRA adapter as PEFT files. Collective.
+
+    All ranks must call it with the same ``step``: DTensor adapter weights are
+    materialized with ``full_tensor()``, key by key in sorted order. Rank 0
+    keeps float32 CPU copies, renames them to PEFT keys through the
+    checkpointer's state-dict adapter and writes
+    ``<dump_folder>/lora_adapter/step-<step>``; the other ranks drop every
+    materialized tensor before the next one. All ranks then meet at a
+    barrier, so none returns before the files exist.
+
+    Returns the directory on rank 0 and None elsewhere.
+    """
+    model_state = ModelWrapper(self.model_parts).state_dict()
+    is_writer = self._rank == 0
+    cpu_adapter: dict[str, torch.Tensor] = {}
+    for key in sorted(filter(lora_mod.is_lora_key, model_state)):
+      shard = model_state[key]
+      whole = shard.full_tensor() if isinstance(shard, DTensor) else shard
+      if is_writer:
+        cpu_adapter[key] = whole.detach().to(
+            device="cpu", dtype=torch.float32, copy=True
+        )
+      del whole
+    written: str | None = None
+    if is_writer:
+      peft_tensors = lora_mod.peft_adapter_state_dict(
+          cpu_adapter, adapter=getattr(self.checkpointer, "sd_adapter", None)
       )
-      target = Path(self.config.dump_folder) / "lora_adapter" / f"step-{step}"
-      out = str(
-          lora_mod.save_peft_adapter(
-              target,
-              tensors,
-              options=self._lora_options,
-              base_model_name_or_path=str(self.config.hf_assets_path),
-          )
+      out_dir = Path(self.config.dump_folder) / "lora_adapter" / f"step-{step}"
+      released_weights = str(self.config.hf_assets_path)
+      lora_options = self._lora_options
+      saved_dir = lora_mod.save_peft_adapter(
+          out_dir,
+          peft_tensors,
+          options=lora_options,
+          base_model_name_or_path=released_weights,
       )
-      self.lora_exports.append(out)
+      written = str(saved_dir)
+      self.lora_exports.append(written)
       logger.info(
-          "[sft] step=%d LoRA adapter (%d tensors) -> %s",
+          "[sft] step %d: PEFT adapter, %d tensors, saved under %s",
           step,
-          len(tensors),
-          out,
+          len(peft_tensors),
+          written,
       )
     if dist.is_initialized():
       dist.barrier()
-    return out
+    return written
 
   # -- held-out loss ------------------------------------------------------
   def _setup_validation(self, config: Any) -> None:
@@ -439,7 +500,12 @@ class SFTTPUTrainer(TPUTrainer):
     self._last_grad_norm = grad_norm
     return grad_norm
 
-  def forward_backward_step(self, *, input_dict, global_valid_tokens):
+  def forward_backward_step(
+      self,
+      *,
+      input_dict: dict[str, Any] | list[dict[str, Any]],
+      global_valid_tokens: torch.Tensor,
+  ) -> torch.Tensor:
     if self._fault_kill_step and self.step == self._fault_kill_step:
       # Test hook (SFT_FAULT_KILL_STEP): a hard crash on every rank after
       # this step's batches were drawn and before any state is saved.
@@ -452,7 +518,8 @@ class SFTTPUTrainer(TPUTrainer):
         handler.flush()
       os.kill(os.getpid(), signal.SIGKILL)
     loss = super().forward_backward_step(
-        input_dict=input_dict, global_valid_tokens=global_valid_tokens
+        input_dict=input_dict,
+        global_valid_tokens=global_valid_tokens,
     )
     detached = loss.detach()
     self._step_loss = (
@@ -460,10 +527,11 @@ class SFTTPUTrainer(TPUTrainer):
     )
     return loss
 
-  def train_step(self, data_iterator):
+  def train_step(self, data_iterator: Iterator[dict[str, Any]]):
     self._maybe_validate(before_step=True)
-    if hasattr(self.dataloader, "microbatches_for_step"):
-      self.gradient_accumulation_steps = self.dataloader.microbatches_for_step()
+    if isinstance(self.dataloader, MicrobatchesPerStep):
+      per_step = self.dataloader.microbatches_for_step()
+      self.gradient_accumulation_steps = per_step
     before = getattr(self.dataloader, "stats", None)
     snapshot = (
         (before.documents, before.tokens, before.valid_tokens)
@@ -479,7 +547,7 @@ class SFTTPUTrainer(TPUTrainer):
     self._last_grad_norm = None
     result = super().train_step(data_iterator)
     stats = getattr(self.dataloader, "stats", None)
-    record: dict[str, Any] = {"step": self.step}
+    record: dict[str, Any] = dict(step=self.step)
     if self._step_loss is not None:
       # This rank's share of the step's global mean loss (the shares of
       # all data-parallel ranks sum to it). The trainer already reads the
@@ -536,13 +604,29 @@ class SFTTPUTrainer(TPUTrainer):
       handle.write(json.dumps(line, sort_keys=True) + "\n")
 
 
-def start_trainer(train_config: Any) -> None:
-  original = native_train.TPUTrainer
-  native_train.TPUTrainer = SFTTPUTrainer  # type: ignore[assignment]
+@contextlib.contextmanager
+def tpu_trainer_class(trainer_cls: type[TPUTrainer]) -> Iterator[None]:
+  """Have upstream's TPU launcher build ``trainer_cls`` inside the block.
+
+  ``torchtitan.experiments.tpu.train.start_trainer`` constructs whatever
+  class that module's global ``TPUTrainer`` names at the moment it runs. The
+  global is rebound for the duration of the block and handed back to
+  upstream's class on every way out (return, exception, KeyboardInterrupt),
+  so other code in the process keeps seeing ``TPUTrainer``.
+  """
+  module_globals = vars(tpu_entry)
+  upstream_cls = module_globals["TPUTrainer"]
+  module_globals["TPUTrainer"] = trainer_cls
   try:
-    native_train.start_trainer(train_config)
+    yield
   finally:
-    native_train.TPUTrainer = original  # type: ignore[assignment]
+    module_globals["TPUTrainer"] = upstream_cls
+
+
+def start_trainer(train_config: TPUTrainerConfig) -> None:
+  """Upstream's TPU training launch with ``SFTTPUTrainer`` as the trainer."""
+  with tpu_trainer_class(SFTTPUTrainer):
+    tpu_entry.start_trainer(train_config)
 
 
 if __name__ == "__main__":
