@@ -198,4 +198,6 @@ the save flush and the resume-check hooks.
 Muse Spark port), the tests also cover a transformers round trip with
 bit-identical logits, parity with the PEFT library's merge, DCP -> HF export of
 the Muse Spark port, and bit-exact resume of the Muse Spark port (full
-parameter, tuned I/O, LoRA adapter-only).
+parameter, tuned I/O, LoRA adapter-only). On a machine without TorchTPU the
+runner imports the TPU modules these checks need through the shared CPU
+stand-in `torchtitan/experiments/tpu/tests/cpu_stubs`, if the tree has it.
