@@ -65,7 +65,6 @@ from torchtitan.experiments.tpu.tpu_job_config import (
     TPUTrainerConfig,
     TpuTrainerCompileConfig,
 )
-from torchtitan.protocols.state_dict_adapter import StateDictAdapter
 from torch.distributed.checkpoint import HuggingFaceStorageReader
 
 def _install_hbm_logger() -> None:
@@ -445,41 +444,13 @@ def _slot_to_logical(model_config):
 
 
 class FastSparkAdapter(_sda.MuseSparkStateDictAdapter):
-  """The port's adapter with the fast reader (expert placement aware)."""
+  """The Muse Spark HF adapter with the fast reader (expert placement aware).
 
-  def get_hf_storage_reader(self, path, from_quantized=False):
-    return _fast_reader(path, from_quantized, _slot_to_logical(self.model_config))
-
-
-def _is_lora_key(key: str) -> bool:
-  return ".lora_a." in key or ".lora_b." in key
-
-
-class LoRATolerantSparkAdapter(_sda.MuseSparkStateDictAdapter):
-  """The port's strict HF adapter, minus the LoRA adapter weights.
-
-  The released checkpoint has no LoRA tensors; they keep their initialization
-  (A random, B zero) and the checkpointer loads the model non-strictly.
+  Serves LoRA and full-parameter recipes alike: the base adapter leaves LoRA
+  adapter weights out of its checks and of ``to_hf``. The released checkpoint
+  has no LoRA tensors; they keep their initialization (A random, B zero) and
+  the checkpointer loads the model non-strictly.
   """
-
-  def __init__(self, model_config, hf_assets_path):
-    StateDictAdapter.__init__(self, model_config, hf_assets_path)
-    self.num_layers = len(model_config.layers)
-    self.from_hf_map = _sda._build_from_hf_map(model_config)
-    self.to_hf_map = {tt: hf for hf, tt in self.from_hf_map.items()}
-    self.moe_layers = [i for i, layer in enumerate(model_config.layers) if layer.moe is not None]
-    self.expected_hf_keys = set(_sda.hf_text_keys_for_config(model_config))
-    with torch.device("meta"):
-      model = model_config.build()
-    self.expected_model_shapes = {
-        k: tuple(v.shape) for k, v in model.state_dict().items() if not _is_lora_key(k)
-    }
-    del model
-    if hf_assets_path:
-      self._check_index(hf_assets_path)
-
-  def to_hf(self, state_dict):
-    return super().to_hf({k: v for k, v in state_dict.items() if not _is_lora_key(k)})
 
   def get_hf_storage_reader(self, path, from_quantized=False):
     return _fast_reader(path, from_quantized, _slot_to_logical(self.model_config))
@@ -527,9 +498,7 @@ def _base(*, lora: bool, load_hf: bool) -> TPUTrainerConfig:
       [LoRAConverter.Config(rank=16, alpha=32.0, target_modules=list(LORA_TARGETS))] if lora else []
   )
   spec = model_registry("816B-A42B", seq_len=SEQ_LEN, converters=converters)
-  spec = dataclasses.replace(
-      spec, state_dict_adapter=LoRATolerantSparkAdapter if lora else FastSparkAdapter
-  )
+  spec = dataclasses.replace(spec, state_dict_adapter=FastSparkAdapter)
   cfg = TPUTrainerConfig(
       loss=CrossEntropyLoss.Config(),
       hf_assets_path="/mnt/model",

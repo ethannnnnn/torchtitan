@@ -60,8 +60,7 @@ class StepRecipesTest(unittest.TestCase):
     else:
       self.assertTrue(splash.use_splash_attention_kernel)
     self.assertTrue(cfg.parallelism.use_simple_fsdp)
-    adapter = recipes.LoRATolerantSparkAdapter if lora else recipes.FastSparkAdapter
-    self.assertIs(cfg.model_spec.state_dict_adapter, adapter)
+    self.assertIs(cfg.model_spec.state_dict_adapter, recipes.FastSparkAdapter)
     self.assertEqual(cfg.checkpoint.initial_load_in_hf, load_hf)
     self.assertEqual(cfg.training.mixed_precision_reduce, "float32" if lora else "bfloat16")
     self.assertIsInstance(cfg.loss, PallasCrossEntropyLoss.Config)
@@ -98,6 +97,19 @@ class StepRecipesTest(unittest.TestCase):
     with self.subTest(name="spark_816b_lora_64chip_megablox_random"):
       self._check("spark_816b_lora_64chip_megablox_random", lora=True, load_hf=False, rows=1,
                   gmm_v2=False)
+
+  def test_adapter_builds_on_the_lora_and_full_models(self):
+    """The base adapter's constructor checks the 62-layer model (LoRA keys excluded); fast reader."""
+    from torchtitan.experiments.tpu.muse_spark import spark_64chip_recipes as recipes
+
+    for name in ("spark_816b_lora_64chip_random", "spark_816b_full_64chip_random"):
+      with self.subTest(name=name):
+        cfg = getattr(recipes, name)()
+        adapter = cfg.model_spec.state_dict_adapter(cfg.model_spec.model, None)
+        self.assertEqual(len(adapter.moe_layers), 62)
+        self.assertFalse(adapter.permutes_experts)
+        self.assertFalse(any(".lora_" in key for key in adapter.expected_model_shapes))
+        self.assertIsInstance(adapter.get_hf_storage_reader(self.tmp), recipes.FastHFStorageReader)
 
   def test_fast_reader_reads_permuted_expert_rows(self):
     import types
