@@ -30,7 +30,7 @@ TOKENIZER_FILES = (
 )
 
 # Kept in float32 in the debug checkpoint, as in released Qwen3.5 checkpoints.
-FLOAT32_SUFFIXES = (".linear_attn.A_log", ".linear_attn.norm.weight")
+FLOAT32_KEY_SUFFIXES = (".linear_attn.A_log", ".linear_attn.norm.weight")
 
 
 def free_port() -> int:
@@ -76,38 +76,55 @@ def debug_model_spec(seq_len: int = 512):
   )
 
 
+# The single shard of the debug checkpoint. TorchTitan's state-dict adapters
+# read a shard number from every file name in the index, so it has one.
+DEBUG_SHARD = "model-00001-of-00001.safetensors"
+
+
+def _debug_dtype(hf_key: str) -> torch.dtype:
+  if hf_key.endswith(FLOAT32_KEY_SUFFIXES):
+    return torch.float32
+  return torch.bfloat16
+
+
+def _write_single_shard(
+    out: pathlib.Path, tensors: dict[str, torch.Tensor]
+) -> None:
+  """``DEBUG_SHARD`` plus a Hugging Face index mapping every key to it."""
+  from safetensors.torch import save_file
+
+  save_file(tensors, str(out / DEBUG_SHARD), metadata={"format": "pt"})
+  index = {"metadata": {}, "weight_map": dict.fromkeys(tensors, DEBUG_SHARD)}
+  index_path = out / "model.safetensors.index.json"
+  index_path.write_text(json.dumps(index, indent=2))
+
+
 def make_debug_checkpoint(
     out: pathlib.Path, tokenizer_dir: pathlib.Path
 ) -> dict[str, torch.Tensor]:
-  """Random TPU Qwen3.5 debug-model weights in the Hugging Face layout of
-  its state-dict adapter, plus the tokenizer files of ``tokenizer_dir`` (a
-  Muse Spark tokenizer fits the 248320-row vocabulary) except its chat
-  template (see ``TOKENIZER_FILES``)."""
-  from safetensors.torch import save_file
+  """Random weights of the debug model, saved as a Hugging Face checkpoint.
 
-  out.mkdir(parents=True, exist_ok=True)
+  Seeding torch with 0 right before the model is built and initialized makes
+  the weights the same in every call and process. They are stored under
+  Hugging Face names, in bfloat16 except for the float32 families of
+  ``FLOAT32_KEY_SUFFIXES``, with the files of ``TOKENIZER_FILES`` that exist
+  in ``tokenizer_dir`` copied alongside. Returns the tensors as written.
+  """
+  os.makedirs(out, exist_ok=True)
   spec = debug_model_spec()
   torch.manual_seed(0)
   model = spec.model.build()
   model.init_states(buffer_device=None)
-  adapter = spec.state_dict_adapter(spec.model, None)
-  hf = {
-      k: v.detach().clone().contiguous()
-      for k, v in adapter.to_hf(model.state_dict()).items()
+  to_hf = spec.state_dict_adapter(spec.model, None).to_hf
+  written = {
+      key: tensor.detach().clone().contiguous().to(_debug_dtype(key))
+      for key, tensor in to_hf(model.state_dict()).items()
   }
-  hf = {
-      k: (v.float() if k.endswith(FLOAT32_SUFFIXES) else v.to(torch.bfloat16))
-      for k, v in hf.items()
-  }
-  shard = "model.safetensors-00001-of-00001.safetensors"
-  save_file(hf, str(out / shard))
-  (out / "model.safetensors.index.json").write_text(
-      json.dumps({"metadata": {}, "weight_map": {k: shard for k in hf}})
-  )
-  for name in TOKENIZER_FILES:
-    if (tokenizer_dir / name).exists():
-      shutil.copy(tokenizer_dir / name, out / name)
-  return hf
+  _write_single_shard(out, written)
+  found = [n for n in TOKENIZER_FILES if (tokenizer_dir / n).is_file()]
+  for name in found:
+    shutil.copyfile(tokenizer_dir / name, out / name)
+  return written
 
 
 def debug_base_state(hf: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
@@ -116,21 +133,37 @@ def debug_base_state(hf: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
   return spec.state_dict_adapter(spec.model, None).from_hf(dict(hf))
 
 
+# torch.distributed env:// settings of a one-process group on this host.
+_SINGLE_RANK = (
+    ("RANK", "0"),
+    ("LOCAL_RANK", "0"),
+    ("WORLD_SIZE", "1"),
+    ("LOCAL_WORLD_SIZE", "1"),
+    ("MASTER_ADDR", "127.0.0.1"),
+)
+
+
 def single_rank_env() -> None:
-  """torch.distributed environment for one local rank."""
-  os.environ.update(
-      RANK="0",
-      LOCAL_RANK="0",
-      WORLD_SIZE="1",
-      LOCAL_WORLD_SIZE="1",
-      MASTER_ADDR="127.0.0.1",
-      MASTER_PORT=str(free_port()),
-  )
+  """Point torch.distributed at a fresh one-process group (env:// method).
+
+  Overwrites the variables of ``_SINGLE_RANK`` and ``MASTER_PORT``, a free
+  port picked anew on each call, and touches nothing else.
+  """
+  for name, value in (*_SINGLE_RANK, ("MASTER_PORT", str(free_port()))):
+    os.environ[name] = value
 
 
 def report(checks: dict[str, bool], tag: str) -> int:
+  """Print one ``OK`` or ``FAIL`` line per check, then the overall verdict.
+
+  Lines are flushed one by one, since they interleave with trainer logs.
+  Returns the process exit status: 0 if every check holds (no checks count
+  as holding), 1 otherwise.
+  """
   for name, ok in checks.items():
-    print(f"[{tag}] {'OK  ' if ok else 'FAIL'} {name}", flush=True)
+    marker = "OK" if ok else "FAIL"
+    print(f"[{tag}] {marker:<4} {name}", flush=True)
   passed = all(checks.values())
-  print(f"[{tag}] PASS" if passed else f"[{tag}] FAIL", flush=True)
+  verdict = "PASS" if passed else "FAIL"
+  print(f"[{tag}] {verdict}", flush=True)
   return 0 if passed else 1
