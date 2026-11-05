@@ -8,9 +8,11 @@
 
 from __future__ import annotations
 
+import importlib
 import json
 import os
 import random
+import sys
 import tempfile
 import types
 import unittest
@@ -132,6 +134,73 @@ class BalancedPlacementTest(unittest.TestCase):
           self.assertEqual(sorted(ep.load_expert_placement("file:" + path, 2)), ["0", "1"])
     finally:
       MetricsProcessor.log = original_log
+
+
+class ExpertGradReduceDtypeTest(unittest.TestCase):
+
+  def test_model_config_overrides_the_training_reduce_dtype(self):
+    training = types.SimpleNamespace(mixed_precision_reduce="float32")
+    model = nn.Module()
+    self.assertEqual(ep.expert_grad_reduce_dtype(model, training), "float32")
+    model.config = types.SimpleNamespace(ep_grad_reduce_dtype=None)
+    self.assertEqual(ep.expert_grad_reduce_dtype(model, training), "float32")
+    model.config.ep_grad_reduce_dtype = "bfloat16"
+    self.assertEqual(ep.expert_grad_reduce_dtype(model, training), "bfloat16")
+    training.mixed_precision_reduce = "bfloat16"
+    model.config.ep_grad_reduce_dtype = "float32"
+    self.assertEqual(ep.expert_grad_reduce_dtype(model, training), "float32")
+    model.config.ep_grad_reduce_dtype = "float16"
+    with self.assertRaises(ValueError):
+      ep.expert_grad_reduce_dtype(model, training)
+
+  def test_expert_data_parallel_reduces_in_that_dtype(self):
+    class Experts(nn.Module):
+      num_experts = 8
+
+    class RoutedExperts(nn.Module):
+      """Stands in for ``MuseSparkRoutedExperts``: only its ``inner_experts``."""
+
+      def __init__(self):
+        super().__init__()
+        self.inner_experts = Experts()
+
+    # Imported up front: patch.dict below drops modules first imported inside it.
+    importlib.import_module("torch.distributed.fsdp")
+    importlib.import_module("torchtitan.experiments.graph_trainer.simple_fsdp")
+    mesh = {"efsdp": types.SimpleNamespace(size=lambda: 2)}
+    parallel_dims = types.SimpleNamespace(
+        dp_replicate_enabled=False, ep=2, get_optional_mesh=lambda names: mesh
+    )
+
+    def policies(ep_grad_reduce_dtype, mixed_precision_reduce):
+      model = nn.Sequential(RoutedExperts(), RoutedExperts())
+      model.config = types.SimpleNamespace(ep_grad_reduce_dtype=ep_grad_reduce_dtype)
+      training = types.SimpleNamespace(
+          mixed_precision_param="bfloat16",
+          mixed_precision_reduce=mixed_precision_reduce,
+      )
+      seen = []
+
+      def data_parallel(module, mesh, mode, *, mp_policy, shard_dim):
+        del mesh, mode, shard_dim
+        seen.append((mp_policy.param_dtype, mp_policy.reduce_dtype))
+        return module
+
+      model_module = types.SimpleNamespace(MuseSparkRoutedExperts=RoutedExperts)
+      with mock.patch.dict(
+          sys.modules, {"torchtitan.experiments.tpu.muse_spark.model": model_module}
+      ), mock.patch(
+          "torchtitan.experiments.graph_trainer.simple_fsdp.data_parallel",
+          data_parallel,
+      ):
+        wrapped = ep.apply_expert_data_parallel(model, parallel_dims, training)
+      self.assertEqual(wrapped, 2)
+      return seen
+
+    bf16, fp32 = torch.bfloat16, torch.float32
+    self.assertEqual(policies(None, "float32"), [(bf16, fp32)] * 2)
+    self.assertEqual(policies("bfloat16", "float32"), [(bf16, bf16)] * 2)
+    self.assertEqual(policies("float32", "bfloat16"), [(bf16, fp32)] * 2)
 
 
 if __name__ == "__main__":

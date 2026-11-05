@@ -49,6 +49,7 @@ __all__ = [
     "EXPERT_PARAM_LAYOUT",
     "apply_expert_data_parallel",
     "configure_expert_parallel",
+    "expert_grad_reduce_dtype",
 ]
 
 # Dense in/out-dim placements of the canonical grouped-expert weights, only
@@ -247,13 +248,28 @@ def write_expert_placement(path: str, slot_to_logical: dict[str, list[int]], ep_
   os.replace(tmp, path)
 
 
+def expert_grad_reduce_dtype(model: nn.Module, training) -> str:
+  """Dtype name of the expert gradients' reduce-scatter over the ``efsdp`` ranks.
+
+  The model config's ``ep_grad_reduce_dtype`` ("bfloat16" or "float32") when
+  set, else ``training.mixed_precision_reduce`` like every other gradient.
+  """
+  override = getattr(getattr(model, "config", None), "ep_grad_reduce_dtype", None)
+  if override is None:
+    return training.mixed_precision_reduce
+  if override not in ("bfloat16", "float32"):
+    raise ValueError(f"ep_grad_reduce_dtype must be bfloat16 or float32, got {override!r}")
+  return override
+
+
 def apply_expert_data_parallel(model: nn.Module, parallel_dims, training) -> int:
   """SimpleFSDP for the EP-sharded expert weights over the ``efsdp`` ranks.
 
   ``apply_simple_fsdp`` does the same for plain ``TransformerBlock`` layers,
   but skips blocks wrapped by activation checkpointing; this walks the modules
   instead, so it works under any AC wrapper. Run it before
-  ``apply_simple_fsdp`` (which then leaves these modules alone).
+  ``apply_simple_fsdp`` (which then leaves these modules alone). The expert
+  gradients are reduced in ``expert_grad_reduce_dtype(model, training)``.
 
   Returns:
     The number of expert modules wrapped.
@@ -273,7 +289,7 @@ def apply_expert_data_parallel(model: nn.Module, parallel_dims, training) -> int
   mode = "hybrid_shard" if parallel_dims.dp_replicate_enabled else "fully_shard"
   mp_policy = MixedPrecisionPolicy(
       param_dtype=TORCH_DTYPE_MAP[training.mixed_precision_param],
-      reduce_dtype=TORCH_DTYPE_MAP[training.mixed_precision_reduce],
+      reduce_dtype=TORCH_DTYPE_MAP[expert_grad_reduce_dtype(model, training)],
   )
   count = 0
   for module in model.modules():
