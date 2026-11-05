@@ -4,7 +4,14 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""CPU tests for the measured expert placement (``expert_parallel`` utilities, ``expert_placement``)."""
+"""CPU tests for the measured expert placement (``expert_parallel`` utilities, ``expert_placement``).
+
+Importing the Muse Spark package imports TorchTPU (through the TPU trainer
+modules). Without TorchTPU, put the CPU stand-in first on the path:
+
+  PYTHONPATH=torchtitan/experiments/tpu/tests/cpu_stubs:. \\
+      python -m pytest torchtitan/experiments/tpu/muse_spark/tests/test_expert_placement.py
+"""
 
 from __future__ import annotations
 
