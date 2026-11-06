@@ -732,7 +732,7 @@ def _load_factory(spec: str) -> Callable[..., Any]:
 
 
 def _gcs():
-    """The ``gcs`` helpers of this package, or the copy next to this file (standalone use)."""
+    """Cloud Storage helpers: the package module, or the ``gcs.py`` beside this file when run as a script."""
     try:
         from torchtitan.experiments.tpu.checkpointing import gcs
     except Exception:  # noqa: BLE001 - standalone use
