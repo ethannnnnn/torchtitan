@@ -29,7 +29,7 @@ steps and after the last; finite training losses; run B restores run A's
 adapter exactly; each run used the reader it asked for, and both readers give
 the same held-out loss for that adapter.
 
-Start it from the repository root, with the TorchTPU CPU stand-in
+Launch it in the checkout's top folder, with the TorchTPU CPU stand-in
 (``torchtitan/experiments/tpu/tests/cpu_stubs``) ahead of the repository root
 on ``PYTHONPATH`` and ``TORCH_DEVICE_BACKEND_AUTOLOAD=0`` in the environment,
 which is how ``run_cpu.sh`` launches it::

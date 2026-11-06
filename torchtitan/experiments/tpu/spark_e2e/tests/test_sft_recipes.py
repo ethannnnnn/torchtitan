@@ -376,10 +376,11 @@ class PeftAdapterTest(unittest.TestCase):
         from torchtitan.experiments.tpu.spark_e2e.recipes import _lora, spark_model_spec
 
         with _clean_env():
-            spec = spark_model_spec("tiny-hf", 256, lora=_lora(), tpu_kernels=False)
+            model_spec = spark_model_spec("tiny-hf", 256, lora=_lora(), tpu_kernels=False)
+        model_config = model_spec.model
+        sd_adapter = model_spec.state_dict_adapter(model_config, None)
         with torch.device("meta"):
-            model = spec.model.build()
-        adapter = spec.state_dict_adapter(spec.model, None)
+            model = model_config.build()
         state = model.state_dict()
         lora_state = {key: value for key, value in state.items() if ".lora_" in key}
         peft_names = peft_adapter.to_peft_layout(lora_state, peft_adapter.spark_hf_module_name)
@@ -387,7 +388,7 @@ class PeftAdapterTest(unittest.TestCase):
         self.assertTrue(triples)
         self.assertEqual(len(peft_names), 2 * len(triples))
         for module, _, _ in triples:
-            mapped = list(adapter.to_hf({f"{module}.weight": state[f"{module}.weight"]}))
+            mapped = list(sd_adapter.to_hf({f"{module}.weight": state[f"{module}.weight"]}))
             self.assertEqual(len(mapped), 1, module)
             hf_module = mapped[0].removesuffix(".weight")
             self.assertEqual(peft_adapter.spark_hf_module_name(module), hf_module)

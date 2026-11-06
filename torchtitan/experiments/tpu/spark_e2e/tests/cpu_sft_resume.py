@@ -27,7 +27,7 @@ gradient norm, learning rate, the SHA-256 of every microbatch and its
 document ids); the final PEFT adapters are identical; the checkpoint holds
 only adapter tensors plus training state.
 
-Start it from the repository root, with the TorchTPU CPU stand-in
+Launch it in the checkout's top folder, with the TorchTPU CPU stand-in
 (``torchtitan/experiments/tpu/tests/cpu_stubs``) ahead of the repository root
 on ``PYTHONPATH`` and ``TORCH_DEVICE_BACKEND_AUTOLOAD=0`` in the environment,
 which is how ``run_cpu.sh`` launches it::
