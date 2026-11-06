@@ -21,10 +21,10 @@ ISSUER = "https://container.googleapis.com/v1/projects/example-project/locations
 
 
 def _token(claims: dict) -> str:
-    def part(obj) -> str:
-        return base64.urlsafe_b64encode(json.dumps(obj).encode()).decode().rstrip("=")
-
-    return f"{part({'alg': 'RS256'})}.{part(claims)}.signature"
+    segments = [
+        base64.urlsafe_b64encode(json.dumps(obj).encode()).decode().rstrip("=") for obj in ({"alg": "RS256"}, claims)
+    ]
+    return ".".join([*segments, "signature"])
 
 
 def _has_google_auth() -> bool:

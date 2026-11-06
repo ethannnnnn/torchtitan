@@ -13,6 +13,8 @@ import os
 import signal
 import tempfile
 import unittest
+from collections.abc import Iterator
+from typing import Any
 from unittest import mock
 
 import torch
@@ -65,7 +67,7 @@ class InstallTest(unittest.TestCase):
         def batch_generator(self, data_iterable):
             yield from data_iterable
 
-        def train_step(self, data_iterator):
+        def train_step(self, data_iterator: Iterator[dict[str, Any]]):
             self.drawn = [next(data_iterator) for _ in range(2)]
 
         def log(self, step, global_avg_loss, global_max_loss, grad_norm, extra_metrics=None):
