@@ -36,6 +36,36 @@ class BatchDigestTest(unittest.TestCase):
         renamed["tokens"] = renamed.pop("input")
         self.assertNotEqual(digest, resume_check.batch_sha256(renamed))
 
+    def test_pinned_digests(self):
+        """Fixed batches keep fixed digests: batch records stay comparable with those of earlier runs."""
+        digest = resume_check.batch_sha256
+        mixed = {
+            "input_ids": torch.arange(12, dtype=torch.int64).reshape(3, 4),
+            "labels": -torch.arange(12, dtype=torch.int32).reshape(3, 4),
+            "weights": torch.linspace(-2, 2, 12, dtype=torch.float32).to(torch.bfloat16).reshape(3, 4),
+            "mask": torch.tensor([[True, False, True, True]]),
+            "meta": "not hashed",
+            "count": 7,
+        }
+        mixed_sha = "a3af34137756a40c08d4e1698b26dea9f75273c7431d5ef8b3224096af305b91"
+        self.assertEqual(digest(mixed), mixed_sha)
+        self.assertEqual(digest(dict(reversed(list(mixed.items())))), mixed_sha)
+        self.assertEqual(digest({k: v for k, v in mixed.items() if isinstance(v, torch.Tensor)}), mixed_sha)
+        mixed["tokens"] = mixed.pop("input_ids")
+        self.assertEqual(digest(mixed), "f93a9e8bad938f7fa4f669d32542fbc0750d06a6d2f2a2993dca300083e0d102")
+        transposed = {"x": torch.arange(24, dtype=torch.float32).view(4, 6).t()}
+        self.assertEqual(digest(transposed), "1999691eb39a4bc979842a83ba5c76cf7e2193032f2d7c13432c22a0962b09d8")
+        odd_shapes = {
+            "scalar": torch.tensor(3.5, dtype=torch.float64),
+            "empty": torch.zeros(0, 5, dtype=torch.float16),
+            "f8": torch.linspace(-1, 1, 8).to(torch.float8_e4m3fn),
+        }
+        self.assertEqual(digest(odd_shapes), "8e18e6747275f1b9bf34ed4b79dbe4c656dee05d8e55dbee01996adce880afc7")
+        no_tensors = {"meta": "x", "count": 3}
+        self.assertEqual(digest(no_tensors), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+        needs_grad = {"w": torch.ones(2, 3, requires_grad=True) * 0.5}
+        self.assertEqual(digest(needs_grad), "9b3f5582c2cee9946e180b63598ed21f206b8a1dfe8695a45b4f7c625ed831ea")
+
 
 class InstallTest(unittest.TestCase):
     def setUp(self):
