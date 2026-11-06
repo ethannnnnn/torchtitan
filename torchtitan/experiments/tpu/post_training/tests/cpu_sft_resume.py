@@ -45,6 +45,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import importlib
+import itertools
 import json
 import os
 import shutil
@@ -140,33 +141,33 @@ def _batch_identity(record: dict) -> list[tuple]:
   )
 
 
-def _step_differences(rank: int, step: int, mine: dict, theirs: dict) -> list:
-  """Difference lines of one rank and step (``compare``'s format)."""
-  absent = (step not in mine, step not in theirs)
-  if any(absent):
-    return [f"rank {rank} step {step}: missing {absent}"]
-  left, right = mine[step], theirs[step]
-  lines = []
+def _field_value(record: dict, name: str):
+  """The part of a record's field that ``compare`` looks at: the microbatch
+  identities for ``batches``, the stored value (or None) for the others."""
+  return _batch_identity(record) if name == "batches" else record.get(name)
+
+
+def _step_lines(rank: int, step: int, mine: dict, theirs: dict):
+  """Yield ``compare``'s output for a single rank at a single step."""
+  lacking = (step not in mine, step not in theirs)
+  if True in lacking:
+    yield "rank %s step %s: missing %s" % (rank, step, lacking)
+    return
   for name in FIELDS:
-    if name == "batches":
-      a, b = _batch_identity(left), _batch_identity(right)
-    else:
-      a, b = left.get(name), right.get(name)
-    if a != b:
-      lines.append(f"rank {rank} step {step} {name}: {a!r} != {b!r}")
-  return lines
+    pair = (_field_value(mine[step], name), _field_value(theirs[step], name))
+    if pair[0] != pair[1]:
+      yield "rank %s step %s %s: %r != %r" % ((rank, step, name) + pair)
 
 
 def compare(a: dict, b: dict, steps) -> list[str]:
   """Every difference between two ``read_records`` results over ``steps``."""
-  import itertools
-
   if set(a) != set(b):
-    return [f"ranks differ: {sorted(a)} vs {sorted(b)}"]
-  found = []
-  for rank, step in itertools.product(sorted(a), steps):
-    found += _step_differences(rank, step, a[rank], b[rank])
-  return found
+    return ["ranks differ: %s vs %s" % (sorted(a), sorted(b))]
+  return [
+      line
+      for rank, step in itertools.product(sorted(a), steps)
+      for line in _step_lines(rank, step, a[rank], b[rank])
+  ]
 
 
 def checkpoint_keys(step_dir: Path) -> list[str]:

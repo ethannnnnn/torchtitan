@@ -49,8 +49,8 @@ def free_port() -> int:
       socket.socket(socket.AF_INET, socket.SOCK_STREAM)
   ) as probe:
     probe.bind((_LOOPBACK_HOST, 0))
-    _, port = probe.getsockname()
-  return port
+    host_and_port = probe.getsockname()
+  return host_and_port[1]
 
 
 def has_muse_spark() -> bool:
