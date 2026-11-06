@@ -5,7 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 """Muse Spark LoRA SFT recipes for the end-to-end stages. ASCII only.
 
-Built on ``post_training.config_registry`` (``_base_config``) and the chat
+Built on ``post_training.config_registry`` (``base_config``) and the chat
 SFT loader; the differences are the model spec (the Muse Spark HF adapter with
 the fast checkpoint reader, see ``lora_publish``) and per-stage geometry:
 
@@ -15,9 +15,12 @@ the fast checkpoint reader, see ``lora_publish``) and per-stage geometry:
   (``816B-A42B-2L``), bf16 weights; fits small slices.
 * ``s2_sft_full``: TPU, the full 62-layer model on one 64-chip slice.
 
-All of them train LoRA (rank 16, alpha 32) on the q/k/v/o projections over
-packed rows of chat records with assistant-only labels, keep LoRA-only
-checkpoints and export a PEFT adapter (``lora_publish.SparkSFTTrainer``).
+Every stage trains LoRA adapters (rank 16 and alpha 32 unless overridden) on
+the attention's query, key and value projections and on its output
+projection, feeds them packed rows of chat records in which only the
+assistant tokens carry labels, keeps nothing but the LoRA state in its
+checkpoints, and exports a PEFT adapter through the trainer,
+``lora_publish.SparkSFTTrainer``.
 
 Knobs that change between launches come from the environment (defaults in
 brackets) so that one registry serves local runs and pods:
@@ -58,13 +61,16 @@ from torchtitan.experiments.tpu.post_training.config_registry import (
     Parallel,
     Precision,
     TrainShape,
-    _base_config,
+    base_config,
 )
 from torchtitan.experiments.tpu.post_training.lora import LoRAOptions, apply_lora
 from torchtitan.experiments.tpu.post_training.sft_config import SFTConfig, SFTTrainerConfig, as_sft_config
 from torchtitan.experiments.tpu.post_training.sft_data import ChatSFTDataLoader
 
 from .lora_publish import FastReaderSparkAdapter
+
+# Upstream's -1: tokens per optimizer step = microbatch tokens x data-parallel degree x accumulated microbatches.
+DERIVED_STEP_TOKENS = -1
 
 
 def _env_int(name: str, default: int) -> int:
@@ -95,7 +101,7 @@ def sft_config(*, flavor: str, tpu: bool, shape: TrainShape, precision: Precisio
                hf_assets_path: str = "/mnt/model", microbatches_per_step: int = 1,
                max_documents_per_row: int = 8, seed: int = 42) -> SFTTrainerConfig:
     spec = spark_model_spec(flavor, shape.seq_len, lora=_lora(), tpu_kernels=tpu)
-    base = _base_config(
+    base = base_config(
         model_spec=spec,
         hf_assets_path=hf_assets_path,
         loss=ChunkedLossWrapper.Config(num_chunks=shape.num_chunks, loss_fn=CrossEntropyLoss.Config()),
@@ -109,7 +115,7 @@ def sft_config(*, flavor: str, tpu: bool, shape: TrainShape, precision: Precisio
         shape=shape,
         precision=precision,
         parallel=parallel,
-        num_tokens_per_train_step=-1,
+        num_tokens_per_train_step=DERIVED_STEP_TOKENS,
         checkpoint_interval=10**9,
         seed=seed,
     )

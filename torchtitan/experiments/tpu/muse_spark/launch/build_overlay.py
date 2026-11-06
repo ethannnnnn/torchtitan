@@ -16,8 +16,10 @@ This tool writes ``OUT_DIR/overlay.tar.gz`` (every file the candidate adds or
 changes relative to the base, deterministic: sorted, mode 0644 / 0755 or
 symlink as in git, mtime 0, gzip without a timestamp) and
 ``OUT_DIR/overlay.json`` (base and candidate commits and trees, the file list
-with git modes and blob ids, deleted paths, the archive's SHA-256 and size).
-Nothing is uploaded and nothing outside OUT_DIR is written.
+with git modes and blob ids, deleted paths, the archive's SHA-256 and size,
+and the candidate's blob ids of the launch files ``render.py`` copies into
+the manifest: the container entry point and the JobSet template). Nothing
+is uploaded and nothing outside OUT_DIR is written.
 
     python build_overlay.py --repo . --base <BASE_COMMIT> --candidate HEAD --out ./overlay
 """
@@ -39,6 +41,14 @@ MAX_OVERLAY_BYTES = 3 * 1024 * 1024
 """Compressed overlay limit: it travels in ConfigMaps (about 1 MiB each)."""
 FILE_MODES = {"100644": 0o644, "100755": 0o755, "120000": 0o777}
 SHA1 = re.compile(r"[0-9a-f]{40}")
+KIT_DIR = "torchtitan/experiments/tpu/muse_spark/launch"
+KIT_FILES = ("bootstrap.sh", "trainer_jobset.json.in")
+"""Launch files that render.py takes from its own directory into the rendered manifest."""
+
+
+def blob_id(data: bytes) -> str:
+    """The git blob id of ``data``."""
+    return hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
 
 
 def git(repo: Path, *args: str, binary: bool = False) -> str | bytes:
@@ -73,6 +83,18 @@ def changed_paths(repo: Path, base: str, candidate: str) -> tuple[list[dict], li
             raise ValueError(f"{path}: git mode {new_mode} (submodules and others are not supported)")
         changed.append({"path": path, "status": status, "mode": new_mode, "blob": new_blob})
     return sorted(changed, key=lambda f: f["path"]), sorted(deleted)
+
+
+def kit_blobs(repo: Path, commit: str) -> dict[str, str]:
+    """Blob ids of the launch files in ``commit``, whether or not the candidate changes them."""
+    blobs = {}
+    for name in KIT_FILES:
+        path = f"{KIT_DIR}/{name}"
+        found = subprocess.run(["git", "-C", str(repo), "rev-parse", "--verify", "-q", f"{commit}:{path}"],
+                               capture_output=True, text=True)
+        if found.returncode == 0:
+            blobs[path] = found.stdout.strip()
+    return blobs
 
 
 def build_archive(repo: Path, files: list[dict]) -> bytes:
@@ -115,6 +137,7 @@ def build(repo: Path, base: str, candidate: str, out: Path) -> dict:
         "candidate_commit": candidate_commit, "candidate_tree": candidate_tree,
         "sha256": hashlib.sha256(archive).hexdigest(), "bytes": len(archive),
         "files": files, "deleted": deleted,
+        "kit": kit_blobs(repo, candidate_commit),
         "method": "git diff-tree -r --no-renames BASE CANDIDATE; tar of the changed blobs (mtime 0, git modes), gzip -n",
     }
     (out / "overlay.json").write_text(json.dumps(manifest, indent=2) + "\n")
@@ -135,13 +158,21 @@ def load_manifest(directory: Path) -> tuple[dict, bytes]:
     return manifest, archive
 
 
-def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--repo", type=Path, default=Path("."), help="git checkout holding both commits")
-    ap.add_argument("--base", required=True, help="public base commit the pods fetch")
-    ap.add_argument("--candidate", default="HEAD", help="commit whose tree the pods must end up with")
-    ap.add_argument("--out", type=Path, required=True, help="new output directory")
-    args = ap.parse_args(argv)
+_OVERLAY_OPTIONS = (
+    ("--repo", {"type": Path, "default": Path("."),
+                "help": "git checkout that holds both commits (default: the current directory)"}),
+    ("--base", {"required": True, "help": "public base commit that every pod fetches before applying the overlay"}),
+    ("--candidate", {"default": "HEAD", "help": "commit whose tree the pods must end up with (default: HEAD)"}),
+    ("--out", {"type": Path, "required": True, "help": "output directory to create; it must not exist yet"}),
+)
+
+
+def main() -> int:
+    overlay_cli = argparse.ArgumentParser(
+        description="Package a candidate commit's changes against a public base as the pods' inline code overlay.")
+    for flag, settings in _OVERLAY_OPTIONS:
+        overlay_cli.add_argument(flag, **settings)
+    args = overlay_cli.parse_args()
     manifest = build(args.repo.resolve(), args.base, args.candidate, args.out)
     print(f"overlay: {len(manifest['files'])} files, {len(manifest['deleted'])} deletions, "
           f"{manifest['bytes']} bytes; base {manifest['base_commit']} -> tree {manifest['candidate_tree']}")

@@ -26,7 +26,7 @@
 #                          torch_tpu jax tokamax torchtitan.experiments.tpu.muse_spark, the config
 #                          module and the entry; export mode: the export module); a failed import
 #                          stops the pod with [SPARK:GATE]. SPARK_IMPORT_CHECK=0 skips the check,
-#                          SPARK_IMPORT_TIMEOUT_S bounds it (default 600).
+#                          SPARK_IMPORT_TIMEOUT_S bounds it (default 600; SIGKILL 30 s later).
 #   SPARK_DRY_RUN=1        print the trainer command instead of running it (local checks)
 #   NNODES, JOB_COMPLETION_INDEX, WORKERS_0_HOSTNAME   multi-host rendezvous
 # Outputs under SPARK_OUT: stdout-hostN.log, versions-hostN.json (package versions, code tree,
@@ -138,8 +138,8 @@ read -r -a IMPORTS <<< "${SPARK_IMPORT_MODULES:-$default_imports}"
 [[ "${SPARK_IMPORT_CHECK:-1}" == 1 ]] || IMPORTS=()
 IMPORT_TIMEOUT_S=${SPARK_IMPORT_TIMEOUT_S:-600}
 rc=0
-TORCH_DEVICE_BACKEND_AUTOLOAD=0 timeout "$IMPORT_TIMEOUT_S" "$TRAINER_PYTHON" - "$OUT/versions-$HOST.json" \
-  "${IMPORTS[@]}" <<'PY' || rc=$?
+TORCH_DEVICE_BACKEND_AUTOLOAD=0 timeout --signal=TERM --kill-after=30 "$IMPORT_TIMEOUT_S" \
+  "$TRAINER_PYTHON" - "$OUT/versions-$HOST.json" "${IMPORTS[@]}" <<'PY' || rc=$?
 import importlib, importlib.metadata as md, json, os, platform, sys, time
 versions = {"python": platform.python_version()}
 for name in ("torch", "torch_tpu", "libtpu", "jax", "jaxlib", "tokamax", "transformers", "safetensors"):
@@ -177,7 +177,7 @@ if imports:
 sys.exit(1 if failed else 0)
 PY
 if (( rc != 0 )); then
-  (( rc == 124 )) && echo "[SPARK:IMPORTS] the import check did not finish within $IMPORT_TIMEOUT_S s"
+  (( rc == 124 || rc == 137 )) && echo "[SPARK:IMPORTS] the import check did not finish within $IMPORT_TIMEOUT_S s"
   echo "[SPARK:GATE] import check failed (see [SPARK:IMPORTS] above; SPARK_IMPORT_CHECK=0 skips it)" >&2
   exit 5
 fi

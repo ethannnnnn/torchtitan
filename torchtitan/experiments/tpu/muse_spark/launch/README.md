@@ -26,11 +26,16 @@ account with read access to the runtime, model, and data prefixes and write
 access to the run prefix. The pods fetch the base commit from the public
 repository (`--base-repo`, default `https://github.com/google-pytorch/torchtitan.git`)
 and, with `--pip-overlay` and no `--pip-find-links`, wheels from PyPI, so
-they need outbound HTTPS. The template carries the labels used by dynamic
-slice provisioning (`x.tpu.cloud.google.com/slice-autoprovisioning`,
-`x.tpu.google.com/inject-slice-selector`) and
-`cloud.google.com/gke-accelerator-topology-mode: PROVISION_ONLY`; remove them
-if your cluster uses static TPU node pools.
+they need outbound HTTPS.
+
+By default the pods select existing TPU7x nodes of the slice shape
+(`cloud.google.com/gke-tpu-accelerator`, `cloud.google.com/gke-tpu-topology`).
+On a cluster that provisions the slice when the queue admits the JobSet,
+render with `--slice-provisioning dynamic`: it adds the JobSet label
+`x.tpu.cloud.google.com/slice-autoprovisioning: async`, the Job template label
+`x.tpu.google.com/inject-slice-selector: "true"` and the node selector
+`cloud.google.com/gke-accelerator-topology-mode: PROVISION_ONLY`, and nothing
+else. The receipt records the choice.
 
 ## Storage layout
 
@@ -48,10 +53,14 @@ No code goes to the bucket.
 
 `build_overlay.py` compares the candidate commit (your branch) with a public
 base commit and packs every file the candidate adds or changes; deletions are
-listed in the manifest. `render.py` splits the archive into ConfigMaps of at
-most 700 KiB (each stays under the 1 MiB ConfigMap limit; the overlay may be
-up to 3 MiB compressed) that every trainer pod mounts at `/mnt/overlay`. In
-each pod `bootstrap.sh`:
+listed in the manifest, together with the candidate's blob ids of
+`bootstrap.sh` and `trainer_jobset.json.in`. `render.py` splits the archive
+into ConfigMaps of at most 700 KiB (each stays under the 1 MiB ConfigMap
+limit; the overlay may be up to 3 MiB compressed) that every trainer pod
+mounts at `/mnt/overlay`. The container command is `render.py`'s own
+`bootstrap.sh` and the JobSet comes from its own template, so it refuses to
+render unless both files are the candidate's copies: render from a clean
+checkout of the candidate. In each pod `bootstrap.sh`:
 
 1. fetches the base commit (`git fetch --depth=1`) and checks its commit and
    tree ids;
@@ -60,11 +69,13 @@ each pod `bootstrap.sh`:
    and blob id against the manifest;
 4. stages the changed paths and compares `git write-tree` with the
    candidate's tree, and stops unless they are equal;
-5. starts `spark_pod.sh` from that tree.
+5. checks that the script it is running (the container command) is that
+   tree's `launch/bootstrap.sh`;
+6. starts `spark_pod.sh` from that tree.
 
-So the pods run exactly the candidate's tree, and the rendered manifest
-records which tree that is (`receipt.json`, JobSet annotations, and the
-`versions-hostN.json` of every host).
+So the pods run exactly the candidate's tree, entry script included, and the
+rendered manifest records which tree that is (`receipt.json`, JobSet
+annotations, and the `versions-hostN.json` of every host).
 
 ## Render and launch
 
@@ -83,12 +94,17 @@ bash ./rendered/own-configmaps.sh --context <KUBE_CONTEXT>
 
 `<BASE_COMMIT>` must be a commit the pods can fetch from `--base-repo` (for
 example the upstream commit your branch starts from). `trainer.json` is a
-`v1` List: the code ConfigMaps (`<RUN_NAME>-code-N`) followed by the JobSet,
-which stays suspended until the queue admits it. `own-configmaps.sh` looks up
-the new JobSet's uid and makes it the owner of those ConfigMaps, so Kubernetes
-deletes them together with the JobSet, whether you delete it
+`v1` List: the code ConfigMaps (`<RUN_NAME>-code-<RENDER_ID>-N`) followed by
+the JobSet, which stays suspended until the queue admits it. Every render has
+its own id (random, or `--render-id`; recorded in `receipt.json` and in the
+`muse-spark-render` label), so ConfigMaps left over from an earlier launch
+under the same run name are never mounted. `own-configmaps.sh` looks up the
+new JobSet and makes it the owner of those ConfigMaps, so Kubernetes deletes
+them together with the JobSet, whether you delete it
 (`kubectl delete jobset <RUN_NAME>`) or `ttlSecondsAfterFinished` removes it
-an hour after the run. If the script did not run, delete them by label:
+an hour after the run; it refuses a JobSet of another render (an old JobSet
+of the same name that still existed when you ran `kubectl create`). If the
+script did not run, delete the ConfigMaps by label:
 `kubectl delete configmap -l muse-spark-run=<RUN_NAME>`.
 
 `--mode` picks the entry point and the TorchTitan `--module`; `--entry` and
@@ -104,7 +120,8 @@ an hour after the run. If the script did not run, delete them by label:
 
 `--priority-class` sets the pod priority class when your operator requires
 one, `--label KEY=VALUE` adds labels to the JobSet, its pods and the
-ConfigMaps, and `--env KEY=VALUE` adds a trainer environment variable such as
+ConfigMaps (not the labels the kit sets itself), and `--env KEY=VALUE` adds a
+trainer environment variable such as
 the `SPARK_*` knobs of `spark_e2e/recipes.py` (variables the kit sets itself
 and names that look like credentials are rejected; use a Kubernetes Secret
 for tokens). TPU node boot disks often have only about 20 GB free, so the
@@ -171,7 +188,12 @@ python -m pip list --format=freeze --exclude pip > NAME-lock.txt
 #    add --extra-index-url https://download.pytorch.org/whl/cpu for the torch CPU wheel:
 python -m pip download --no-deps --only-binary=:all: --find-links ./given-wheels \
   -r NAME-lock.txt -d wheels
-# 3. Digest lists, and the digests of the lists for render.py (without system
+# 3. Optional system packages (for example the tcmalloc allocator, which
+#    runtime_install.sh preloads when present): the .deb files for the trainer
+#    image's distribution, with every dependency they need (dpkg -i installs
+#    exactly these files), e.g. in a container of that image:
+mkdir -p debs && (cd debs && apt-get update && apt-get download <PACKAGE>...)
+# 4. Digest lists, and the digests of the lists for render.py (without system
 #    packages, leave out debs/ and NAME-debs.sha256):
 (cd wheels && sha256sum *.whl) > NAME-wheels.sha256
 (cd debs && sha256sum *.deb) > NAME-debs.sha256

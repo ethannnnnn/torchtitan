@@ -138,24 +138,29 @@ def _install_ckpt_cache_drop() -> None:
 
   orig_save = CheckpointManager._save
 
-  def _save(self, curr_step, last_step=False):
+  def _settle_tpu_ranks(model_entry, step: int) -> None:
+    # Let all TPU ranks finish a written checkpoint together (see checkpointing/flush.py).
+    parts = getattr(model_entry, "model", None) or []
+    first = next((param for part in parts for param in part.parameters()), None)
+    if first is None or first.device.type != "tpu":
+      return
+    from torchtitan.experiments.tpu.checkpointing.flush import device_flush
+
+    waited = device_flush(first.device)
+    if int(os.environ.get("RANK", "0")) == 0:
+      print(f"[spark] checkpoint of step {step} is complete on every rank ({waited:.3f} s)", flush=True)
+
+  def _save(self, curr_step: int, last_step: bool = False) -> bool:
     saved = orig_save(self, curr_step, last_step)
-    model = self.states.get("model") if isinstance(getattr(self, "states", None), dict) else None
-    if saved and str(getattr(self.async_mode, "value", self.async_mode)) == "disabled" and model is not None:
-      model.cached_state_dict = {}
+    mode = getattr(self, "async_mode", None)
+    states = getattr(self, "states", None)
+    model_entry = states.get("model") if isinstance(states, dict) else None
+    if saved and str(getattr(mode, "value", mode)) == "disabled" and model_entry is not None:
+      model_entry.cached_state_dict = {}
       import gc
 
       gc.collect()
-      # Every rank leaves the save together (checkpointing/flush.py): otherwise ranks 1..N-1
-      # wait in DCP's last collective until rank 0's next readback, and hang if rank 0 dies first.
-      device = next((p.device for m in getattr(model, "model", []) for p in m.parameters()), None)
-      if device is not None and device.type == "tpu":
-        from torchtitan.experiments.tpu.checkpointing.flush import device_flush
-
-        seconds = device_flush(device)
-        if int(os.environ.get("RANK", "0")) == 0:
-          print(f"[spark] checkpoint step={curr_step}: every rank left the save (flush {seconds:.3f} s)",
-                flush=True)
+      _settle_tpu_ranks(model_entry, curr_step)
     return saved
 
   CheckpointManager._save = _save

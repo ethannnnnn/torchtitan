@@ -9,7 +9,8 @@
 # delivery). Checks the slice wiring, fetches the public base commit, applies
 # the code overlay carried by the mounted ConfigMaps (build_overlay.py), and
 # refuses to continue unless the resulting git tree is exactly the candidate's
-# tree. Then hands off to spark_pod.sh from that verified tree.
+# tree and this script is that tree's launch/bootstrap.sh. Then hands off to
+# spark_pod.sh from that verified tree.
 #
 # Inputs (environment, set by render.py): SPARK_BASE_REPO, SPARK_BASE_COMMIT,
 # SPARK_BASE_TREE, SPARK_CANDIDATE_TREE, SPARK_OVERLAY_SHA256, SPARK_OVERLAY_CHUNKS,
@@ -154,6 +155,22 @@ if [[ "$tree" != "$SPARK_CANDIDATE_TREE" ]]; then
   exit 5
 fi
 echo "[SPARK:CODE] base $SPARK_BASE_COMMIT + overlay = candidate tree $tree"
+
+# 4. The script running now must be the candidate's own copy: render.py puts
+#    launch/bootstrap.sh into the container command (bash -c), so compare the
+#    command with that file of the verified tree.
+entry="$SRC/torchtitan/experiments/tpu/muse_spark/launch/bootstrap.sh"
+if [[ -n "${BASH_EXECUTION_STRING:-}" ]]; then
+  running=$(printf '%s' "$BASH_EXECUTION_STRING" | sha256sum)
+elif [[ -f "${BASH_SOURCE[0]:-}" ]]; then
+  running=$(sha256sum < "${BASH_SOURCE[0]}")
+else
+  running=unknown
+fi
+if [[ ! -f "$entry" || "$(sha256sum < "$entry")" != "$running" ]]; then
+  echo "[SPARK:GATE] this entry script is not the candidate tree's launch/bootstrap.sh" >&2
+  exit 5
+fi
 [[ "${SPARK_BOOTSTRAP_ONLY:-0}" == 1 ]] && exit 0
 export SPARK_SRC_DIR=$SRC
 exec /bin/bash "$SRC/torchtitan/experiments/tpu/muse_spark/launch/spark_pod.sh"

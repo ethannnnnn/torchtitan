@@ -22,6 +22,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 import zipfile
 from pathlib import Path
@@ -60,12 +61,22 @@ def git(repo: Path, *args: str) -> str:
                           check=True, capture_output=True, text=True).stdout.strip()
 
 
+def add_kit(repo: Path, **suffixes: str) -> None:
+    """This checkout's launch files at their repository paths (render.py renders only the candidate's own
+    copies); ``suffixes`` maps a file name with ``_`` for ``.`` (e.g. bootstrap_sh) to text appended to it."""
+    for name in build_overlay.KIT_FILES:
+        target = repo / build_overlay.KIT_DIR / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text((LAUNCH / name).read_text() + suffixes.get(name.replace(".", "_"), ""))
+
+
 def make_repo(root: Path) -> tuple[Path, str, str]:
     """A repository with a base commit and a candidate commit that adds, changes, deletes,
-    changes a mode, adds a symlink and replaces a directory with a file."""
+    changes a mode, adds a symlink and replaces a directory with a file; both carry the launch files."""
     repo = root / "repo"
     repo.mkdir()
     subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    add_kit(repo)
     (repo / "keep.txt").write_text("unchanged\n")
     (repo / "change.py").write_text("x = 1\n")
     (repo / "drop.txt").write_text("deleted later\n")
@@ -123,6 +134,27 @@ def env_of(jobset: dict) -> dict:
     return {e["name"]: e.get("value") for e in pod_of(jobset)["containers"][0]["env"]}
 
 
+def kubelet_expand(text: str, env: dict[str, str]) -> str:
+    """Kubernetes' expansion of container commands and arguments: $(NAME) of a container variable becomes
+    its value, $$ becomes $, anything else stays."""
+    out, i = [], 0
+    while i < len(text):
+        if text[i] != "$" or i + 1 == len(text):
+            out.append(text[i])
+            i += 1
+        elif text[i + 1] == "$":
+            out.append("$")
+            i += 2
+        elif text[i + 1] == "(" and text.find(")", i + 2) != -1:
+            close = text.find(")", i + 2)
+            out.append(env.get(text[i + 2:close], text[i:close + 1]))
+            i = close + 1
+        else:
+            out.append(text[i:i + 2])
+            i += 2
+    return "".join(out)
+
+
 class OverlayTest(LaunchTestCase):
     def test_manifest_lists_changes_with_git_modes(self):
         files = {f["path"]: f for f in self.manifest["files"]}
@@ -134,6 +166,12 @@ class OverlayTest(LaunchTestCase):
         self.assertEqual(self.manifest["candidate_tree"], git(self.repo, "rev-parse", f"{self.candidate}^{{tree}}"))
         for item in files.values():
             self.assertEqual(item["blob"], git(self.repo, "rev-parse", f"{self.candidate}:{item['path']}"))
+        # The launch files are recorded although the candidate does not change them.
+        kit = {f"{build_overlay.KIT_DIR}/{name}" for name in build_overlay.KIT_FILES}
+        self.assertEqual(set(self.manifest["kit"]), kit)
+        for path, blob in self.manifest["kit"].items():
+            self.assertEqual(blob, git(self.repo, "rev-parse", f"{self.candidate}:{path}"))
+            self.assertNotIn(path, files)
 
     def test_archive_is_deterministic_and_checked(self):
         again = build_overlay.build(self.repo, self.base, self.candidate, self.tmp / "overlay-again")
@@ -200,6 +238,43 @@ class RenderTest(LaunchTestCase):
         self.assertEqual(command, (LAUNCH / "bootstrap.sh").read_text())
         self.assertEqual(maps[0]["metadata"]["labels"]["muse-spark-run"], "inline")
 
+    def test_every_render_has_its_own_configmaps(self):
+        """A relaunch under the same run name gets new ConfigMap objects, never an earlier render's."""
+        first, first_maps, first_receipt, _ = self._render("--mode", "e2e", "--run", "again", "--topology", "2x2x1",
+                                                           "--config", "s1_sft_trunc2")
+        second, second_maps, second_receipt, _ = self._render("--mode", "e2e", "--run", "again", "--topology",
+                                                              "2x2x1", "--config", "s1_sft_trunc2")
+        self.assertNotEqual(first_receipt["render_id"], second_receipt["render_id"])
+        for jobset, maps, receipt in ((first, first_maps, first_receipt), (second, second_maps, second_receipt)):
+            render_id = receipt["render_id"]
+            self.assertRegex(render_id, render.RENDER_ID)
+            names = [f"again-code-{render_id}-{i}" for i in range(len(maps))]
+            self.assertEqual([m["metadata"]["name"] for m in maps], names)
+            self.assertEqual(receipt["code"]["configmaps"], names)
+            sources = pod_of(jobset)["volumes"][0]["projected"]["sources"]
+            self.assertEqual([s["configMap"]["name"] for s in sources], names)
+            self.assertEqual(jobset["metadata"]["labels"]["muse-spark-render"], render_id)
+            self.assertTrue(all(m["metadata"]["labels"]["muse-spark-render"] == render_id for m in maps))
+        _, fixed, receipt, _ = self._render("--mode", "e2e", "--run", "again", "--topology", "2x2x1",
+                                            "--config", "s1_sft_trunc2", "--render-id", "r2d2")
+        self.assertEqual((receipt["render_id"], fixed[0]["metadata"]["name"]), ("r2d2", "again-code-r2d2-0"))
+
+    def _owner_script_run(self, script: Path, name: str, render_id: str) -> tuple[subprocess.CompletedProcess, list]:
+        """Runs own-configmaps.sh with a stand-in kubectl that records its arguments and reports a JobSet
+        with a fixed uid and the given render id."""
+        bindir = self.tmp / f"fake-kubectl-{name}"
+        bindir.mkdir()
+        calls = self.tmp / f"kubectl-calls-{name}.jsonl"
+        calls.write_text("")
+        (bindir / "kubectl").write_text(
+            f"#!{sys.executable}\nimport json, sys\n"
+            f"open({str(calls)!r}, 'a').write(json.dumps(sys.argv[1:]) + '\\n')\n"
+            f"if 'get' in sys.argv: print('0f0f0f0f-1111-2222-3333-444455556666 {render_id}', end='')\n")
+        (bindir / "kubectl").chmod(0o755)
+        result = subprocess.run(["bash", str(script), "--context", "example-context"], capture_output=True, text=True,
+                                env=dict(os.environ, PATH=f"{bindir}:{os.environ.get('PATH', '')}"), timeout=60)
+        return result, [json.loads(line) for line in calls.read_text().splitlines()]
+
     @unittest.skipIf(shutil.which("bash") is None, "bash not installed")
     def test_owner_script_hands_the_configmaps_to_the_jobset(self):
         jobset, maps, receipt, out = self._render("--mode", "e2e", "--run", "owned", "--topology", "2x2x1",
@@ -207,21 +282,10 @@ class RenderTest(LaunchTestCase):
         script = out / "own-configmaps.sh"
         self.assertEqual(receipt["code"]["configmap_owner_script"], script.name)
         subprocess.run(["bash", "-n", str(script)], check=True)
-        # A stand-in kubectl that records its arguments and knows the JobSet's uid.
-        bindir = self.tmp / "fake-kubectl"
-        bindir.mkdir()
-        calls = self.tmp / "kubectl-calls.jsonl"
-        (bindir / "kubectl").write_text(
-            f"#!{sys.executable}\nimport json, sys\n"
-            f"open({str(calls)!r}, 'a').write(json.dumps(sys.argv[1:]) + '\\n')\n"
-            "if 'get' in sys.argv: print('0f0f0f0f-1111-2222-3333-444455556666', end='')\n")
-        (bindir / "kubectl").chmod(0o755)
-        result = subprocess.run(["bash", str(script), "--context", "example-context"], capture_output=True, text=True,
-                                env=dict(os.environ, PATH=f"{bindir}:{os.environ.get('PATH', '')}"), timeout=60)
+        result, recorded = self._owner_script_run(script, "owned", receipt["render_id"])
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        recorded = [json.loads(line) for line in calls.read_text().splitlines()]
         self.assertEqual(recorded[0], ["--context", "example-context", "-n", "example-ns", "get", "jobset", "owned",
-                                       "-o", "jsonpath={.metadata.uid}"])
+                                       "-o", "jsonpath={.metadata.uid} {.metadata.labels.muse-spark-render}"])
         patched = []
         for call in recorded[1:]:
             self.assertEqual(call[:6], ["--context", "example-context", "-n", "example-ns", "patch", "configmap"])
@@ -231,10 +295,16 @@ class RenderTest(LaunchTestCase):
             self.assertEqual(owner, {"apiVersion": jobset["apiVersion"], "kind": "JobSet", "name": "owned",
                                      "uid": "0f0f0f0f-1111-2222-3333-444455556666"})
         self.assertEqual(patched, [m["metadata"]["name"] for m in maps])
+        # A JobSet of the same name from another render (it was not deleted before kubectl create): no patch.
+        result, recorded = self._owner_script_run(script, "other", "0ld0ld00")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn(f"comes from render '0ld0ld00', not {receipt['render_id']}", result.stderr)
+        self.assertEqual([call[4] for call in recorded], ["get"])
 
     def test_large_overlay_uses_several_configmaps(self):
         big = self.tmp / "big-repo"
         subprocess.run(["git", "init", "-q", str(big)], check=True)
+        add_kit(big)
         (big / "a.txt").write_text("a\n")
         git(big, "add", "-A")
         git(big, "commit", "-q", "-m", "base")
@@ -253,6 +323,94 @@ class RenderTest(LaunchTestCase):
         self.assertEqual(archive, (overlay / "overlay.tar.gz").read_bytes())
         self.assertEqual(env_of(jobset)["SPARK_OVERLAY_CHUNKS"], "3")
         self.assertEqual(len(receipt["code"]["configmaps"]), 3)
+
+    def _kit_overlay(self, name: str, base: dict, candidate: dict, *, keep_kit_record: bool = True) -> Path:
+        """An overlay whose base and candidate carry the launch files with the given suffixes (see add_kit)."""
+        repo = self.tmp / f"kit-{name}"
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        add_kit(repo, **base)
+        (repo / "a.txt").write_text("a\n")
+        git(repo, "add", "-A")
+        git(repo, "commit", "-q", "-m", "base")
+        base_commit = git(repo, "rev-parse", "HEAD")
+        add_kit(repo, **candidate)
+        (repo / "a.txt").write_text("b\n")
+        git(repo, "add", "-A")
+        git(repo, "commit", "-q", "-m", "candidate")
+        overlay = self.tmp / f"kit-{name}-overlay"
+        build_overlay.build(repo, base_commit, "HEAD", overlay)
+        if not keep_kit_record:  # as written by a build_overlay.py without the launch-file record
+            manifest = json.loads((overlay / "overlay.json").read_text())
+            del manifest["kit"]
+            (overlay / "overlay.json").write_text(json.dumps(manifest, indent=2) + "\n")
+        return overlay
+
+    def _refused(self, overlay: Path) -> str:
+        out = self.tmp / "never"
+        stderr = io.StringIO()
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(stderr):
+            render.main([*BASE_ARGS, "--mode", "e2e", "--run", "kit", "--topology", "2x2x1", "--config", "c",
+                         "--code-overlay", str(overlay), "--out", str(out)])
+        self.assertFalse(out.exists())
+        return stderr.getvalue()
+
+    def test_renders_only_with_the_candidates_entry_script_and_template(self):
+        # The candidate changes bootstrap.sh to this checkout's copy: the manifest's file entry matches.
+        changed = self._kit_overlay("changed", {"bootstrap_sh": "# older\n"}, {})
+        files = {f["path"] for f in json.loads((changed / "overlay.json").read_text())["files"]}
+        self.assertIn(f"{build_overlay.KIT_DIR}/bootstrap.sh", files)
+        _, _, receipt, _ = self._render("--mode", "e2e", "--run", "kit-ok", "--topology", "2x2x1", "--config", "c",
+                                        overlay=changed)
+        self.assertEqual(receipt["code"]["launch_files"],
+                         {f"{build_overlay.KIT_DIR}/{name}": build_overlay.blob_id((LAUNCH / name).read_bytes())
+                          for name in build_overlay.KIT_FILES})
+        # Without the launch-file record (an older build_overlay.py), the file entries still suffice when
+        # the candidate changes both files.
+        older = {"bootstrap_sh": "# older\n", "trainer_jobset_json_in": "\n"}
+        self._render("--mode", "e2e", "--run", "kit-old-manifest", "--topology", "2x2x1", "--config", "c",
+                     overlay=self._kit_overlay("changed-old", older, {}, keep_kit_record=False))
+        # A candidate whose entry script or template differs from the files render.py would use.
+        for name, suffixes in (("entry", {"bootstrap_sh": "# edited\n"}),
+                               ("template", {"trainer_jobset_json_in": "\n"})):
+            with self.subTest(differs=name):
+                self.assertIn("render from a clean checkout of the candidate",
+                              self._refused(self._kit_overlay(f"dirty-{name}", {}, suffixes)))
+        # Unchanged launch files and no launch-file record: the candidate's copies are unknown.
+        self.assertIn("does not record the candidate's",
+                      self._refused(self._kit_overlay("unknown", {}, {}, keep_kit_record=False)))
+
+    def test_the_kubelet_passes_the_command_on_unchanged(self):
+        jobset, _, _, _ = self._render("--mode", "e2e", "--run", "expand", "--topology", "2x2x2", "--config", "c",
+                                       "--env", "SPARK_STEPS=5")
+        command = pod_of(jobset)["containers"][0]["args"][0]
+        env = {name: "value" for name in env_of(jobset)}
+        self.assertEqual(kubelet_expand(command, env), command)
+        self.assertEqual(kubelet_expand("a $$ b $(NNODES) $(date) $(x", {"NNODES": "2"}), "a $ b 2 $(date) $(x")
+        render.check_command("n=$(nproc) h=$(hostname -s)", set(env))
+        for bad in ("echo $$", "echo $(NNODES)", "echo $$(date)"):
+            with self.subTest(command=bad), self.assertRaises(SystemExit):
+                render.check_command(bad, set(env))
+
+    def test_slice_provisioning(self):
+        """Default: existing node pools of the slice shape. dynamic adds exactly three settings."""
+        common = ("--mode", "e2e", "--run", "slices", "--topology", "4x4x4", "--config", "s2_sft_full",
+                  "--render-id", "same")
+        static, static_maps, static_receipt, _ = self._render(*common)
+        dynamic, dynamic_maps, dynamic_receipt, _ = self._render(*common, "--slice-provisioning", "dynamic")
+        self.assertEqual((static_receipt["slice_provisioning"], dynamic_receipt["slice_provisioning"]),
+                         ("static", "dynamic"))
+        self.assertEqual(pod_of(static)["nodeSelector"], {"cloud.google.com/gke-tpu-accelerator": "tpu7x",
+                                                          "cloud.google.com/gke-tpu-topology": "4x4x4"})
+        self.assertNotIn("metadata", static["spec"]["replicatedJobs"][0]["template"])
+        self.assertFalse([key for key in static["metadata"]["labels"] if key.startswith("x.tpu")])
+        added = json.loads(json.dumps(dynamic))
+        self.assertEqual(added["metadata"]["labels"].pop("x.tpu.cloud.google.com/slice-autoprovisioning"), "async")
+        self.assertEqual(added["spec"]["replicatedJobs"][0]["template"].pop("metadata"),
+                         {"labels": {"x.tpu.google.com/inject-slice-selector": "true"}})
+        self.assertEqual(pod_of(added)["nodeSelector"].pop("cloud.google.com/gke-accelerator-topology-mode"),
+                         "PROVISION_ONLY")
+        self.assertEqual(added, static)
+        self.assertEqual(dynamic_maps, static_maps)
 
     def test_priority_class_labels_work_size_and_extra_args(self):
         jobset, maps, _, _ = self._render("--mode", "sft", "--run", "t", "--topology", "2x2x1", "--config", "c",
@@ -318,6 +476,12 @@ class RenderTest(LaunchTestCase):
             ["--pip-overlay", "does/not/exist.txt"],
             ["--pip-find-links", "/mnt/runtime"],
             ["--code-overlay", "/nonexistent"],
+            ["--render-id", "Not-Valid"],
+            ["--render-id", "toolongid"],
+            ["--label", "muse-spark-run=other"],
+            ["--label", "muse-spark-render=other"],
+            ["--label", "x.tpu.cloud.google.com/slice-autoprovisioning=async"],
+            ["--slice-provisioning", "auto"],
         ]
         for override in bad:
             args = ["--mode", "sft", "--run", "ok", "--topology", "2x2x1", "--config", "c", *BASE_ARGS,
@@ -334,7 +498,7 @@ class RenderTest(LaunchTestCase):
         self.assertFalse((self.tmp / "never").exists())
 
     def test_templates_use_only_known_placeholders(self):
-        known = {"<RUN_NAME>", "<MODE>", "<ENTRY_MODULE>", "<CONFIG_MODULE>", "<CONFIG>", "<EXTRA_ARGS>",
+        known = {"<RUN_NAME>", "<RENDER_ID>", "<MODE>", "<ENTRY_MODULE>", "<CONFIG_MODULE>", "<CONFIG>", "<EXTRA_ARGS>",
                  "<TPU_TOPOLOGY>", "<BASE_REPO>", "<BASE_COMMIT>", "<BASE_TREE>", "<CANDIDATE_COMMIT>",
                  "<CANDIDATE_TREE>", "<OVERLAY_SHA256>", "<OVERLAY_CHUNKS>", "<OVERLAY_SOURCES>", "<BUDGET_S>",
                  "<DEADLINE_S>", "<NNODES>", "<GCS_BUCKET>", "<PREFIX>", "<MODEL_DIR>", "<DATA_DIR>",
@@ -396,7 +560,9 @@ class RenderTest(LaunchTestCase):
 class BootstrapTest(LaunchTestCase):
     """bootstrap.sh against a local base repository, with the ConfigMaps written out as the kubelet would."""
 
-    def _run(self, maps: list[dict], env: dict, name: str, **overrides) -> subprocess.CompletedProcess:
+    def _run(self, maps: list[dict], env: dict, name: str, command: str | None = None,
+             **overrides) -> subprocess.CompletedProcess:
+        """Runs bootstrap.sh as a file, or ``command`` with ``bash -c`` the way the container does."""
         root = self.tmp / name
         overlay_dir = root / "overlay"
         overlay_dir.mkdir(parents=True)
@@ -414,8 +580,8 @@ class BootstrapTest(LaunchTestCase):
                        SPARK_OVERLAY_DIR=str(overlay_dir), SPARK_BOOTSTRAP_ONLY="1",
                        PATH=f"{python_dir}:{os.environ.get('PATH', '')}")
         run_env.update(overrides)
-        return subprocess.run(["bash", str(LAUNCH / "bootstrap.sh")], env=run_env, capture_output=True, text=True,
-                              timeout=300)
+        argv = ["bash", str(LAUNCH / "bootstrap.sh")] if command is None else ["bash", "-c", command]
+        return subprocess.run(argv, env=run_env, capture_output=True, text=True, timeout=300)
 
     def _rendered(self, run: str, topology: str = "2x2x2"):
         jobset, maps, _, _ = self._render("--mode", "e2e", "--run", run, "--topology", topology,
@@ -454,6 +620,17 @@ class BootstrapTest(LaunchTestCase):
                 result = self._run(case_maps, env, f"bad-{name}", **overrides)
                 self.assertNotEqual(result.returncode, 0, name)
                 self.assertIn("[SPARK:GATE]", result.stderr + result.stdout, name)
+
+    def test_runs_only_as_the_candidates_entry_script(self):
+        git(self.repo, "config", "uploadpack.allowAnySHA1InWant", "true")
+        jobset, maps, env = self._rendered("boot-self")
+        command = pod_of(jobset)["containers"][0]["args"][0]
+        result = self._run(maps, env, "self-ok", command=command)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(f"= candidate tree {self.manifest['candidate_tree']}", result.stdout)
+        result = self._run(maps, env, "self-edited", command=command + "# edited after rendering\n")
+        self.assertEqual(result.returncode, 5, result.stdout + result.stderr)
+        self.assertIn("[SPARK:GATE] this entry script is not the candidate tree's launch/bootstrap.sh", result.stderr)
 
     def test_multi_host_needs_the_injected_process_addresses(self):
         _, maps, env = self._rendered("boot-hosts", topology="2x2x2")
@@ -569,6 +746,11 @@ class RuntimeInstallTest(unittest.TestCase):
         result = self._install("badpin", **bad)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("does not match its pin", result.stderr)
+        # A pinned system package list must exist: a missing list would skip the system packages silently.
+        result = self._install("nodebs", **pins, SPARK_RUNTIME_DEBS_SHA256="3" * 64)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("the system package list is pinned but", result.stderr)
+        self.assertNotIn("VERSION", result.stdout)
 
 
 @unittest.skipUnless(HAVE_BASH, "needs bash >= 4.4")
@@ -671,6 +853,19 @@ class SparkPodDryRunTest(unittest.TestCase):
         self.assertEqual(result.returncode, 5, result.stdout + result.stderr)
         self.assertIn("[SPARK:IMPORTS] the import check did not finish within 3 s", result.stdout)
         self.assertIn("python", self._versions())  # written before the imports
+
+    def test_import_check_kills_an_import_that_ignores_sigterm(self):
+        modules = self.tmp / "modules"
+        modules.mkdir()
+        (modules / "spark_stubborn_module_for_tests.py").write_text(
+            "import signal, time\nsignal.signal(signal.SIGTERM, signal.SIG_IGN)\ntime.sleep(600)\n")
+        start = time.monotonic()
+        result = self._run(SPARK_CONFIG="c", SPARK_IMPORT_MODULES="spark_stubborn_module_for_tests",
+                           SPARK_IMPORT_TIMEOUT_S="2",
+                           PYTHONPATH=os.pathsep.join(filter(None, [str(modules), os.environ.get("PYTHONPATH")])))
+        self.assertLess(time.monotonic() - start, 120)  # SIGTERM after 2 s is ignored; SIGKILL 30 s later
+        self.assertEqual(result.returncode, 5, result.stdout + result.stderr)
+        self.assertIn("[SPARK:IMPORTS] the import check did not finish within 2 s", result.stdout)
 
     def test_low_open_file_limit_is_reported(self):
         result = self._run(SPARK_CONFIG="c", wrapper="ulimit -Sn 1024 && ulimit -Hn 1024")

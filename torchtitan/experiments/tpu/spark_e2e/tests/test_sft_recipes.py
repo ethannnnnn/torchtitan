@@ -6,9 +6,9 @@
 """CPU checks for the end-to-end LoRA SFT recipes, the PEFT export and the tools. ASCII only.
 
 The recipe tests build trainer configs only (no model is instantiated); the
-TPU stages need TorchTPU or its import-only CPU stand-in on PYTHONPATH
-(``tests/tpu_import_stubs``, as ``run_cpu.sh`` sets it) and are skipped
-otherwise.
+TPU stages need TorchTPU or its CPU stand-in on PYTHONPATH
+(``torchtitan/experiments/tpu/tests/cpu_stubs``, as ``run_cpu.sh`` sets it)
+and are skipped otherwise.
 """
 from __future__ import annotations
 
@@ -204,70 +204,196 @@ def _spark_lora_model():
 
 
 class PeftAdapterTest(unittest.TestCase):
-    def test_export_layout_and_round_trip(self):
+    """``peft_adapter``: export, the adapter directory and import, on the stand-in model."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="spark-peft-"))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    @staticmethod
+    def _lora_values(model) -> dict[str, torch.Tensor]:
+        from torchtitan.components.checkpointer.utils import canonical_fqn
+
+        return {canonical_fqn(name): param.detach().clone()
+                for name, param in model.named_parameters() if ".lora_" in name}
+
+    def _assert_same_lora(self, expected: dict[str, torch.Tensor], actual: dict[str, torch.Tensor]):
+        self.assertEqual(sorted(expected), sorted(actual))
+        for name in expected:
+            self.assertTrue(torch.equal(expected[name], actual[name]), name)
+
+    def test_export_write_and_reload(self):
+        import re
+
         from safetensors.torch import load_file
         from torchtitan.experiments.tpu.spark_e2e import peft_adapter
 
-        model = _spark_lora_model()
-        spec = peft_adapter.adapter_spec_from_model(model)
-        self.assertEqual((spec.rank, spec.alpha, spec.scaling), (2, 4.0, 2.0))
-        tensors = peft_adapter.gather_peft_adapter([model], keep=True)
-        self.assertEqual(len(tensors), 16)
-        self.assertIn("base_model.model.model.language_model.layers.1.self_attn.k_proj.lora_B.weight", tensors)
-        self.assertTrue(all(t.dtype == torch.float32 for t in tensors.values()))
-        self.assertEqual(peft_adapter.gather_peft_adapter([model], keep=False), {})
-        tmp = Path(tempfile.mkdtemp(prefix="spark-peft-"))
-        try:
-            out = peft_adapter.save_peft_dir(tmp / "adapter", tensors, spec, base="/mnt/model", extra={"step": 3})
-            config = json.loads((out / "adapter_config.json").read_text())
-            self.assertEqual((config["r"], config["lora_alpha"], config["peft_type"]), (2, 4.0, "LORA"))
-            import re
+        torch.manual_seed(3)
+        trained = _spark_lora_model()
+        hyperparams = peft_adapter.lora_hyperparams_of(trained)
+        self.assertEqual((hyperparams.rank, hyperparams.alpha, hyperparams.scale), (2, 4.0, 2.0))
+        on_rank0, elsewhere = (peft_adapter.export_spark_adapter([trained], keep=keep) for keep in (True, False))
+        self.assertEqual(elsewhere, {})
+        self.assertEqual(len(on_rank0), 16)
+        self.assertEqual({t.dtype for t in on_rank0.values()}, {torch.float32})
+        self.assertIn("base_model.model.model.language_model.layers.1.self_attn.k_proj.lora_B.weight", on_rank0)
+        details = {"exported_at_step": 11}
+        adapter_dir = peft_adapter.write_spark_adapter_dir(
+            self.tmp / "exported", on_rank0, hyperparams, base_model_path="/models/tiny-spark", export_info=details)
+        config = json.loads((adapter_dir / "adapter_config.json").read_text())
+        self.assertEqual((config["r"], config["lora_alpha"], config["peft_type"], config["base_model_name_or_path"]),
+                         (2, 4.0, "LORA", "/models/tiny-spark"))
+        self.assertTrue(re.fullmatch(config["target_modules"], "model.language_model.layers.1.self_attn.v_proj"))
+        self.assertIsNone(re.fullmatch(config["target_modules"], "model.vision_tower.layers.1.self_attn.v_proj"))
+        self.assertEqual(json.loads((adapter_dir / "export_info.json").read_text()), details)
+        self.assertEqual(sorted(load_file(str(adapter_dir / "adapter_model.safetensors"))), sorted(on_rank0))
+        untrained = _spark_lora_model()
+        self.assertNotEqual([v.tolist() for v in self._lora_values(trained).values()],
+                            [v.tolist() for v in self._lora_values(untrained).values()])
+        self.assertEqual(peft_adapter.load_spark_adapter(untrained, adapter_dir)["tensors_copied"], 16)
+        self._assert_same_lora(self._lora_values(trained), self._lora_values(untrained))
 
-            pattern = re.compile(config["target_modules"])
-            self.assertTrue(pattern.fullmatch("model.language_model.layers.0.self_attn.q_proj"))
-            self.assertFalse(pattern.fullmatch("model.vision_tower.layers.0.self_attn.q_proj"))
-            self.assertEqual(json.loads((out / "export_info.json").read_text()), {"step": 3})
-            self.assertEqual(sorted(load_file(str(out / "adapter_model.safetensors"))), sorted(tensors))
-            fresh = _spark_lora_model()
-            info = peft_adapter.load_peft_into_model(fresh, out)
-            self.assertEqual(info["tensors"], 16)
-            for (name, a), (_, b) in zip(model.named_parameters(), fresh.named_parameters()):
-                if "lora_" in name:
-                    self.assertTrue(torch.equal(a, b), name)
-        finally:
-            shutil.rmtree(tmp, ignore_errors=True)
+    def test_config_file_bytes(self):
+        import re
 
-    def test_rejects_unmapped_or_unpaired_adapters(self):
         from torchtitan.experiments.tpu.spark_e2e import peft_adapter
 
-        mapping = peft_adapter.spark_module_map()
-        self.assertEqual(mapping("layers.12.attention.wo"), "model.language_model.layers.12.self_attn.o_proj")
-        with self.assertRaises(peft_adapter.AdapterError):
-            mapping("layers.0.feed_forward.w1")
-        with self.assertRaises(peft_adapter.AdapterError):
-            peft_adapter.lora_module_keys(["layers.0.attention.wo.lora_a.weight"])
-        self.assertEqual(peft_adapter.canonical_fqn("layers.0._checkpoint_wrapped_module.attention.wo.lora_a.weight"),
-                         "layers.0.attention.wo.lora_a.weight")
+        model = _spark_lora_model()
+        out = peft_adapter.write_spark_adapter_dir(
+            self.tmp / "bytes", peft_adapter.export_spark_adapter([model], keep=True),
+            peft_adapter.lora_hyperparams_of(model), base_model_path="base")
+        modules = [f"model.language_model.layers.{layer}.self_attn.{proj}_proj" for layer in "01" for proj in "koqv"]
+        expected = {"peft_type": "LORA", "task_type": "CAUSAL_LM", "r": 2, "lora_alpha": 4.0, "use_rslora": False,
+                    "lora_dropout": 0.0, "bias": "none", "fan_in_fan_out": False, "inference_mode": True,
+                    "target_modules": "^(?:" + "|".join(map(re.escape, modules)) + ")$",
+                    "base_model_name_or_path": "base"}
+        self.assertEqual((out / "adapter_config.json").read_text(), json.dumps(expected, indent=2))
+        self.assertFalse((out / "export_info.json").exists())
+
+    def test_target_modules_follow_plain_path_order(self):
+        import re
+
+        from torchtitan.experiments.tpu.spark_e2e import peft_adapter
+
+        paths = sorted(f"model.language_model.layers.{i}.self_attn.{p}_proj" for i in range(12) for p in "qkvo")
+        # Plain-text order: layer 1, then 10 and 11, then 2. Escaping first would put 10 ahead of 1.
+        self.assertEqual([int(path.split(".")[3]) for path in paths[::4]], [0, 1, 10, 11, 2, 3, 4, 5, 6, 7, 8, 9])
+        tensors = {f"base_model.model.{path}.lora_{ab}.weight": torch.zeros(2, 2)
+                   for path in reversed(paths) for ab in "AB"}
+        written = peft_adapter.write_spark_adapter_dir(
+            self.tmp / "twelve", tensors, peft_adapter.LoraHyperparams(2, 4.0))
+        text = (written / "adapter_config.json").read_text()
+        pattern = "^(?:" + "|".join(map(re.escape, paths)) + ")$"
+        self.assertEqual(text, json.dumps({**json.loads(text), "target_modules": pattern}, indent=2))
+
+    def test_module_names_and_pairing(self):
+        from torchtitan.experiments.tpu.spark_e2e import peft_adapter
+
+        self.assertEqual(peft_adapter.spark_hf_module_name("layers.5.attention.wo"),
+                         "model.language_model.layers.5.self_attn.o_proj")
+        self.assertEqual(peft_adapter.spark_hf_module_name("layers.12.attention.qkv_linear.wq"),
+                         "model.language_model.layers.12.self_attn.q_proj")
+        for path in ("layers.0.feed_forward.w1", "layers.x.attention.wo", "attention.wo"):
+            with self.subTest(path=path), self.assertRaises(peft_adapter.PeftAdapterError):
+                peft_adapter.spark_hf_module_name(path)
+        for label, keys in (("A without B", ["proj.lora_A.weight"]),
+                            ("both spellings", [f"proj.lora_{letter}.weight" for letter in "abAB"])):
+            with self.subTest(label), self.assertRaises(peft_adapter.PeftAdapterError):
+                peft_adapter.pair_lora_matrices(keys)
+        keys = ["z.lora_A.weight", "y.weight", "z.lora_B.weight", "a.lora_b.weight", "a.lora_a.weight",
+                "a.lora_a.weight", "a.lora_a.bias", "lora_a.weight"]
+        self.assertEqual(peft_adapter.pair_lora_matrices(keys),
+                         [("a", "a.lora_a.weight", "a.lora_b.weight"), ("z", "z.lora_A.weight", "z.lora_B.weight")])
+
+    def test_hyperparameter_checks(self):
+        from torchtitan.experiments.tpu.spark_e2e import peft_adapter
+
+        for rank, alpha in ((0, 8.0), (True, 8.0), (4, float("inf")), (4, float("nan")), (4, 0.0), (4, -2.0)):
+            with self.subTest(rank=rank, alpha=alpha), self.assertRaises(peft_adapter.PeftAdapterError):
+                peft_adapter.LoraHyperparams(rank, alpha)
+        self.assertEqual(peft_adapter.LoraHyperparams(16, 32.0, use_rslora=True).scale, 8.0)
+        plain = peft_adapter.LoraHyperparams(8, 24)
+        self.assertEqual((plain.alpha, plain.scale), (24, 3.0))
+        self.assertIs(type(plain.alpha), int)
+        with self.assertRaises(TypeError):
+            peft_adapter.LoraHyperparams(4, 8.0, scale=1.0)
+        with self.assertRaises(AttributeError):
+            plain.scale = 1.0
+
+    def test_renaming_checks(self):
+        from torchtitan.experiments.tpu.spark_e2e import peft_adapter
+
+        def matrices(**ranks: int) -> dict[str, torch.Tensor]:
+            out = {}
+            for module, rank in ranks.items():
+                out[f"{module}.lora_a.weight"] = torch.zeros(rank, 6)
+                out[f"{module}.lora_b.weight"] = torch.zeros(4, rank)
+            return out
+
+        def prefixed(module: str) -> str:
+            return "hf." + module
+
+        good = matrices(left=2, right=2)
+        renamed = peft_adapter.to_peft_layout(good, prefixed, hyperparams=peft_adapter.LoraHyperparams(2, 4.0))
+        self.assertEqual(list(renamed), [f"base_model.model.hf.{module}.lora_{ab}.weight"
+                                         for module in ("left", "right") for ab in "AB"])
+        self.assertIs(renamed["base_model.model.hf.left.lora_A.weight"], good["left.lora_a.weight"])
+        self.assertIs(renamed["base_model.model.hf.right.lora_B.weight"], good["right.lora_b.weight"])
+        cases = {
+            "ranks differ": (matrices(left=2, right=3), prefixed, None),
+            "rank differs from the hyperparameters": (good, prefixed, peft_adapter.LoraHyperparams(4, 8.0)),
+            "two modules on one HF path": (good, lambda module: "hf.same", None),
+            "empty HF path segment": (good, lambda module: "hf.." + module, None),
+            "matrices do not chain": ({**good, "right.lora_b.weight": torch.zeros(4, 3)}, prefixed, None),
+            "no pair at all": ({}, prefixed, None),
+        }
+        for label, (mats, namer, hyperparams) in cases.items():
+            with self.subTest(label), self.assertRaises(peft_adapter.PeftAdapterError):
+                peft_adapter.to_peft_layout(mats, namer, hyperparams=hyperparams)
+
+    def test_import_through_checkpoint_wrappers(self):
+        from torchtitan.experiments.tpu.spark_e2e import peft_adapter
+
+        class Checkpointed(torch.nn.Module):
+            def __init__(self, inner: torch.nn.Module):
+                super().__init__()
+                self._checkpoint_wrapped_module = inner
+
+        source = _spark_lora_model()
+        out = peft_adapter.write_spark_adapter_dir(
+            self.tmp / "wrapped", peft_adapter.export_spark_adapter([source], keep=True),
+            peft_adapter.lora_hyperparams_of(source))
+        target = _spark_lora_model()
+        for key in list(target.layers):
+            target.layers[key] = Checkpointed(target.layers[key])
+        self.assertTrue(any("._checkpoint_wrapped_module." in name for name, _ in target.named_parameters()))
+        self.assertEqual(peft_adapter.load_spark_adapter(target, out)["tensors_copied"], 16)
+        self._assert_same_lora(self._lora_values(source), self._lora_values(target))
 
     @unittest.skipUnless(HAVE_TPU_IMPORTS, "needs torch_tpu or the CPU import stub on PYTHONPATH")
-    def test_module_map_agrees_with_the_checkpoint_mapping(self):
-        """The export's HF module names equal what the model's state-dict adapter maps the base weights to."""
+    def test_export_names_follow_the_checkpoint_adapter(self):
         from torchtitan.experiments.tpu.spark_e2e import peft_adapter
         from torchtitan.experiments.tpu.spark_e2e.recipes import _lora, spark_model_spec
 
         with _clean_env():
-            spec = spark_model_spec("tiny-hf", 256, lora=_lora(), tpu_kernels=False)
-        adapter = spec.state_dict_adapter(spec.model, None)
-        mapping = peft_adapter.spark_module_map()
+            model_spec = spark_model_spec("tiny-hf", 256, lora=_lora(), tpu_kernels=False)
+        model_config = model_spec.model
+        sd_adapter = model_spec.state_dict_adapter(model_config, None)
         with torch.device("meta"):
-            model = spec.model.build()
-        keys = [k for k in model.state_dict() if k.endswith(".lora_a.weight")]
-        self.assertTrue(keys)
-        for key in keys:
-            module = key[: -len(".lora_a.weight")]
-            weight = dict(model.named_parameters())[f"{module}.weight"]
-            hf = adapter.to_hf({f"{module}.weight": torch.empty(weight.shape, device="meta")})
-            self.assertEqual(list(hf), [mapping(module) + ".weight"], module)
+            model = model_config.build()
+        state = model.state_dict()
+        lora_state = {key: value for key, value in state.items() if ".lora_" in key}
+        peft_names = peft_adapter.to_peft_layout(lora_state, peft_adapter.spark_hf_module_name)
+        triples = peft_adapter.pair_lora_matrices(lora_state)
+        self.assertTrue(triples)
+        self.assertEqual(len(peft_names), 2 * len(triples))
+        for module, _, _ in triples:
+            mapped = list(sd_adapter.to_hf({f"{module}.weight": state[f"{module}.weight"]}))
+            self.assertEqual(len(mapped), 1, module)
+            hf_module = mapped[0].removesuffix(".weight")
+            self.assertEqual(peft_adapter.spark_hf_module_name(module), hf_module)
+            self.assertIn(f"base_model.model.{hf_module}.lora_A.weight", peft_names)
+            self.assertIn(f"base_model.model.{hf_module}.lora_B.weight", peft_names)
 
 
 class FastReaderTest(unittest.TestCase):

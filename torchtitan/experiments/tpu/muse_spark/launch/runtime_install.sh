@@ -20,7 +20,8 @@
 #   SPARK_RUNTIME_NAME           file prefix (default runtime)
 #   SPARK_RUNTIME_LOCK_SHA256    SHA-256 of NAME-lock.txt (required)
 #   SPARK_RUNTIME_WHEELS_SHA256  SHA-256 of NAME-wheels.sha256 (required)
-#   SPARK_RUNTIME_DEBS_SHA256    SHA-256 of NAME-debs.sha256 (required when that file exists)
+#   SPARK_RUNTIME_DEBS_SHA256    SHA-256 of NAME-debs.sha256 (required when that file exists;
+#                                when set, the file must exist)
 #   SPARK_RUNTIME_VENV           target environment (default /opt/spark-runtime)
 #   SPARK_RUNTIME_WORK           local scratch (default /work/runtime)
 #   SPARK_TCMALLOC               allocator preloaded when present
@@ -40,6 +41,10 @@ spark_runtime_install() {
   mkdir -p "$work/wheels" "$work/debs"
   printf '%s  %s\n' "$SPARK_RUNTIME_LOCK_SHA256" "$lock" "$SPARK_RUNTIME_WHEELS_SHA256" "$wheels" \
     | sha256sum --quiet -c - || { echo "[SPARK:RUNTIME] lock or wheel list does not match its pin" >&2; return 3; }
+  if [[ -n "${SPARK_RUNTIME_DEBS_SHA256:-}" && ! -f "$debs" ]]; then
+    echo "[SPARK:RUNTIME] the system package list is pinned but $debs is missing" >&2
+    return 3
+  fi
   if [[ -f "$debs" ]]; then
     : "${SPARK_RUNTIME_DEBS_SHA256:?pin the system package list (render.py --runtime-debs-sha256)}"
     printf '%s  %s\n' "$SPARK_RUNTIME_DEBS_SHA256" "$debs" | sha256sum --quiet -c - \
