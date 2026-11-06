@@ -39,9 +39,10 @@ Environment: ``MUSE_SPARK_ATTN_TEST_SEQ`` (default 4096),
 ``MUSE_SPARK_ATTN_TEST_HEADS`` (default 16 query heads; KV heads = heads / 8).
 """
 
-import dataclasses
+import importlib.util
 import os
 import types
+import unittest
 
 from absl.testing import absltest
 from absl.testing import parameterized
@@ -49,7 +50,6 @@ import numpy as np
 import torch
 
 from torchtitan.experiments.tpu import base_device_test
-from torchtitan.experiments.tpu.tpu_job_config import SplashAttentionKernelConfig
 
 HEAD_DIM = 64
 QK_SCALE = 5.4730064863875
@@ -68,6 +68,14 @@ DOCS = {
 # inside that. The window / segment controls below exceed these by >100x
 # (max abs) or >50x (rel-L2).
 TOL = dict(out=1e-2, dq=1.5e-2, dk=1.5e-2, dv=1e-2)
+
+
+def _transformers_has_muse_spark():
+  """The reference needs Transformers >= 5.18 (``model_type="muse_spark"``)."""
+  try:
+    return importlib.util.find_spec("transformers.models.muse_spark") is not None
+  except ImportError:  # no transformers at all
+    return False
 
 
 def _doc_lens(seq):
@@ -161,14 +169,18 @@ def _splash_config(block_q=1024, block_kv=1024, block_kv_compute=512, **tokamax_
 SPARK_TOKAMAX = dict(block_q=512, block_kv=1024, block_kv_compute=512, use_base2_exp=False,
                      max_logit_const=0.0, num_stacked_q_heads=4, q_layout="SEQ_MINOR",
                      k_layout="SEQ_MINOR", v_layout="SEQ_MINOR")
-# The two Tokamax knobs above that are not plain block / layout settings; they
-# need the matching SplashAttentionKernelConfig fields (a separate change).
-SPARK_TOKAMAX_KNOBS = ("use_base2_exp", "max_logit_const")
 
 
 def _spark_tokamax_knobs_available():
-  fields = {f.name for f in dataclasses.fields(SplashAttentionKernelConfig)}
-  return all(f"sa_{knob}" in fields for knob in SPARK_TOKAMAX_KNOBS)
+  """Whether ``use_base2_exp`` / ``max_logit_const`` above reach the kernel.
+
+  They are not plain block / layout settings and need the matching
+  ``SplashAttentionKernelConfig`` fields (``tpu7x.SPLASH_KNOBS``).
+  """
+  # pylint: disable-next=g-import-not-at-top
+  from torchtitan.experiments.tpu.muse_spark import tpu7x
+
+  return tpu7x.splash_knobs_available()
 
 
 def _attend(path, q, k, v, positions, segment_ids, window, splash_cfg):
@@ -215,6 +227,10 @@ def _rel_l2(a, ref):
   return float(np.linalg.norm((a - ref).ravel()) / np.linalg.norm(ref.ravel()))
 
 
+@unittest.skipUnless(
+    _transformers_has_muse_spark(),
+    "needs Transformers >= 5.18 (model_type muse_spark) for the reference",
+)
 class MuseSparkSplashAttentionTest(base_device_test.BaseAcceleratorDeviceTest):
 
   def _run(self, path, layer, inp, window, splash_cfg=None, use_segments=True):

@@ -19,7 +19,7 @@ Checks:
 2. Tiny public checkpoint parity (``MUSE_SPARK_TINY_DIR`` =
    ``trl-internal-testing/tiny-MuseSparkForConditionalGeneration``).
 3. Truncated real dimensions (opt-in ``MUSE_SPARK_REAL_DIMS=1``; about
-   140 GB of host memory): the first two released layers (sliding + RoPE,
+   125 GB of host memory): the first two released layers (sliding + RoPE,
    full + NoPE) at hidden 8192, 128/16 heads, 256 experts of 4096x4096, the
    real vocabulary, a shrunk sliding window so that it is exercised; random
    weights shared by both models (the expert and embedding weights are frozen
@@ -31,8 +31,8 @@ Checks:
 
 Run: ``python -m pytest -q torchtitan/experiments/tpu/muse_spark/tests``. The
 package imports ``torch_tpu`` through ``tpu/muse_glimmer``; on a host without
-it, put the import stubs first on the path:
-``PYTHONPATH=torchtitan/experiments/tpu/muse_spark/tests/cpu_stubs:$PWD``.
+it, put its CPU import stand-in first on the path:
+``PYTHONPATH=torchtitan/experiments/tpu/tests/cpu_stubs:$PWD``.
 """
 
 from __future__ import annotations
@@ -356,7 +356,7 @@ class MuseSparkHFParityTest(unittest.TestCase):
     )
     print("tiny_checkpoint_parity", report)
 
-  @unittest.skipUnless(REAL_DIMS, "set MUSE_SPARK_REAL_DIMS=1 (~140 GB RAM)")
+  @unittest.skipUnless(REAL_DIMS, "set MUSE_SPARK_REAL_DIMS=1 (~125 GB RAM)")
   def test_truncated_real_dims_parity(self):
     args = MuseSparkArgs(num_hidden_layers=2, sliding_window=48)
     text = {
@@ -417,8 +417,9 @@ class MuseSparkTpuMoEKernelsTest(unittest.TestCase):
 
   ``model_registry`` applies ``TpuTokenDispatcherConverter`` and
   ``TpuGroupedExpertsConverter``; with Pallas off they must match the plain
-  model with the same BF16 grouped experts. Needs ``torch_tpu`` or the CPU
-  import stubs (``tests/cpu_stubs`` on ``PYTHONPATH``).
+  model with the same BF16 grouped experts. Needs ``torch_tpu`` or its CPU
+  import stand-in (``torchtitan/experiments/tpu/tests/cpu_stubs`` on
+  ``PYTHONPATH``).
   """
 
   @unittest.skipUnless(_tpu_moe_kernels_importable(), "needs torch_tpu or its CPU stubs")
@@ -603,6 +604,24 @@ class MuseSparkConfigTest(unittest.TestCase):
     with self.assertRaisesRegex(NotImplementedError, "expert_parallel.py"):
       MuseSparkStateDictAdapter(placed, None)
 
+  def test_ep_grad_reduce_dtype_reaches_the_built_model(self):
+    """None by default: the expert gradients follow the training reduce dtype.
+
+    Expert parallelism reads a recipe's override from the built model's
+    config, so the field must survive ``build``.
+    """
+    for flavor in ("debugmodel", "tiny-hf", "816B-A42B-2L", "816B-A42B"):
+      config = model_registry(flavor, tpu_moe_kernels=False).model
+      self.assertIsNone(config.ep_grad_reduce_dtype, flavor)
+      self.assertIn(
+          "ep_grad_reduce_dtype", {f.name for f in dataclasses.fields(config)}
+      )
+    config = model_registry("debugmodel", tpu_moe_kernels=False).model
+    config.ep_grad_reduce_dtype = "bfloat16"
+    with torch.device("meta"):
+      model = config.build()
+    self.assertEqual(model.config.ep_grad_reduce_dtype, "bfloat16")
+
 
 class ChatTemplateTest(unittest.TestCase):
   """TorchTitan's tokenizer must compile HF ``{% generation %}`` blocks.
@@ -636,6 +655,13 @@ class ChatTemplateTest(unittest.TestCase):
         [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "yo"}]
     )
     self.assertEqual(out, "<user>hi<assistant>yo")
+    # As in Transformers, a variable set inside the block keeps its outer
+    # value after it (the Muse Spark template sets several inside its blocks).
+    tok.set_chat_template(
+        "{% set x = 'outer' %}{% generation %}{% set x = 'inner' %}{{ x }}"
+        "{% endgeneration %}|{{ x }}"
+    )
+    self.assertEqual(tok.apply_chat_template([]), "inner|outer")
 
   @unittest.skipUnless(TINY_DIR and transformers is not None, "set MUSE_SPARK_TINY_DIR")
   def test_muse_spark_template_matches_transformers(self):

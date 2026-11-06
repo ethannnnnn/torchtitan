@@ -663,6 +663,11 @@ class MuseSparkModel(Decoder):
     # and ep_placement_degree records the EP degree they were permuted for.
     ep_expert_placement: str = "contiguous"
     ep_placement_degree: int = 1
+    # Dtype of the expert weights' gradient reduce-scatter over the efsdp
+    # ranks (expert parallelism > 1): None follows
+    # training.mixed_precision_reduce; "bfloat16" or "float32" overrides it
+    # for the EP-sharded experts only.
+    ep_grad_reduce_dtype: str | None = None
 
     def __post_init__(self) -> None:
       if self.enable_weight_tying:

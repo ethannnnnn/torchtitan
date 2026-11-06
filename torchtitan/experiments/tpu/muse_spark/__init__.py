@@ -56,7 +56,7 @@ def tpu_moe_converters() -> list[ModelConfigConverter.Config]:
   """The TPU MoE kernels used by the Qwen3.5 MoE TPU recipes.
 
   Imported lazily: the kernel modules import ``torch_tpu`` (CPU tests can use
-  the import stubs in ``tests/cpu_stubs``).
+  its import stand-in in ``torchtitan/experiments/tpu/tests/cpu_stubs``).
   """
   # pylint: disable=g-import-not-at-top
   from torchtitan.experiments.tpu.grouped_experts import TpuGroupedExpertsConverter

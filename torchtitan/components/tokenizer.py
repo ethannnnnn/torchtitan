@@ -46,6 +46,7 @@ class BaseTokenizer(ABC, Configurable):
 
         import jinja2
         import jinja2.ext
+        import jinja2.nodes
         import jinja2.sandbox
 
         def raise_exception(msg):
@@ -72,16 +73,19 @@ class BaseTokenizer(ABC, Configurable):
 
             Hugging Face chat templates (e.g. Muse Spark Open) mark assistant
             turns with this block so that Transformers can return an assistant
-            token mask; for plain rendering the block is a no-op.
+            token mask; for plain rendering the block is a no-op. As in
+            Transformers, the body is its own scope: a ``{% set %}`` inside
+            it does not change the variable outside.
             """
 
             tags = {"generation"}
 
             def parse(self, parser):
-                next(parser.stream)
-                return parser.parse_statements(
+                lineno = next(parser.stream).lineno
+                body = parser.parse_statements(
                     ("name:endgeneration",), drop_needle=True
                 )
+                return jinja2.nodes.Scope(body, lineno=lineno)
 
         env = jinja2.sandbox.ImmutableSandboxedEnvironment(
             trim_blocks=True,
