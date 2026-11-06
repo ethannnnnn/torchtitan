@@ -93,17 +93,25 @@ def run(args, name: str, dump: Path, *, kill_step: int = 0) -> dict:
   }
 
 
-def read_records(dump: Path) -> dict[int, dict[int, dict]]:
-  """{rank: {step: record}}; a later line for the same step wins."""
-  out: dict[int, dict[int, dict]] = {}
-  root = dump / "sft-records"
-  for path in sorted(root.glob("rank-*.jsonl")) if root.is_dir() else []:
-    rank = int(path.stem.split("-")[1])
-    for line in path.read_text().splitlines():
-      if line.strip():
-        rec = json.loads(line)
-        out.setdefault(rank, {})[int(rec["step"])] = rec
-  return out
+def read_records(dump) -> dict[int, dict[int, dict]]:
+  """``{rank: {step: record}}`` from ``<dump>/sft-records/rank-*.jsonl``.
+
+  Blank lines are skipped, a later line for a step replaces an earlier one,
+  and a file without records adds no rank.
+  """
+  import collections
+  import glob
+
+  pattern = os.path.join(dump, "sft-records", "rank-*.jsonl")
+  by_rank = collections.defaultdict(dict)
+  for name in sorted(glob.glob(pattern)):
+    rank = int(os.path.basename(name)[len("rank-") : -len(".jsonl")])
+    with open(name, encoding="utf-8") as lines:
+      for text in lines:
+        if text.strip():
+          row = json.loads(text)
+          by_rank[rank][row["step"]] = row
+  return dict(by_rank)
 
 
 FIELDS = (
@@ -132,27 +140,33 @@ def _batch_identity(record: dict) -> list[tuple]:
   )
 
 
-def compare(a: dict, b: dict, steps: range) -> list[str]:
-  diffs = []
-  if sorted(a) != sorted(b):
+def _step_differences(rank: int, step: int, mine: dict, theirs: dict) -> list:
+  """Difference lines of one rank and step (``compare``'s format)."""
+  absent = (step not in mine, step not in theirs)
+  if any(absent):
+    return [f"rank {rank} step {step}: missing {absent}"]
+  left, right = mine[step], theirs[step]
+  lines = []
+  for name in FIELDS:
+    if name == "batches":
+      a, b = _batch_identity(left), _batch_identity(right)
+    else:
+      a, b = left.get(name), right.get(name)
+    if a != b:
+      lines.append(f"rank {rank} step {step} {name}: {a!r} != {b!r}")
+  return lines
+
+
+def compare(a: dict, b: dict, steps) -> list[str]:
+  """Every difference between two ``read_records`` results over ``steps``."""
+  import itertools
+
+  if set(a) != set(b):
     return [f"ranks differ: {sorted(a)} vs {sorted(b)}"]
-  for rank in sorted(a):
-    for step in steps:
-      ra, rb = a[rank].get(step), b[rank].get(step)
-      if ra is None or rb is None:
-        diffs.append(
-            f"rank {rank} step {step}: missing ({ra is None}, {rb is None})"
-        )
-        continue
-      for field in FIELDS:
-        va, vb = (
-            (_batch_identity(ra), _batch_identity(rb))
-            if field == "batches"
-            else (ra.get(field), rb.get(field))
-        )
-        if va != vb:
-          diffs.append(f"rank {rank} step {step} {field}: {va!r} != {vb!r}")
-  return diffs
+  found = []
+  for rank, step in itertools.product(sorted(a), steps):
+    found += _step_differences(rank, step, a[rank], b[rank])
+  return found
 
 
 def checkpoint_keys(step_dir: Path) -> list[str]:

@@ -26,7 +26,7 @@ from torchtitan.components.loss import IGNORE_INDEX
 from torchtitan.experiments.tpu.post_training import chat_template as ct
 from torchtitan.experiments.tpu.post_training import sft_data
 
-ASSETS = os.environ.get("SPARK_TEST_ASSETS", "")
+ASSETS = os.getenv("SPARK_TEST_ASSETS", "")
 
 CONVERSATIONS = [
     [
@@ -106,7 +106,10 @@ class PackingTest(unittest.TestCase):
         positions[1, 11:].tolist(), list(range(5, 10))
     )  # pad continues
     self.assertEqual(int(batch["padding_mask"].sum()), 5)
-    self.assertEqual(batch["num_valid_tokens"], 8)
+    self.assertEqual(
+        batch["num_valid_tokens"],
+        sum(doc.num_valid for row in placed for doc in row),
+    )
     labels = batch["labels"].view(2, 16)
     self.assertTrue((labels[1, 11:] == IGNORE_INDEX).all())
     # A document's last position never predicts the next document's first token.
@@ -564,17 +567,15 @@ class ChatSFTDataLoaderTest(unittest.TestCase):
     )
 
   def setUp(self):
-    self.tmp = tempfile.TemporaryDirectory()
-    rows = [{"messages": CONVERSATIONS[i % 3]} for i in range(12)]
-    rows[5]["messages"] = [
-        {"role": "user", "content": "x " * 700},
-        {"role": "assistant", "content": "too long"},
+    holder = tempfile.TemporaryDirectory()
+    self.addCleanup(holder.cleanup)
+    self.path = os.path.join(holder.name, "conversations.jsonl")
+    overlong = [
+        {"role": "user", "content": "word " * 700},
+        {"role": "assistant", "content": "Too long for one row."},
     ]
-    self.path = str(Path(self.tmp.name) / "sft.jsonl")
-    _write_jsonl(rows, self.path)
-
-  def tearDown(self):
-    self.tmp.cleanup()
+    records = [{"messages": chat} for chat in CONVERSATIONS * 4 + [overlong]]
+    _write_jsonl(records, self.path)
 
   def test_batches(self):
     loader = self._loader(self.path)
@@ -584,8 +585,8 @@ class ChatSFTDataLoaderTest(unittest.TestCase):
         batch["num_valid_tokens"], int((batch["labels"] != IGNORE_INDEX).sum())
     )
     self.assertGreater(batch["num_valid_tokens"], 0)
-    starts = (batch["positions"].view(2, 512) == 0).sum(dim=1)
-    self.assertTrue((starts <= 3).all())
+    per_row = (batch["positions"].reshape(2, -1) == 0).sum(dim=1).tolist()
+    self.assertTrue(all(1 <= starts <= 3 for starts in per_row), per_row)
     self.assertEqual(loader.max_num_documents, 6)
     for _ in range(8):
       next(iter(loader))
@@ -604,25 +605,28 @@ class ChatSFTDataLoaderTest(unittest.TestCase):
     self.assertEqual([e["microbatch"] for e in loader.batch_log], [1, 2, 3])
     for entry, batch in zip(loader.batch_log, batches):
       self.assertEqual(entry["sha256"], sft_data.batch_fingerprint(batch))
-      # One document per position reset outside the padding.
-      starts = int(((batch["positions"] == 0) & ~batch["padding_mask"]).sum())
-      self.assertEqual(len(entry["docs"]), starts)
+      resets = batch["positions"] == 0
+      real_tokens = ~batch["padding_mask"]
+      self.assertEqual(len(entry["docs"]), int((resets & real_tokens).sum()))
 
   def test_resume_reproduces_batches(self):
-    loader = self._loader(self.path)
-    it = iter(loader)
+    def batch_key(batch):
+      return (
+          sft_data.batch_fingerprint(batch),
+          batch["padding_mask"].tolist(),
+          batch["num_valid_tokens"],
+      )
+
+    uninterrupted = self._loader(self.path)
+    stream = iter(uninterrupted)
     for _ in range(3):
-      next(it)
-    state = loader.state_dict()
-    expected = [next(it) for _ in range(4)]
+      next(stream)
+    saved = uninterrupted.state_dict()
+    expected = [batch_key(next(stream)) for _ in range(4)]
     resumed = self._loader(self.path)
-    resumed.load_state_dict(state)
-    rit = iter(resumed)
-    for want in expected:
-      got = next(rit)
-      for key in ("input", "labels", "positions", "padding_mask"):
-        self.assertTrue(torch.equal(want[key], got[key]), key)
-      self.assertEqual(want["num_valid_tokens"], got["num_valid_tokens"])
+    resumed.load_state_dict(saved)
+    again = iter(resumed)
+    self.assertEqual([batch_key(next(again)) for _ in range(4)], expected)
 
   def test_state_dict_schema(self):
     loader = self._loader(self.path, rank=1, world=2)

@@ -4,7 +4,8 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Unit tests of the smoke helpers (debug checkpoint writer, check report)."""
+"""Unit tests of the smoke helpers: the debug checkpoint writer, the check
+report and the record comparison of the kill-and-resume check."""
 
 from __future__ import annotations
 
@@ -63,7 +64,8 @@ class DebugCheckpointTest(unittest.TestCase):
 
   def test_one_shard_and_an_index_of_every_key(self):
     shard = self._shard()
-    index = json.loads((self.out / "model.safetensors.index.json").read_text())
+    with open(self.out / "model.safetensors.index.json") as handle:
+      index = json.load(handle)
     self.assertEqual(index["metadata"], {})
     self.assertEqual(
         index["weight_map"], {key: shard.name for key in self.tensors}
@@ -174,6 +176,59 @@ class ReportTest(unittest.TestCase):
         self.assertEqual(out.getvalue().splitlines(), want_lines)
         self.assertTrue(out.getvalue().endswith("\n"))
         self.assertEqual(code, want_code)
+
+
+class ResumeRecordsTest(unittest.TestCase):
+  """``read_records`` and ``compare`` of ``cpu_sft_resume``."""
+
+  def test_read_records(self):
+    from torchtitan.experiments.tpu.post_training.tests import cpu_sft_resume
+
+    first = {"step": 1, "loss_local": 1.5}
+    second = {"step": 2, "loss_local": 1.25}
+    rewritten = {"step": 1, "loss_local": 0.75}
+    with tempfile.TemporaryDirectory() as tmpdir:
+      self.assertEqual(cpu_sft_resume.read_records(tmpdir), {})
+      folder = pathlib.Path(tmpdir, "sft-records")
+      folder.mkdir()
+      (folder / "rank-00003.jsonl").write_text(
+          "".join(
+              json.dumps(row) + "\n\n" for row in (first, second, rewritten)
+          )
+      )
+      (folder / "rank-00000.jsonl").write_text("\n  \n")
+      (folder / "notes.txt").write_text("not a rank file")
+      records = cpu_sft_resume.read_records(pathlib.Path(tmpdir))
+    self.assertEqual(records, {3: {1: rewritten, 2: second}})
+
+  def test_compare_lines(self):
+    from torchtitan.experiments.tpu.post_training.tests import cpu_sft_resume
+
+    compare = cpu_sft_resume.compare
+
+    def step(loss, sha, counter=1, epoch=0):
+      batch = {"microbatch": counter, "sha256": sha, "docs": [4, 1]}
+      return {"step": 1, "loss_local": loss, "epoch": epoch, "batches": [batch]}
+
+    ref = {0: {1: step(2.5, "aa")}}
+    self.assertEqual(compare(ref, {}, [1]), ["ranks differ: [0] vs []"])
+    self.assertEqual(
+        compare(ref, {0: {}}, range(1, 3)),
+        [
+            "rank 0 step 1: missing (False, True)",
+            "rank 0 step 2: missing (True, True)",
+        ],
+    )
+    # The per-process microbatch counter is not compared.
+    self.assertEqual(compare(ref, {0: {1: step(2.5, "aa", counter=7)}}, [1]), [])
+    self.assertEqual(
+        compare(ref, {0: {1: step(2.0, "bb", epoch=1)}}, [1]),
+        [
+            "rank 0 step 1 loss_local: 2.5 != 2.0",
+            "rank 0 step 1 batches: [('aa', [4, 1])] != [('bb', [4, 1])]",
+            "rank 0 step 1 epoch: 0 != 1",
+        ],
+    )
 
 
 if __name__ == "__main__":

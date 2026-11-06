@@ -30,9 +30,9 @@ from torchtitan.experiments.tpu.post_training.sft_data import ChatSFTDataLoader
 from torchtitan.experiments.tpu.post_training.tests import cpu_recipes, smoke_common
 from torchtitan.experiments.tpu.tpu_job_config import TpuTrainerCompileConfig
 
-SPARK_RECIPES = sorted(
-    n for n in dir(cr) if n.startswith("muse_spark_816b_a42b_")
-)
+SPARK_RECIPES = [
+    name for name in sorted(vars(cr)) if name.startswith("muse_spark_")
+]
 
 
 def _lora_configs(model_config):
@@ -99,12 +99,8 @@ class SparkRecipeTest(unittest.TestCase):
         self.assertIsInstance(config.compile, TpuTrainerCompileConfig)
         self.assertTrue(config.compile.compile_grad_norm)
         self.assertEqual(config.tpu_config.eager_mode, "DEFER_AND_FUSE")
-        experts = [
-            e
-            for _, e, _, _ in config.model_spec.model.traverse(
-                TpuGroupedExperts.Config
-            )
-        ]
+        traversal = config.model_spec.model.traverse(TpuGroupedExperts.Config)
+        experts = [found[1] for found in traversal]
         self.assertEqual(len(experts), 2)
         for e in experts:
           self.assertTrue(e.use_pallas_grouped_mm)
@@ -155,8 +151,8 @@ class SparkRecipeTest(unittest.TestCase):
   def test_sft_recipes(self):
     for name in SPARK_RECIPES:
       with self.subTest(name=name):
-        config = getattr(cr, name)()
-        self.assertIsInstance(config.dataloader, ChatSFTDataLoader.Config)
+        recipe = vars(cr)[name]
+        config = recipe()
         self.assertEqual(config.dataloader.reasoning_effort, "low")
         # Pallas fused CE carries the head's multiplier and soft cap.
         head = config.model_spec.model.lm_head

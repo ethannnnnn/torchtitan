@@ -10,6 +10,7 @@ low-bit AdamW options, on TorchTitan's llama3 debug model."""
 from __future__ import annotations
 
 import copy
+import functools
 import json
 import tempfile
 import unittest
@@ -26,8 +27,11 @@ from torchtitan.experiments.tpu.post_training.optimizers import (
 from torchtitan.models.llama3 import model_registry
 
 
-def _spec():
-  return model_registry("debugmodel", seq_len=32, attn_backend="sdpa")
+# The llama3 debug model for the 32-token inputs below, with SDPA attention
+# (no attention masks needed); every call builds a new spec.
+_spec = functools.partial(
+    model_registry, "debugmodel", seq_len=32, attn_backend="sdpa"
+)
 
 
 def _build(spec, seed=0):
@@ -104,9 +108,8 @@ class LoRATest(unittest.TestCase):
     with torch.no_grad():
       lora_out = model(tokens)
       base_out = base(tokens)
-    self.assertGreater(
-        float((lora_out - base_out).abs().max()), 1e-4
-    )  # adapters act
+    largest_change = float((lora_out - base_out).abs().max())
+    self.assertGreater(largest_change, 1e-3)  # the adapters move the output
     merged = lora_mod.merge_lora_state_dict(
         model.state_dict(), self.options.scaling, self.layouts
     )
@@ -210,8 +213,10 @@ class LoRATest(unittest.TestCase):
         fused_layouts={},
     )
     self.assertEqual(len(named), 2 * len(lora_mod.lora_prefixes(state)))
-    with tempfile.TemporaryDirectory() as tmp:
-      out = lora_mod.save_peft_adapter(tmp, tensors, options=self.options)
+    with tempfile.TemporaryDirectory() as tmpdir:
+      out = lora_mod.save_peft_adapter(
+          Path(tmpdir) / "peft", tensors, options=self.options
+      )
       config = json.loads((out / "adapter_config.json").read_text())
       self.assertEqual((config["r"], config["lora_alpha"]), (4, 8.0))
       self.assertEqual(

@@ -36,11 +36,21 @@ TOKENIZER_FILES = (
 FLOAT32_KEY_SUFFIXES = (".linear_attn.A_log", ".linear_attn.norm.weight")
 
 
+# Interface the free-port probe binds to (port 0: the OS picks the port).
+_LOOPBACK_HOST = "127.0.0.1"
+
+
 def free_port() -> int:
-  """An unused local TCP port for the single-rank process group."""
-  with socket.socket() as sock:
-    sock.bind(("127.0.0.1", 0))
-    return sock.getsockname()[1]
+  """A TCP port on the loopback interface that nothing uses right now (the
+  single-rank environment's ``MASTER_PORT``)."""
+  import contextlib
+
+  with contextlib.closing(
+      socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+  ) as probe:
+    probe.bind((_LOOPBACK_HOST, 0))
+    _, port = probe.getsockname()
+  return port
 
 
 def has_muse_spark() -> bool:
