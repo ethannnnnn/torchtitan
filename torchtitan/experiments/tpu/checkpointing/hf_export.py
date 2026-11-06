@@ -107,7 +107,7 @@ def _is_url(path: str) -> bool:
 
 
 def _local(path: str) -> str:
-    return path[len("file://"):] if path.startswith("file://") else path
+    return path.removeprefix("file://")
 
 
 def _join(root: str, name: str) -> str:
@@ -513,7 +513,7 @@ class DcpSource:
 def assign_files(layout: HfLayout, num_workers: int) -> list[list[str]]:
     """Greedy largest-first assignment of shard files to workers by bytes."""
     loads = [0] * num_workers
-    out: list[list[str]] = [[] for _ in range(num_workers)]
+    out = [list() for _ in range(num_workers)]
     for file in sorted(layout.files, key=lambda f: (-layout.file_bytes(f), f)):
         i = min(range(num_workers), key=lambda j: (loads[j], j))
         out[i].append(file)

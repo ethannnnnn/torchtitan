@@ -64,7 +64,7 @@ class ParallelReadMixin:
         n = max(1, min(self.read_threads, len(items)))
         # Contiguous chunks balanced by bytes keep each thread's reads sequential.
         total = sum(x[2] for x in items) or 1
-        chunks: list[list] = [[] for _ in range(n)]
+        chunks = [list() for _ in range(n)]
         acc, i = 0, 0
         for it in items:
             if i < n - 1 and acc >= (i + 1) * total / n:
