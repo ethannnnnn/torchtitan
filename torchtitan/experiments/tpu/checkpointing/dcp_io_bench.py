@@ -45,6 +45,7 @@ Example (per host, under torchrun with 8 ranks per TPU7x host)::
 from __future__ import annotations
 
 import argparse
+import functools
 import glob
 import json
 import math
@@ -302,9 +303,8 @@ def _transfer_fns(args, run: str):
             return os.path.getsize(dst)
 
         return up, down, _Local(root)
-    from torchtitan_ckpt_gcs import download_file, parse_gs_uri, upload_file
-
-    return upload_file, download_file, parse_gs_uri(args.gs_root).join(run)
+    gcs = _import_gcs()
+    return gcs.upload_file, gcs.download_file, gcs.parse_gs_uri(args.gs_root).join(run)
 
 
 def fsspec_reader(url: str, cache_type: str, **kw):
@@ -520,9 +520,8 @@ def cleanup(ctx: Ctx, args, method: str, run: str, client, creds) -> None:
         elif method in ("fsspec", "stage") and args.gs_root.startswith("file://"):
             shutil.rmtree(args.gs_root[len("file://"):].rstrip("/") + "/" + run, ignore_errors=True)
         elif method in ("fsspec", "stage") and client is not None:
-            from torchtitan_ckpt_gcs import delete_prefix, parse_gs_uri
-
-            delete_prefix(client, parse_gs_uri(args.gs_root).join(run))
+            gcs = _import_gcs()
+            gcs.delete_prefix(client, gcs.parse_gs_uri(args.gs_root).join(run))
     ctx.barrier()
 
 
@@ -561,6 +560,7 @@ def d2h_probe(ctx: Ctx, state, limit_bytes: int) -> dict:
 # ---------------------------------------------------------------------------
 
 
+@functools.cache
 def _import_gcs():
     """Import ``gcs.py`` from this package, or from next to this file."""
     try:
@@ -568,7 +568,6 @@ def _import_gcs():
     except Exception:  # noqa: BLE001 - running as a standalone script
         sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
         import gcs  # type: ignore[no-redef]
-    sys.modules["torchtitan_ckpt_gcs"] = gcs
     return gcs
 
 

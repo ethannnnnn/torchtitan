@@ -16,7 +16,8 @@ Model-agnostic (always run):
   DCP I/O; PEFT adapter export and import.
 * ``PeftLayoutTest``: TorchTitan <-> PEFT adapter tensors, including adapters
   that permute rows (RoPE) and re-layouts that cannot be supported.
-* ``CanonicalNamesTest``: activation-checkpoint wrappers in parameter names.
+* ``CanonicalNamesTest``: activation-checkpoint and torch.compile wrappers in
+  parameter names.
 
 ``ResumeTest`` repeats the resume checks on Muse Spark and needs
 ``MUSE_SPARK_TINY_DIR`` (public tiny test checkpoint), the Muse Spark port
@@ -139,35 +140,56 @@ def _model_keys(metadata) -> list[str]:
     return [k for k in metadata if not k.startswith(("optimizer", "lr_scheduler", "dataloader", "train_state"))]
 
 
+class _TinyLoRABlock(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.wq = torch.nn.Linear(4, 4, bias=False)
+        self.lora_a = torch.nn.Linear(4, 2, bias=False)
+        self.lora_b = torch.nn.Linear(2, 4, bias=False)
+
+
+def _wrapped_blocks(wrap) -> torch.nn.Module:
+    model = torch.nn.Module()
+    model.layers = torch.nn.ModuleList([wrap(_TinyLoRABlock()) for _ in range(2)])
+    for name, param in model.named_parameters():
+        param.requires_grad_(".lora_" in name)
+    return model
+
+
 class CanonicalNamesTest(unittest.TestCase):
-    """Adapter-only checkpoints with activation-checkpoint wrappers (every TPU recipe uses them)."""
+    """Adapter-only checkpoints keep the ``state_dict()`` keys of models with wrapped blocks."""
 
     def test_trainable_wrapper_with_checkpoint_wrappers(self):
+        """Every TPU recipe wraps its blocks for activation checkpointing."""
         from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoint_wrapper
 
-        from torchtitan.experiments.tpu.checkpointing.lora_checkpoint import (
-            TrainableModelWrapper,
-            canonical_fqn,
-        )
+        from torchtitan.experiments.tpu.checkpointing.lora_checkpoint import TrainableModelWrapper
 
-        class Block(torch.nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.wq = torch.nn.Linear(4, 4, bias=False)
-                self.lora_a = torch.nn.Linear(4, 2, bias=False)
-                self.lora_b = torch.nn.Linear(2, 4, bias=False)
-
-        model = torch.nn.Module()
-        model.layers = torch.nn.ModuleList([checkpoint_wrapper(Block()) for _ in range(2)])
-        for name, param in model.named_parameters():
-            param.requires_grad_(".lora_" in name)
+        model = _wrapped_blocks(checkpoint_wrapper)
         raw = [n for n, p in model.named_parameters() if p.requires_grad]
         self.assertTrue(all("_checkpoint_wrapped_module." in n for n in raw))
-        self.assertEqual(canonical_fqn("layers.0._checkpoint_wrapped_module._orig_mod.wq.weight"),
-                         "layers.0.wq.weight")
         state = TrainableModelWrapper([model]).state_dict()
         self.assertEqual(sorted(state), sorted(k for k in model.state_dict() if ".lora_" in k))
         self.assertEqual(len(state), 4)
+
+    def test_trainable_wrapper_with_compile_wrappers(self):
+        """A wrapping torch.compile keeps ``_orig_mod`` in named_parameters() and state_dict()."""
+        from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoint_wrapper
+
+        from torchtitan.experiments.tpu.checkpointing.lora_checkpoint import TrainableModelWrapper
+
+        wraps = {
+            "compile": torch.compile,
+            "checkpoint(compile)": lambda block: checkpoint_wrapper(torch.compile(block)),
+            "compile(checkpoint)": lambda block: torch.compile(checkpoint_wrapper(block)),
+        }
+        for label, wrap in wraps.items():
+            with self.subTest(wrap=label):
+                model = _wrapped_blocks(wrap)
+                want = sorted(k for k in model.state_dict() if ".lora_" in k)
+                self.assertEqual(len(want), 4)
+                self.assertTrue(all("._orig_mod." in k for k in want), want)
+                self.assertEqual(sorted(TrainableModelWrapper([model]).state_dict()), want)
 
 
 class Llama3AdapterOnlyTest(unittest.TestCase):
@@ -347,10 +369,17 @@ class _ToyAdapter:
                 out[f"model.layers.{layer}.self_attn.o_proj.weight"] = value
             elif self.mode == "permute":
                 out[f"model.layers.{layer}.self_attn.q_proj.weight"] = _rope_permute(value, self.n_heads)
+            elif self.mode == "permute_cast":  # row permutation, then a cast to bf16
+                out[f"model.layers.{layer}.self_attn.q_proj.weight"] = _rope_permute(
+                    value, self.n_heads).to(torch.bfloat16)
             elif self.mode == "cast":  # a rename that also casts
                 out[f"model.layers.{layer}.self_attn.q_proj.weight"] = value.to(torch.bfloat16)
+            elif self.mode == "view":  # a rename through view(), which needs a compatible stride
+                out[f"model.layers.{layer}.self_attn.q_proj.weight"] = value.view(-1).view(value.shape)
             elif self.mode == "transpose":
                 out[f"model.layers.{layer}.self_attn.q_proj.weight"] = value.t()
+            elif self.mode == "flip_columns":
+                out[f"model.layers.{layer}.self_attn.q_proj.weight"] = value.flip(1)
             elif self.mode == "scale":
                 out[f"model.layers.{layer}.self_attn.q_proj.weight"] = 2 * value
             elif self.mode == "split":
@@ -391,7 +420,7 @@ class PeftLayoutTest(unittest.TestCase):
         from torchtitan.experiments.tpu.checkpointing.lora_checkpoint import peft_to_tt_lora, tt_lora_to_peft
 
         lora = _random_lora(dim=512)  # more rows than bf16 represents exactly as integers
-        for mode in ("rename", "cast"):
+        for mode in ("rename", "cast", "view"):
             with self.subTest(mode=mode):
                 peft = tt_lora_to_peft(lora, _ToyAdapter(n_heads=8, mode=mode))
                 self.assertEqual(len(peft), len(lora))
@@ -426,10 +455,26 @@ class PeftLayoutTest(unittest.TestCase):
         for key, value in lora.items():
             self.assertTrue(torch.equal(back[key], value), key)
 
+    def test_lora_b_rows_follow_a_permutation_that_casts(self):
+        """Row ids above 256 are not exact in bf16; the probes read them digit by digit."""
+        from torchtitan.experiments.tpu.checkpointing.lora_checkpoint import peft_to_tt_lora, tt_lora_to_peft
+
+        adapter = _ToyAdapter(n_heads=8, mode="permute_cast")
+        lora = _random_lora(dim=512)
+        peft = tt_lora_to_peft(lora, adapter)
+        for layer in range(2):
+            a, b = lora[f"layers.{layer}.wq.lora_a.weight"], lora[f"layers.{layer}.wq.lora_b.weight"]
+            module = f"base_model.model.model.layers.{layer}.self_attn.q_proj"
+            self.assertTrue(torch.equal(peft[f"{module}.lora_A.weight"], a))
+            self.assertTrue(torch.equal(peft[f"{module}.lora_B.weight"], _rope_permute(b, 8)))
+        back = peft_to_tt_lora(peft, adapter, {k: tuple(v.shape) for k, v in lora.items()})
+        for key, value in lora.items():
+            self.assertTrue(torch.equal(back[key], value), key)
+
     def test_unsupported_relayouts_raise(self):
         from torchtitan.experiments.tpu.checkpointing.lora_checkpoint import tt_lora_to_peft
 
-        for mode in ("transpose", "scale", "split"):
+        for mode in ("transpose", "scale", "split", "flip_columns"):
             with self.subTest(mode=mode), self.assertRaises(NotImplementedError):
                 tt_lora_to_peft(_random_lora(), _ToyAdapter(mode=mode))
 

@@ -13,8 +13,8 @@ specific: models plug in through their TorchTitan `StateDictAdapter`.
 | `dcp_parallel.py` | Multi-threaded DCP reader and writer settings for a `CheckpointManager` |
 | `dcp_io_bench.py` | DCP save/load throughput benchmark (Cloud Storage FUSE, `gs://` via gcsfs, local staging + parallel upload) |
 | `gcs.py` | Cloud Storage credentials for GKE pods and parallel multipart transfers |
-| `flush.py` | Makes every rank leave a DCP save together on TorchTPU |
-| `resume_check.py` | Environment-gated kill and batch-record hooks for checkpoint/resume tests of any TorchTitan trainer |
+| `flush.py` | Flush of every rank's TorchTPU device queue after each save that wrote a checkpoint |
+| `resume_check.py` | Environment-gated kill and batch-record hooks for checkpoint/resume tests of TorchTitan trainers |
 
 ## LoRA runs
 
@@ -45,9 +45,10 @@ save_peft_adapter(model_parts, sd_adapter, "gs://<GCS_BUCKET>/<RUN_NAME>/adapter
   them, so serve the adapter when the engine supports it.
 * PEFT module names come from the model's adapter, and `lora_B` rows follow any
   row permutation the adapter applies to the base weight (for example a RoPE
-  permutation of q/k). An adapter on a weight that does not map one-to-one
-  (such as a fused `wqkv` projection) is refused; export those with the
-  model's own PEFT layout code.
+  permutation of q/k), also when it casts the weight. An adapter on a weight
+  that does not map one-to-one (such as a fused `wqkv` projection), or whose
+  columns or values the model's adapter changes, is refused; export those with
+  the model's own PEFT layout code.
 
 ## Export trained weights in the original layout
 
@@ -106,26 +107,35 @@ the multi-threaded writer for the whole process (the latest settings win);
 asynchronous saves, Hugging Face loads and saves, and remote paths keep the
 stock readers and writers.
 
-## Leaving a save together (TorchTPU)
+## Flush the device queue after each save (TorchTPU)
 
-TorchTPU defers device work until a host readback, so the last collective of a
-DCP save (the coordinator's broadcast of the result) stays queued on rank 0,
-which returns at once while every other rank waits for it until rank 0's next
-readback. If rank 0 dies in between, the other ranks hang in the save although
-the checkpoint is complete.
+On TorchTPU, device work that the host issues is queued and only executes when
+the host next reads a value from the device. A DCP save ends with a collective
+in which the coordinating rank (rank 0) passes the outcome of the save to the
+other ranks, and rank 0 can return from `save` before that collective has run
+on its device. The other ranks then wait inside it until rank 0 forces its
+device to execute, in practice somewhere in the next training step. So the
+save time that rank 0 reports is too short (the remainder shows up in the next
+step), and if rank 0 dies in that window, the other ranks hang until the
+collective times out, even though every checkpoint file is already written.
 
 ```python
 from torchtitan.experiments.tpu.checkpointing.flush import flush_after_saves
-flush_after_saves(checkpointer, device)
+
+flush_after_saves(checkpointer, device)  # every rank, after any other override of save
 ```
 
-After every save that wrote, each rank all-reduces one int32 on the device and
-reads it back, so every rank leaves the save together. It changes no numerics.
+Afterwards, each `save` call that wrote a checkpoint is followed by a flush:
+every rank sums one integer over all ranks with a collective on its device and
+fetches the total to the host, which runs the queued work in order and returns
+once all ranks have arrived. Trained values, checkpoint contents and the order
+of the save's own work stay the same. The flush is a collective, so install it
+on all ranks or on none.
 
 ## Resume checks
 
-`resume_check.install()` patches `torchtitan.trainer.Trainer` (and so every
-subclass) only when the environment asks for it:
+`resume_check.install()` patches `torchtitan.trainer.Trainer` only when the
+environment asks for it:
 
 * `TT_FAULT_KILL_STEP=N`: every rank sends itself SIGKILL when step N draws its
   first batch, a hard crash for restart tests (relaunch with the same dump
@@ -134,6 +144,12 @@ subclass) only when the environment asks for it:
   the SHA-256 of each batch it drew to `<dir>/rank-NNNNN.jsonl`, and rank 0 logs
   `[resume-check] step=N loss=... grad_norm=...` at full precision, so two runs
   can be compared batch by batch and bit for bit across a restart.
+
+The hooks live in `Trainer.batch_generator` and `Trainer.train_step`, so a
+subclass gets them only through those methods: one that overrides
+`batch_generator` without calling the base method is never killed and hashes
+no batches, and one that overrides `train_step` that way (for example
+`TpuGraphTrainer` with the optimizer in the graph) writes no batch records.
 
 ## Benchmark
 
@@ -197,4 +213,6 @@ the save flush and the resume-check hooks.
 Muse Spark port), the tests also cover a transformers round trip with
 bit-identical logits, parity with the PEFT library's merge, DCP -> HF export of
 the Muse Spark port, and bit-exact resume of the Muse Spark port (full
-parameter, tuned I/O, LoRA adapter-only).
+parameter, tuned I/O, LoRA adapter-only). On a machine without TorchTPU the
+runner imports the TPU modules these checks need through the shared CPU
+stand-in `torchtitan/experiments/tpu/tests/cpu_stubs`, if the tree has it.

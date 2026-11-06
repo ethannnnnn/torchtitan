@@ -45,6 +45,19 @@ class UriTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             gcs.parse_gs_uri("/local/path")
 
+    def test_bench_transfers_use_this_module(self):
+        """dcp_io_bench's Cloud Storage transfers come from gcs.py, imported directly."""
+        import sys
+        import types
+
+        from torchtitan.experiments.tpu.checkpointing import dcp_io_bench
+
+        upload, download, root = dcp_io_bench._transfer_fns(types.SimpleNamespace(gs_root="gs://bucket/bench"), "run")
+        self.assertIs(upload, gcs.upload_file)
+        self.assertIs(download, gcs.download_file)
+        self.assertEqual(root, gcs.parse_gs_uri("gs://bucket/bench/run"))
+        self.assertNotIn("torchtitan_ckpt_gcs", sys.modules)
+
 
 class CredentialsTest(unittest.TestCase):
     def test_jwt_claims(self):

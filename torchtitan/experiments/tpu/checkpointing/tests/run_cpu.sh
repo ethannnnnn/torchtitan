@@ -13,6 +13,8 @@
 # Needs torch (CPU), safetensors, fsspec, pytest. Optional: transformers >= 5.18 (Muse Spark
 # round trips), peft (parity with the PEFT library's merge), google-auth (credential tests);
 # the Muse Spark resume / LoRA checks also need the muse_spark port and post_training.lora.
+# Where torch_tpu is not installed, those import TorchTPU through the shared import-only
+# stand-in torchtitan/experiments/tpu/tests/cpu_stubs when the tree has it.
 set -euo pipefail
 TEST_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd "$TEST_DIR/../../../../.." && pwd)
@@ -25,6 +27,12 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 export PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"
+STUBS="$REPO_ROOT/torchtitan/experiments/tpu/tests/cpu_stubs"
+# The stand-in refuses to load next to a real torch_tpu: use it only where none is installed.
+if [[ -d "$STUBS/torch_tpu" ]] && "$CPU_PYTHON" -c \
+    'import importlib.util, sys; sys.exit(importlib.util.find_spec("torch_tpu") is not None)'; then
+  export PYTHONPATH="$STUBS:$PYTHONPATH"
+fi
 export PJRT_DEVICE=CPU JAX_PLATFORMS=cpu TORCH_DEVICE_BACKEND_AUTOLOAD=0
 export HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1 PYTHONDONTWRITEBYTECODE=1
 cd "$REPO_ROOT"
