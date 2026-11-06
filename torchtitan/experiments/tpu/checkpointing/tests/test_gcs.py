@@ -31,7 +31,7 @@ def _has_google_auth() -> bool:
     try:
         import google.auth.transport.requests  # noqa: F401
         from google.auth import identity_pool  # noqa: F401
-    except Exception:  # noqa: BLE001
+    except Exception:
         return False
     return True
 

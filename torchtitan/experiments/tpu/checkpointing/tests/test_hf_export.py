@@ -610,7 +610,7 @@ def _spark():
     try:
         from torchtitan.experiments.tpu.muse_spark import MuseSparkArgs, MuseSparkStateDictAdapter
         from torchtitan.experiments.tpu.muse_spark.configs import build_muse_spark_config
-    except Exception:  # noqa: BLE001
+    except Exception:
         return None
     return MuseSparkArgs, MuseSparkStateDictAdapter, build_muse_spark_config
 

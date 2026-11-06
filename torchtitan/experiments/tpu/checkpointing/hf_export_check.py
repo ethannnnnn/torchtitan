@@ -47,7 +47,7 @@ DEFAULT_TARGETS = r"model\.language_model\.layers\.\d+\.self_attn\.(q|k|v|o)_pro
 def _modules():
     try:
         from torchtitan.experiments.tpu.checkpointing import gcs, hf_export, lora_checkpoint
-    except Exception:  # noqa: BLE001 - standalone use next to the other files
+    except Exception:  # standalone use next to the other files
         sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
         import gcs  # type: ignore
         import hf_export  # type: ignore
@@ -89,7 +89,7 @@ def _worker(args, worker: int, num_workers: int, adapter_dir: str, q) -> None:
             storage_options=storage, out_storage_options=storage, staging_dir=args.staging_dir,
             gcs_client=client, sha256=True, finalize=False)
         q.put((worker, {k: v for k, v in rep.items() if k != "source"}))
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         import traceback
 
         q.put((worker, {"error": f"{type(exc).__name__}: {exc}", "trace": traceback.format_exc()[-3000:]}))

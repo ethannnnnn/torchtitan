@@ -379,7 +379,7 @@ def discover_hf_dependencies(adapter: Any, meta: dict[str, torch.Tensor]) -> dic
             continue
         try:
             out = to_hf({key: value})
-        except Exception:  # noqa: BLE001 - needs its partners
+        except Exception:  # needs its partners
             pending[_layer_of(key)].append(key)
             continue
         if len(out) == 1:
@@ -735,7 +735,7 @@ def _gcs():
     """Cloud Storage helpers: the package module, or the ``gcs.py`` beside this file when run as a script."""
     try:
         from torchtitan.experiments.tpu.checkpointing import gcs
-    except Exception:  # noqa: BLE001 - standalone use
+    except Exception:  # standalone use
         sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
         import gcs  # type: ignore[no-redef]
     return gcs

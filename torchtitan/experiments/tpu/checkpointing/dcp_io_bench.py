@@ -173,7 +173,7 @@ class Ctx:
                 from torch_tpu._internal import sync as tpu_sync
 
                 self._tpu_sync = tpu_sync
-            except Exception:  # noqa: BLE001
+            except Exception:
                 self._tpu_sync = None
             self.device = torch.device("tpu")
             backend = "tpu_dist"
@@ -226,7 +226,7 @@ def _fill_random_(ctx: Ctx, t) -> None:
         try:
             t.copy_(torch.randint(0, 256, tuple(t.shape), dtype=torch.uint8, device=t.device))
             return
-        except Exception:  # noqa: BLE001 - some backends lack a uint8 randint; use scaled uniform floats
+        except Exception:  # some backends lack a uint8 randint; use scaled uniform floats
             pass
         t.copy_((torch.rand(tuple(t.shape), device=t.device) * 255.0).to(torch.uint8))
     else:
@@ -370,7 +370,7 @@ def run_method(ctx: Ctx, args, method: str, state, layout, tag: str, threads: in
             ParallelFileSystemReader,
             ParallelFsspecReader,
         )
-    except Exception:  # noqa: BLE001 - standalone script
+    except Exception:  # standalone script
         from dcp_parallel import ParallelFileSystemReader, ParallelFsspecReader  # type: ignore
 
     rec: dict[str, Any] = {"method": method, "tag": tag, "threads": threads}
@@ -390,7 +390,7 @@ def run_method(ctx: Ctx, args, method: str, state, layout, tag: str, threads: in
         try:
             fn()
             ctx.sync()
-        except (Exception, CheckpointException) as exc:  # noqa: BLE001
+        except (Exception, CheckpointException) as exc:
             err = f"{type(exc).__name__}: {str(exc)[:300]}"
             ctx.log(f"rank-local failure: {err}\n{traceback.format_exc()[-2000:]}", all_ranks=True)
         errs = [e for e in ctx.gather(err) if e]
@@ -482,13 +482,13 @@ def run_method(ctx: Ctx, args, method: str, state, layout, tag: str, threads: in
             raise ValueError(method)
         exact = [v for k, v in rec.items() if k.endswith("_bit_exact")]
         rec["verify_bit_exact"] = bool(exact) and all(exact)
-    except (Exception, CheckpointException) as exc:  # noqa: BLE001 - record, go on
+    except (Exception, CheckpointException) as exc:  # record, go on
         rec["error"] = f"{type(exc).__name__}: {str(exc)[:600]}"
         ctx.log(f"{method} {tag} FAILED: {rec['error']}")
     finally:
         try:
             cleanup(ctx, args, method, run, client, creds)
-        except (Exception, CheckpointException) as exc:  # noqa: BLE001
+        except (Exception, CheckpointException) as exc:
             rec["cleanup_error"] = f"{type(exc).__name__}: {str(exc)[:300]}"
     for k in [k for k in rec if k.endswith("_s") and isinstance(rec[k], float)]:
         rec[k] = round(rec[k], 3)
@@ -565,7 +565,7 @@ def _import_gcs():
     """Import ``gcs.py`` from this package, or from next to this file."""
     try:
         from torchtitan.experiments.tpu.checkpointing import gcs
-    except Exception:  # noqa: BLE001 - running as a standalone script
+    except Exception:  # running as a standalone script
         sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
         import gcs  # type: ignore[no-redef]
     return gcs
@@ -624,7 +624,7 @@ def main(argv=None) -> int:
             from torchtitan.experiments.tpu import distributed_utils
 
             distributed_utils.maybe_init_distributed()
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             print(f"[CKB] maybe_init_distributed skipped: {exc!r}", flush=True)
     ctx = Ctx(args.device)
     gcs = _import_gcs()
@@ -645,7 +645,7 @@ def main(argv=None) -> int:
         try:
             m = __import__(mod, fromlist=["x"])
             results["versions"][mod] = getattr(m, "__version__", "?")
-        except Exception:  # noqa: BLE001
+        except Exception:
             pass
 
     def dump():
@@ -663,7 +663,7 @@ def main(argv=None) -> int:
                 impersonate=args.impersonate, probe_uri=args.gs_root)
             client = gcs.storage_client(creds)
             results["auth"] = {"mode": mode, "notes": notes}
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             results["auth"] = {"error": f"{type(exc).__name__}: {str(exc)[:800]}"}
             methods = [m for m in methods if m not in ("fsspec", "stage")]
         auth_ok = ctx.gather(creds is not None)
@@ -686,7 +686,7 @@ def main(argv=None) -> int:
         try:
             results["d2h_probe"] = d2h_probe(ctx, state, int(args.d2h_probe_gb * 1e9))
             ctx.log(f"d2h probe {results['d2h_probe']}")
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             results["d2h_probe"] = {"error": f"{type(exc).__name__}: {exc}"}
         dump()
 

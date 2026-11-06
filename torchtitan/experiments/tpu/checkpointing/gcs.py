@@ -168,7 +168,7 @@ def resolve_credentials(
                 _probe(creds, parse_gs_uri(probe_uri), name)
             notes.append(f"{name}: ok")
             return creds, name, notes
-        except Exception as exc:  # noqa: BLE001 - report and try the next one
+        except Exception as exc:  # report and try the next one
             notes.append(f"{name}: {type(exc).__name__}: {str(exc)[:300]}")
     raise PermissionError("no usable Cloud Storage credentials: " + "; ".join(notes))
 
