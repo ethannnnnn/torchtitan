@@ -96,18 +96,18 @@ def load_conversations(
     path: str | Path, *, limit: int | None = None
 ) -> list[list[dict[str, Any]]]:
   """``messages`` lists from JSONL / parquet files (or a directory of them)."""
-  resolved = Path(path)
+  source = Path(path)
   files = (
       sorted(
           p
-          for p in resolved.iterdir()
+          for p in source.iterdir()
           if p.suffix in (".jsonl", ".json", ".parquet")
       )
-      if resolved.is_dir()
-      else [resolved]
+      if source.is_dir()
+      else [source]
   )
   if not files or not all(f.is_file() for f in files):
-    raise FileNotFoundError(f"no SFT records at {resolved}")
+    raise FileNotFoundError(f"no SFT records at {source}")
   conversations: list[list[dict[str, Any]]] = []
   for file in files:
     for messages in map(_decoded_messages, _read_records(file)):
@@ -121,7 +121,7 @@ def load_conversations(
       if limit is not None and len(conversations) >= limit:
         return conversations
   if not conversations:
-    raise ValueError(f"{resolved} holds no SFT records")
+    raise ValueError(f"{source} holds no SFT records")
   return conversations
 
 
@@ -300,10 +300,9 @@ class ChatSFTDataLoader(BaseDataLoader):
   class Config(BaseDataLoader.Config):
     data_path: str = ""
     hf_tokenizer_path: str = ""
-    """Source of the chat template: a directory or hub id whose Hugging Face
-        tokenizer renders the conversations. When empty, the loader reuses the
-        location of the tokenizer the trainer itself loaded (its
-        ``--hf_assets_path``)."""
+    """Folder or hub id of the Hugging Face tokenizer whose chat template
+      renders the records. Empty: the folder of the tokenizer the trainer
+      loaded itself, i.e. the one given by ``--hf_assets_path``."""
     reasoning_effort: str = ""
     current_date: str = ""
     mask_mode: str = "auto"
@@ -339,16 +338,16 @@ class ChatSFTDataLoader(BaseDataLoader):
       )
     if config.microbatches_per_step < 1:
       raise ValueError("microbatches_per_step must be >= 1")
-    width = int(max_context_length)
-    rows, spare = divmod(num_tokens_per_batch, width)
-    if spare:
-      raise ValueError(
-          f"num_tokens_per_batch ({num_tokens_per_batch}) must be a whole "
-          f"number of {width}-token rows (max_context_length)"
-      )
     self.config = config
-    self._width, self._rows = width, rows
-    self.max_num_documents = rows * config.max_documents_per_row
+    self._width = int(max_context_length)
+    self._rows, leftover = divmod(int(num_tokens_per_batch), self._width)
+    if leftover:
+      raise ValueError(
+          "num_tokens_per_batch={} does not split into {}-token rows".format(
+              num_tokens_per_batch, self._width
+          )
+      )
+    self.max_num_documents = self._rows * config.max_documents_per_row
     self._dp_world_size, self._dp_rank = int(dp_world_size), int(dp_rank)
     self._hf_tokenizer = _chat_template_tokenizer(
         config.hf_tokenizer_path, tokenizer
@@ -385,18 +384,19 @@ class ChatSFTDataLoader(BaseDataLoader):
           len(self._conversations),
           self._dp_world_size,
           self._rows,
-          width,
+          self._width,
           config.max_documents_per_row,
           self._options,
           config.mask_mode,
           config.overlong,
       )
 
-  # -- data order -------------------------------------------------------
   def _epoch_shard(self, epoch: int) -> list[int]:
+    """The conversation indices this rank visits in ``epoch``."""
     order = list(range(len(self._conversations)))
-    if self.config.shuffle_seed is not None:
-      random.Random(int(self.config.shuffle_seed) + epoch).shuffle(order)
+    seed = self.config.shuffle_seed
+    if seed is not None:
+      random.Random(int(seed) + epoch).shuffle(order)
     # Equal shard sizes keep ranks in step across epochs.
     usable = len(order) - len(order) % self._dp_world_size
     return order[self._dp_rank : usable : self._dp_world_size]
@@ -467,9 +467,9 @@ class ChatSFTDataLoader(BaseDataLoader):
       del self.batch_log[:-4096]
     return batch
 
-  def num_microbatches_per_step(self) -> int:
-    """Microbatches per rank in one optimizer step (``microbatches_per_step``
-    of the config); it does not change over the loader's life."""
+  def accumulation_steps(self) -> int:
+    """Microbatches that make up one optimizer step on this rank: the
+    configured ``microbatches_per_step``, fixed for the loader's lifetime."""
     return int(self.config.microbatches_per_step)
 
   # -- iteration and resumable position ---------------------------------
@@ -491,26 +491,36 @@ class ChatSFTDataLoader(BaseDataLoader):
     }
 
   def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+    """Continue from a ``state_dict()``; an empty state changes nothing.
+
+    The state must be version 1, come from as many data-parallel ranks and
+    hold this rank's entry; otherwise ``ValueError``, with the position left
+    as it was. Pending documents are tokenized again in their saved order.
+    """
     if not state_dict:
       return
-    version = state_dict.get("version")
-    if version != 1:
-      raise ValueError(
-          f"ChatSFTDataLoader state version {version!r}; only 1 is understood"
+    rank_key = "dp_rank_{}".format(self._dp_rank)
+    complaint = None
+    if state_dict.get("version") != 1:
+      complaint = "unsupported ChatSFTDataLoader state version {!r}".format(
+          state_dict.get("version")
       )
-    saved_world = state_dict.get("dp_world_size")
-    if saved_world != self._dp_world_size:
-      raise ValueError(
-          f"refusing a dataloader position saved with {saved_world} "
-          f"data-parallel ranks in a run with {self._dp_world_size}"
+    elif state_dict.get("dp_world_size") != self._dp_world_size:
+      complaint = (
+          "the loader state comes from {} data-parallel ranks, this run has "
+          "{}".format(state_dict.get("dp_world_size"), self._dp_world_size)
       )
-    own_key = f"dp_rank_{self._dp_rank}"
-    if own_key not in state_dict:
-      raise ValueError(f"the dataloader state has no {own_key!r} entry")
-    position = state_dict[own_key]
+    elif rank_key not in state_dict:
+      complaint = "the loader state has no {} entry".format(rank_key)
+    if complaint is not None:
+      raise ValueError(complaint)
+    position = state_dict[rank_key]
     self._epoch = int(position["epoch"])
     self._cursor = int(position["cursor"])
     self._shard = self._epoch_shard(self._epoch)
-    queue = (self.tokenize(int(index)) for index in position["pending"])
-    self._pending = [doc for doc in queue if doc is not None]
+    self._pending = [
+        doc
+        for doc in map(self.tokenize, map(int, position["pending"]))
+        if doc is not None
+    ]
     self.stats.epoch = self._epoch

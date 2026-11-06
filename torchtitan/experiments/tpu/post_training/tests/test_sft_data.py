@@ -177,7 +177,7 @@ class MicrobatchHookTest(unittest.TestCase):
 
     class FixedCount:
 
-      def num_microbatches_per_step(self) -> int:
+      def accumulation_steps(self) -> int:
         return 3
 
     self.assertIsInstance(FixedCount(), MicrobatchesPerStep)
@@ -652,14 +652,35 @@ class ChatSFTDataLoaderTest(unittest.TestCase):
     with self.assertRaises(ValueError):
       loader.load_state_dict(dict(state, dp_world_size=2))
 
-  def test_microbatch_hook(self):
+  def test_accumulation_steps_hook(self):
     from torchtitan.experiments.tpu.post_training.sft_train import (
         MicrobatchesPerStep,
     )
 
     loader = self._loader(self.path, microbatches_per_step=3)
     self.assertIsInstance(loader, MicrobatchesPerStep)
-    self.assertEqual(loader.num_microbatches_per_step(), 3)
+    before = loader.state_dict()
+    self.assertEqual([loader.accumulation_steps() for _ in range(3)], [3] * 3)
+    self.assertEqual(loader.state_dict(), before)  # asking changes nothing
+
+  def test_rejected_state_keeps_position(self):
+    loader, twin = self._loader(self.path), self._loader(self.path)
+    next(iter(loader))
+    next(iter(twin))
+    state = loader.state_dict()
+    rejected = {
+        "version": dict(state, version=3),
+        "data-parallel size": dict(state, dp_world_size=4),
+        "rank entry": {k: v for k, v in state.items() if k != "dp_rank_0"},
+    }
+    for label, bad in rejected.items():
+      with self.subTest(label), self.assertRaises(ValueError):
+        loader.load_state_dict(bad)
+      self.assertEqual(loader.state_dict(), state)
+    self.assertEqual(
+        sft_data.batch_fingerprint(next(iter(loader))),
+        sft_data.batch_fingerprint(next(iter(twin))),
+    )
 
 
 if __name__ == "__main__":

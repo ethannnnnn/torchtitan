@@ -103,13 +103,13 @@ logger = logging.getLogger(__name__)
 
 @runtime_checkable
 class MicrobatchesPerStep(Protocol):
-  """Implemented by data loaders that set the gradient-accumulation count.
+  """A data loader that fixes how many microbatches form one optimizer step.
 
-  ``SFTTPUTrainer`` asks for ``num_microbatches_per_step()`` ahead of every
-  optimizer step and trains that many microbatches on each rank.
+  ``SFTTPUTrainer.train_step`` asks before every step and accumulates that
+  many microbatches.
   """
 
-  def num_microbatches_per_step(self) -> int:
+  def accumulation_steps(self) -> int:
     ...
 
 
@@ -137,7 +137,7 @@ class SFTTPUTrainer(TPUTrainer):
     logger.info("[sft] parameters: %s", self.parameter_report)
     rank = int(os.getenv("RANK", "0"))
     self._rank = rank
-    self.sft_records: list[dict[str, Any]] = []
+    self.sft_records = []
     self._step_loss: torch.Tensor | None = None
     self.lora_exports: list[str] = []
     self._install_lora_save(job_config)
@@ -171,39 +171,31 @@ class SFTTPUTrainer(TPUTrainer):
     self._setup_validation(job_config)
 
   # -- loss -------------------------------------------------------------
-  def _reinstall_chunked_loss(self, job_config: Configurable.Config) -> None:
-    """Give a ``ChunkedLossWrapper`` job its loss back after TPUTrainer.
+  def _reinstall_chunked_loss(self, job_config: Any) -> None:
+    """Give a job configured with ``ChunkedLossWrapper`` that loss back.
 
-    ``Trainer.__init__`` bound the configured wrapper to the model's
-    ``lm_head`` and set ``_skip_lm_head``, so the model returns hidden
-    states; ``TPUTrainer.__init__`` then installed a loss over logits. The
-    wrapper is rebuilt with the same call ``Trainer`` uses (same chunks,
-    inner loss and compile settings) and bound the same way. Other loss
-    configurations keep TPUTrainer's choice.
+    ``TPUTrainer.__init__`` replaces it with a loss over logits; this builds
+    it again the way upstream ``Trainer`` does, binds the single model part's
+    ``lm_head`` to it and lets the model stop before that projection.
     """
-    loss_config = job_config.loss
-    if not isinstance(loss_config, ChunkedLossWrapper.Config):
+    if not isinstance(job_config.loss, ChunkedLossWrapper.Config):
       return
-    if len(self.model_parts) != 1:
+    heads = [getattr(part, "lm_head", None) for part in self.model_parts]
+    if len(heads) != 1 or heads[0] is None:
       raise ValueError(
-          "SFTTPUTrainer applies the chunked loss to a single model part; "
-          f"this job has {len(self.model_parts)} (pipeline parallelism)"
+          "a ChunkedLossWrapper loss needs exactly one model part with an "
+          "lm_head; found {} part(s), lm_head present: {}".format(
+              len(heads), [head is not None for head in heads]
+          )
       )
-    (decoder,) = self.model_parts
-    head = getattr(decoder, "lm_head", None)
-    if head is None:
-      raise ValueError(
-          f"{type(decoder).__name__} has no lm_head module, which the chunked "
-          "loss applies to each chunk of hidden states"
-      )
-    chunked = loss_config.build(compile_config=job_config.compile)
+    (part,), (head,) = self.model_parts, heads
+    chunked = job_config.loss.build(compile_config=job_config.compile)
     chunked.set_lm_head(head)
-    decoder._skip_lm_head = True
+    part._skip_lm_head = True
     self.loss_fn = chunked
     logger.info(
-        "[sft] loss: ChunkedLossWrapper back in place of TPUTrainer's loss, "
-        "%d chunks",
-        chunked.num_chunks,
+        "[sft] chunked loss restored: %d chunks through the model's lm_head",
+        job_config.loss.num_chunks,
     )
 
   # -- LoRA adapter saves ----------------------------------------------
@@ -319,7 +311,7 @@ class SFTTPUTrainer(TPUTrainer):
     self._val_batches: list[dict[str, Any]] | None = None
     self._val_info: dict[str, Any] = {}
     self._val_started = False
-    self.val_records: list[dict[str, Any]] = []
+    self.val_records = []
     if self._val_path:
       from .sft_data import ChatSFTDataLoader
 
@@ -465,20 +457,20 @@ class SFTTPUTrainer(TPUTrainer):
       )
     total_loss, total_valid = (float(x) for x in totals.cpu().tolist())
     value = total_loss / max(total_valid, 1.0)
-    record = {
+    evaluation = {
         "step": step,
         "loss": value,
         "supervised_tokens": int(total_valid),
         "microbatches_per_rank": len(self._val_batches),
         "seconds": round(time.perf_counter() - t0, 3),
     }
-    self.val_records.append(record)
+    self.val_records.append(evaluation)
     logger.info(
         "[sft] validation step=%d loss=%.5f supervised_tokens=%d seconds=%.1f",
         step,
         value,
         int(total_valid),
-        record["seconds"],
+        evaluation["seconds"],
     )
     metrics = getattr(self, "metrics_processor", None)
     if metrics is not None and hasattr(metrics, "log_validation"):
@@ -492,7 +484,7 @@ class SFTTPUTrainer(TPUTrainer):
               {"set": self._val_info, "evals": self.val_records}, indent=2
           )
       )
-    return record
+    return evaluation
 
   def _maybe_validate(self, *, before_step: bool) -> None:
     if not self._val_path:
@@ -543,16 +535,16 @@ class SFTTPUTrainer(TPUTrainer):
     self._maybe_validate(before_step=True)
     loader = self.dataloader
     if isinstance(loader, MicrobatchesPerStep):
-      self.gradient_accumulation_steps = loader.num_microbatches_per_step()
+      self.gradient_accumulation_steps = loader.accumulation_steps()
     start = self._note_step_start()
     self._step_loss = None
     self._last_grad_norm = None
     result = super().train_step(data_iterator)
-    record = self._step_record(start)
-    self.sft_records.append(record)
-    logger.info("[sft] step %d: %s", self.step, record)
-    batches = self._take_step_batches(start)
-    self._append_rank_line(record, batches, start.learning_rates)
+    this_step = self._step_record(start)
+    self.sft_records.append(this_step)
+    logger.info("[sft] step %d: %s", self.step, this_step)
+    drawn = self._take_step_batches(start)
+    self._append_rank_line(this_step, drawn, start.learning_rates)
     self._rewrite_rank0_records()
     self._maybe_validate(before_step=False)
     return result
