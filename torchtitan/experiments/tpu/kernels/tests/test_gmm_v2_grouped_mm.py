@@ -6,12 +6,9 @@
 
 """Tests for the Tokamax GMM-v2 expert grouped matmul.
 
-The kernel tests need a TPU (``--device=tpu``) and skip on other devices. The
-autograd bookkeeping tests replace the kernels with stand-ins and run anywhere.
+These tests need a TPU (``--device=tpu``) and skip on other devices.
+``test_gmm_v2_grouped_mm_cpu`` has the tests that run without a TPU.
 """
-
-from types import SimpleNamespace
-from unittest import mock
 
 from absl.testing import absltest
 import torch
@@ -180,8 +177,8 @@ class TpuGroupedExpertsGmmV2Test(base_device_test.BaseAcceleratorDeviceTest):
                 self.assertLess(rel(g.cpu(), rg), 2e-2, (native, name))
 
     def test_large_expert_shapes_compile(self):
-        # 4096 x 4096 experts: full-axis MegaBlox tiles exceed the 64 MiB VMEM of a
-        # TPU7x TensorCore; the GMM-v2 heuristic tiles must compile and run.
+        # 4096 x 4096 experts: one full-axis BF16 weight tile is 32 MiB, half the
+        # 64 MiB VMEM of a TPU7x TensorCore. The heuristic tiles must still fit.
         device = self.accelerator_device
         experts, _ = self._experts(4096, 4096, 4, True)
         rows = 16384
@@ -192,84 +189,6 @@ class TpuGroupedExpertsGmmV2Test(base_device_test.BaseAcceleratorDeviceTest):
         out.float().square().mean().backward()
         self.assertTrue(bool(torch.isfinite(out.float()).all().cpu()))
         self.assertTrue(bool(torch.isfinite(experts.w1_EDF.grad.float()).all().cpu()))
-
-
-class GmmV2AutogradBookkeepingTest(absltest.TestCase):
-    """What the backward keeps alive and which kernels it calls."""
-
-    def setUp(self):
-        super().setUp()
-        self.lhs = torch.ones(4, 2)
-        self.rhs = torch.ones(1, 2, 3)
-        self.group_sizes = torch.tensor([4], dtype=torch.int32)
-        self.grad_output = torch.ones(4, 3)
-
-    def _setup(self, needs_input_grad):
-        ctx = SimpleNamespace()
-        if needs_input_grad is not None:
-            ctx.needs_input_grad = needs_input_grad
-
-        def save_for_backward(*tensors):
-            ctx.saved_tensors = tensors
-
-        ctx.save_for_backward = save_for_backward
-        gmm_v2_grouped_mm._setup_context(
-            ctx, (self.lhs, self.rhs, self.group_sizes), None
-        )
-        return ctx
-
-    def _backward(self, ctx):
-        with mock.patch.object(
-            gmm_v2_grouped_mm, "_gmm_v2_dgrad", return_value="dx"
-        ) as dgrad, mock.patch.object(
-            gmm_v2_grouped_mm, "_gmm_v2_bwd", return_value=("dx", "dw")
-        ) as bwd:
-            grads = gmm_v2_grouped_mm._backward(ctx, self.grad_output)
-        return grads, dgrad, bwd
-
-    def test_frozen_weights_keep_only_the_weights(self):
-        ctx = self._setup((True, False, False))
-        self.assertFalse(ctx.lhs_saved)
-        self.assertEqual(len(ctx.saved_tensors), 2)
-        self.assertIs(ctx.saved_tensors[0], self.rhs)
-        grads, dgrad, bwd = self._backward(ctx)
-        self.assertEqual(grads, ("dx", None, None))
-        dgrad.assert_called_once_with(self.grad_output, self.rhs, self.group_sizes)
-        bwd.assert_not_called()
-
-    def test_trainable_weights_run_the_full_backward(self):
-        ctx = self._setup((True, True, False))
-        self.assertTrue(ctx.lhs_saved)
-        self.assertEqual(len(ctx.saved_tensors), 3)
-        grads, dgrad, bwd = self._backward(ctx)
-        self.assertEqual(grads, ("dx", "dw", None))
-        bwd.assert_called_once_with(
-            self.grad_output, self.lhs, self.rhs, self.group_sizes
-        )
-        dgrad.assert_not_called()
-
-    def test_unknown_requires_grad_keeps_the_lhs(self):
-        ctx = self._setup(None)
-        self.assertTrue(ctx.lhs_saved)
-        grads, _, bwd = self._backward(ctx)
-        self.assertEqual(grads, ("dx", "dw", None))
-        bwd.assert_called_once()
-
-    def test_weight_grad_without_saved_lhs_raises(self):
-        ctx = self._setup((True, False, False))
-        ctx.needs_input_grad = (True, True, False)
-        with self.assertRaisesRegex(RuntimeError, "LHS not saved"):
-            gmm_v2_grouped_mm._backward(ctx, self.grad_output)
-
-    def test_group_sizes_reach_the_kernel_as_int32(self):
-        with mock.patch.object(
-            gmm_v2_grouped_mm, "_gmm_v2_fwd", return_value="out"
-        ) as fwd:
-            out = gmm_v2_grouped_mm.gmm_v2_grouped_mm(
-                self.lhs, self.rhs, self.group_sizes.long()
-            )
-        self.assertEqual(out, "out")
-        self.assertEqual(fwd.call_args.args[2].dtype, torch.int32)
 
 
 if __name__ == "__main__":

@@ -694,6 +694,11 @@ Reference recipes, all in [`qwen3/config_registry.py`](qwen3/config_registry.py)
 Enable all five. The grouped matmul is the largest lever. The others remove copies and repeated
 work around it.
 
+`use_tokamax_gmm_v2` is an opt-in alternative to the first two rows: all three expert projections,
+forward and backward, run on the Tokamax GMM-v2 kernel
+([`kernels/gmm_v2_grouped_mm.py`](kernels/gmm_v2_grouped_mm.py)), which sizes its own tiles. See
+the notes below.
+
 ### How to enable them
 
 Two converters swap in the TPU classes when the model is built. The kernels are then switched on
@@ -736,8 +741,11 @@ Notes on the switches:
 
 - **Use the Pallas grouped matmul, not `torch._grouped_mm`.** The native op has produced incorrect
   weight gradients on TPU (torch_tpu issue 2668). The recipes use the Pallas path for that reason.
-- **The paired kernel and the kernel-native layout both require `use_pallas_grouped_mm`.** Model
-  construction fails otherwise.
+- **The paired kernel requires `use_pallas_grouped_mm`; the kernel-native layout requires
+  `use_pallas_grouped_mm` or `use_tokamax_gmm_v2`.** Model construction fails otherwise.
+- **`use_tokamax_gmm_v2` overrides `use_pallas_grouped_mm` and `use_pallas_paired_grouped_mm`.**
+  When it is set, the expert matmuls ignore both switches and the tile sizes below. It does not
+  support `scale_before_down_proj`: the expert forward raises.
 - **Model checkpoints are unaffected by the kernel-native layout; optimizer state is not.** Weights
   are stored in the order the kernel reads, and the module's state-dict hooks translate to and from
   the standard keys (`w1_EFD` etc.) on save and load. The optimizer state dict has no such hook: it

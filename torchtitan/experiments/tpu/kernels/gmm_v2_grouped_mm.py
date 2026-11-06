@@ -13,10 +13,6 @@ and ``dW_e = X_e^T @ dY_e`` with the same Pallas kernel family (Tokamax
 tiling heuristic, so no per-shape tile tuning is needed. Rows past
 ``sum(group_sizes)`` are not visited (their outputs are unspecified), which lets
 callers pass a fixed-size, partially filled routed-row buffer.
-
-On TPU7x at expert shapes of 4096 x 8192 and 4096 x 4096 with 65,536 routed
-rows, this path measured faster than the MegaBlox v1 kernels for all three
-GEMMs and does not exceed VMEM at large K/N (where full-axis MegaBlox tiles do).
 """
 
 import jax
