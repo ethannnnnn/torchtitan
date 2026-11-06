@@ -35,12 +35,14 @@ The keys are visited in sorted order, so all ranks issue matching collectives.
 
 from __future__ import annotations
 
+import itertools
 import json
 import math
+import operator
 import os
 import pathlib
 import re
-from collections import Counter, defaultdict
+from collections import Counter
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
@@ -139,12 +141,12 @@ def lora_hyperparams_of(model: torch.nn.Module) -> LoraHyperparams:
     return LoraHyperparams(rank=rank, alpha=alpha)
 
 
-def _ab_letters(module: str, letters: set[str]) -> tuple[str, str]:
-    if letters == {"a", "b"} or letters == {"A", "B"}:
-        first, second = sorted(letters)
-        return first, second
-    raise PeftAdapterError(
-        f"adapter {module!r} needs one A and one B matrix spelled the same way, found lora_{sorted(letters)}")
+def _module_triple(module: str, letters: str) -> tuple[str, str, str]:
+    if letters not in ("ab", "AB"):
+        found = "/".join(f"lora_{letter}" for letter in letters)
+        raise PeftAdapterError(f"adapter {module!r} needs one A and one B matrix spelled the same way, found {found}")
+    a_key, b_key = (f"{module}.lora_{letter}.weight" for letter in letters)
+    return module, a_key, b_key
 
 
 def pair_lora_matrices(keys: Iterable[str]) -> list[tuple[str, str, str]]:
@@ -153,22 +155,15 @@ def pair_lora_matrices(keys: Iterable[str]) -> list[tuple[str, str, str]]:
     Keys that do not name a LoRA matrix are skipped. Both TorchTitan's lower-case
     and PEFT's upper-case matrix letters are understood, but one module may not mix them.
     """
-    letters_by_module: dict[str, set[str]] = defaultdict(set)
-    for key in keys:
-        match = _ADAPTER_KEY.fullmatch(key)
-        if match is not None:
-            letters_by_module[match["module"]].add(match["letter"])
-    triples = []
-    for module in sorted(letters_by_module):
-        a, b = _ab_letters(module, letters_by_module[module])
-        triples.append((module, f"{module}.lora_{a}.weight", f"{module}.lora_{b}.weight"))
-    return triples
+    found = sorted({(match["module"], match["letter"]) for match in map(_ADAPTER_KEY.fullmatch, keys) if match})
+    return [_module_triple(module, "".join(letter for _, letter in group))
+            for module, group in itertools.groupby(found, key=operator.itemgetter(0))]
 
 
 def spark_hf_module_name(module: str) -> str:
     """The released checkpoint's name for one adapted TorchTitan projection.
 
-    ``layers.3.attention.wo`` becomes ``model.language_model.layers.3.self_attn.o_proj``.
+    ``layers.17.attention.wo`` becomes ``model.language_model.layers.17.self_attn.o_proj``.
     Any other path is refused, so that no tensor is stored under a name a
     loader would apply to the wrong module.
     """
@@ -190,21 +185,21 @@ def materialize_lora_matrices(
 ) -> dict[str, torch.Tensor]:
     """Unsharded CPU copies of the adapter matrices of ``state`` (collective).
 
-    Every rank must call this with the same keys. Matrices are visited module by
+    All ranks join in, each with an identical key set. Matrices are visited module by
     module in sorted order, A before B, and a DTensor is gathered in full. Only
     a rank with ``keep`` stores the copies (detached, contiguous, in ``dtype``);
     the others drop each gathered matrix before the next one and get ``{}``.
     Entries other than adapter matrices are never touched.
     """
-    triples = pair_lora_matrices(state)
-    kept: dict[str, torch.Tensor] = {}
-    for _, a_key, b_key in triples:
-        for key in (a_key, b_key):
-            whole = _gathered(state[key])
-            if keep:
-                kept[key] = whole.detach().to(device="cpu", dtype=dtype, copy=True).contiguous()
-            del whole
-    return kept
+    names = [name for triple in pair_lora_matrices(state) for name in triple[1:]]
+    if not keep:
+        for name in names:
+            _gathered(state[name])  # collective: join it, keep nothing
+        return {}
+    host = {name: torch.empty(state[name].shape, dtype=dtype, device="cpu") for name in names}
+    for name in names:
+        host[name].copy_(_gathered(state[name]).detach())
+    return host
 
 
 def _check_layout_entry(module: str, hf_module: str, a: Any, b: Any) -> None:
@@ -297,7 +292,7 @@ def write_spark_adapter_dir(
 
 
 def load_spark_adapter(model: torch.nn.Module, adapter_dir: str | os.PathLike[str]) -> dict[str, Any]:
-    """Copy a PEFT adapter directory into the model's LoRA parameters.
+    """Inverse of export: copy the tensors stored by ``write_spark_adapter_dir`` into ``model``.
 
     Every rank reads the whole tensor file. A DTensor parameter receives its own
     shard of the stored matrix through ``distribute_tensor``, so with sharded
@@ -313,7 +308,7 @@ def load_spark_adapter(model: torch.nn.Module, adapter_dir: str | os.PathLike[st
             for key, letter in ((a_key, "A"), (b_key, "B")):
                 name = f"{_PEFT_ROOT}{hf_module}.lora_{letter}.weight"
                 if name not in stored:
-                    raise PeftAdapterError(f"{_TENSOR_FILE} in {adapter_dir} has no tensor {name!r}")
+                    raise PeftAdapterError(f"{adapter_dir}: {_TENSOR_FILE} lacks {name!r}")
                 target = live[key]
                 incoming = stored[name].to(dtype=target.dtype)
                 if isinstance(target, DTensor):
