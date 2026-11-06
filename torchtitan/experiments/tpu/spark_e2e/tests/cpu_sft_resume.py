@@ -27,8 +27,12 @@ gradient norm, learning rate, the SHA-256 of every microbatch and its
 document ids); the final PEFT adapters are identical; the checkpoint holds
 only adapter tensors plus training state.
 
-    PYTHONPATH=<repo>/torchtitan/experiments/tpu/tests/cpu_stubs:<repo> \\
-      TORCH_DEVICE_BACKEND_AUTOLOAD=0 python -m torchtitan.experiments.tpu.spark_e2e.tests.cpu_sft_resume \\
+Start it from the repository root, with the TorchTPU CPU stand-in
+(``torchtitan/experiments/tpu/tests/cpu_stubs``) ahead of the repository root
+on ``PYTHONPATH`` and ``TORCH_DEVICE_BACKEND_AUTOLOAD=0`` in the environment,
+which is how ``run_cpu.sh`` launches it::
+
+    python -m torchtitan.experiments.tpu.spark_e2e.tests.cpu_sft_resume \\
         --model <tiny-muse-spark> --work <new dir> [--data <chat jsonl>] [--nproc 2] [--ac] [--partial]
 
 Without ``--data`` the runs train on short generated chat records
@@ -93,9 +97,13 @@ def read_records(dump: Path) -> dict[int, dict[int, dict]]:
 FIELDS = ("loss_local", "grad_norm", "lr", "batches", "epoch", "documents", "tokens", "valid_tokens_local")
 
 
-def _batches(rec: dict) -> list:
-    # The per-process microbatch counter restarts after a resume; compare content.
-    return [(b.get("sha256"), b.get("docs")) for b in rec.get("batches", [])]
+def _digest_and_docs(entry: dict) -> tuple:
+    return entry.get("sha256"), entry.get("docs")
+
+
+def _batch_draws(record: dict) -> list[tuple]:
+    """(sha256, docs) of each microbatch a step drew, in order; microbatch numbers restart on resume."""
+    return list(map(_digest_and_docs, record.get("batches", [])))
 
 
 def compare(a: dict, b: dict, steps: range) -> list[str]:
@@ -109,7 +117,7 @@ def compare(a: dict, b: dict, steps: range) -> list[str]:
                 diffs.append(f"rank {rank} step {step}: missing ({ra is None}, {rb is None})")
                 continue
             for field in FIELDS:
-                va, vb = (_batches(ra), _batches(rb)) if field == "batches" else (ra.get(field), rb.get(field))
+                va, vb = (_batch_draws(ra), _batch_draws(rb)) if field == "batches" else (ra.get(field), rb.get(field))
                 if va != vb:
                     diffs.append(f"rank {rank} step {step} {field}: {va!r} != {vb!r}")
     return diffs
@@ -127,28 +135,47 @@ def adapter_tensors(dump: Path, step: int, entry: str) -> dict:
     return load_file(str(dump / "adapter" / f"step-{step}" / "adapter_model.safetensors"))
 
 
+def _resume_arguments() -> argparse.Namespace:
+    resume_parser = argparse.ArgumentParser(
+        description="Kill a CPU LoRA SFT run mid-training, resume it and compare it with an uninterrupted run.")
+    resume_parser.add_argument("--model", required=True, help="directory of the tiny Muse Spark checkpoint")
+    resume_parser.add_argument("--data", default="", help="chat records as JSONL (default: generate short ones)")
+    resume_parser.add_argument("--work", required=True, help="working directory, removed first if it exists")
+    resume_parser.add_argument("--entry", choices=sorted(ENTRIES), default="e2e", help="training entry to run")
+    resume_parser.add_argument("--nproc", type=int, default=1, help="ranks per torchrun launch")
+    resume_parser.add_argument("--steps", type=int, default=6, help="steps of the reference and resumed runs")
+    resume_parser.add_argument("--interval", type=int, default=3, help="checkpoint every this many steps")
+    resume_parser.add_argument("--kill-step", type=int, default=5, help="step during which the crash run dies")
+    resume_parser.add_argument("--lr", type=float, default=0.01, help="learning rate of every run")
+    resume_parser.add_argument("--ac", action="store_true", help="turn on full activation checkpointing")
+    resume_parser.add_argument("--partial", action="store_true",
+                               help="also resume past an incomplete newer checkpoint")
+    parsed = resume_parser.parse_args()
+    if not parsed.interval < parsed.kill_step <= parsed.steps:
+        resume_parser.error("the steps must satisfy --interval < --kill-step <= --steps, so that a checkpoint "
+                            "exists before the kill and the reference run gets past it")
+    return parsed
+
+
+def _fresh_dir(path: Path) -> Path:
+    if path.exists():
+        shutil.rmtree(path)
+    path.mkdir(parents=True)
+    return path
+
+
+def _print_checks(checks: dict[str, bool], failed: list[str]) -> None:
+    for name in checks:
+        marker = "FAIL" if name in failed else "ok"
+        print(f"[RESUME] {marker:<4} {name}")
+
+
 def main() -> int:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--model", required=True)
-    ap.add_argument("--data", default="")
-    ap.add_argument("--work", required=True)
-    ap.add_argument("--entry", choices=sorted(ENTRIES), default="e2e")
-    ap.add_argument("--nproc", type=int, default=1)
-    ap.add_argument("--steps", type=int, default=6)
-    ap.add_argument("--interval", type=int, default=3)
-    ap.add_argument("--kill-step", type=int, default=5)
-    ap.add_argument("--lr", type=float, default=1e-2)
-    ap.add_argument("--ac", action="store_true", help="full activation checkpointing (as on TPU)")
-    ap.add_argument("--partial", action="store_true", help="also resume past an incomplete newer checkpoint")
-    args = ap.parse_args()
-    if not args.interval < args.kill_step <= args.steps:
-        ap.error("need --interval < --kill-step <= --steps")
-    import torch  # noqa: F401  (fail early without torch)
+    args = _resume_arguments()
+    import torch  # noqa: F401  (without torch this fails here, before any run)
+
     args.repo = str(Path(__file__).resolve().parents[5])
-    work = Path(args.work)
-    if work.exists():
-        shutil.rmtree(work)
-    work.mkdir(parents=True)
+    work = _fresh_dir(Path(args.work))
     if not args.data:
         from torchtitan.experiments.tpu.spark_e2e.tests.cpu_sft_smoke import write_conversations
 
@@ -215,16 +242,18 @@ def main() -> int:
         checks["partial: resumed steps == ref (bitwise)"] = not pdiff
         summary["diffs"]["partial"] = pdiff[:20]
 
-    summary["pass"] = all(checks.values())
-    (work / "resume_summary.json").write_text(json.dumps(summary, indent=2, default=str))
-    for name, ok in checks.items():
-        print(f"[RESUME] {'ok  ' if ok else 'FAIL'} {name}")
-    for kind, diffs in summary["diffs"].items():
-        for d in diffs[:5]:
-            print(f"[RESUME] diff {kind}: {d}")
-    print(f"[RESUME] {'PASS' if summary['pass'] else 'FAIL'} entry={args.entry} nproc={args.nproc} "
-          f"ac={args.ac} ckpt_step={ckpt_step} checkpoint={summary['checkpoint']}")
-    return 0 if summary["pass"] else 1
+    failed = [name for name in checks if not checks[name]]
+    summary["pass"] = not failed
+    with open(work / "resume_summary.json", "w") as handle:
+        json.dump(summary, handle, indent=2, default=str)
+    _print_checks(checks, failed)
+    for kind in summary["diffs"]:
+        for diff in summary["diffs"][kind][:5]:
+            print(f"[RESUME] diff {kind}: {diff}")
+    verdict = "FAIL" if failed else "PASS"
+    print(f"[RESUME] {verdict} entry={args.entry} nproc={args.nproc} ac={args.ac} ckpt_step={ckpt_step} "
+          f"checkpoint={summary['checkpoint']}")
+    return int(bool(failed))
 
 
 if __name__ == "__main__":

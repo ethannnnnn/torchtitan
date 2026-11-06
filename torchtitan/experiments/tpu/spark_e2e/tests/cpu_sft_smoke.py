@@ -29,8 +29,12 @@ steps and after the last; finite training losses; run B restores run A's
 adapter exactly; each run used the reader it asked for, and both readers give
 the same held-out loss for that adapter.
 
-    PYTHONPATH=<repo>/torchtitan/experiments/tpu/tests/cpu_stubs:<repo> \\
-      TORCH_DEVICE_BACKEND_AUTOLOAD=0 python -m torchtitan.experiments.tpu.spark_e2e.tests.cpu_sft_smoke \\
+Start it from the repository root, with the TorchTPU CPU stand-in
+(``torchtitan/experiments/tpu/tests/cpu_stubs``) ahead of the repository root
+on ``PYTHONPATH`` and ``TORCH_DEVICE_BACKEND_AUTOLOAD=0`` in the environment,
+which is how ``run_cpu.sh`` launches it::
+
+    python -m torchtitan.experiments.tpu.spark_e2e.tests.cpu_sft_smoke \\
         --model <tiny-muse-spark> --work <new dir> [--nproc 2]
 
 Prints ``[SMOKE] PASS`` and writes ``<work>/smoke_summary.json``.
@@ -94,23 +98,40 @@ def checkpoint_keys(step_dir: Path) -> list[str]:
     return sorted(FileSystemReader(str(step_dir)).read_metadata().state_dict_metadata)
 
 
+def _smoke_arguments() -> argparse.Namespace:
+    smoke_parser = argparse.ArgumentParser(
+        description="CPU LoRA SFT smoke through the real trainer: training, PEFT exports and an adapter reload.")
+    smoke_parser.add_argument("--model", required=True, help="directory of the tiny Muse Spark checkpoint")
+    smoke_parser.add_argument("--work", required=True, help="working directory, removed first if it exists")
+    smoke_parser.add_argument("--nproc", type=int, default=1, help="ranks per torchrun launch (default: 1)")
+    smoke_parser.add_argument("--steps", type=int, default=4, help="training steps of run A (default and minimum: 4)")
+    parsed = smoke_parser.parse_args()
+    if parsed.steps < 4:
+        smoke_parser.error(f"--steps {parsed.steps} is too small: at least 4 are needed, because the export "
+                           "checks look at step 2, at step 3 and at a later final step")
+    return parsed
+
+
+def _fresh_dir(path: Path) -> Path:
+    if path.exists():
+        shutil.rmtree(path)
+    path.mkdir(parents=True)
+    return path
+
+
+def _print_checks(checks: dict[str, bool], failed: list[str]) -> None:
+    for name in checks:
+        marker = "FAIL" if name in failed else "ok"
+        print(f"[SMOKE] {marker:<4} {name}")
+
+
 def main() -> int:
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--model", required=True, help="tiny Muse Spark checkpoint directory")
-    ap.add_argument("--work", required=True, help="new working directory")
-    ap.add_argument("--nproc", type=int, default=1)
-    ap.add_argument("--steps", type=int, default=4)
-    args = ap.parse_args()
-    if args.steps < 4:
-        ap.error("--steps must be at least 4 (exports at 2, 3 and the last step)")
+    args = _smoke_arguments()
     import torch
     from safetensors.torch import load_file
 
     repo = str(Path(__file__).resolve().parents[5])
-    work = Path(args.work)
-    if work.exists():
-        shutil.rmtree(work)
-    work.mkdir(parents=True)
+    work = _fresh_dir(Path(args.work))
     train, val = work / "data" / "train.jsonl", work / "data" / "val.jsonl"
     write_conversations(train, 32)
     write_conversations(val, 8, seed=5)
@@ -192,12 +213,14 @@ def main() -> int:
     checks["run B export == run A's adapter (bitwise)"] = bool(tensors) and sorted(tensors_b) == sorted(tensors) and all(
         torch.equal(tensors[k], tensors_b[k]) for k in tensors)
 
-    summary["pass"] = all(checks.values())
-    (work / "smoke_summary.json").write_text(json.dumps(summary, indent=2, default=str))
-    for name, ok in checks.items():
-        print(f"[SMOKE] {'ok  ' if ok else 'FAIL'} {name}")
-    print(f"[SMOKE] {'PASS' if summary['pass'] else 'FAIL'} nproc={args.nproc} steps={args.steps}")
-    return 0 if summary["pass"] else 1
+    failed = [name for name in checks if not checks[name]]
+    summary["pass"] = not failed
+    with open(work / "smoke_summary.json", "w") as handle:
+        json.dump(summary, handle, indent=2, default=str)
+    _print_checks(checks, failed)
+    verdict = "FAIL" if failed else "PASS"
+    print(f"[SMOKE] {verdict} nproc={args.nproc} steps={args.steps}")
+    return int(bool(failed))
 
 
 if __name__ == "__main__":

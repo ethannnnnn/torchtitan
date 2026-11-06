@@ -17,15 +17,14 @@
 # in torchtitan/experiments/tpu/tests/cpu_stubs (kernels raise if called;
 # nothing here calls them).
 set -euo pipefail
-TEST_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-REPO_ROOT=$(cd "$TEST_DIR/../../../../.." && pwd)
-CPU_PYTHON=${CPU_PYTHON:-python3}
+REPO_ROOT=$(realpath "$(dirname "${BASH_SOURCE[0]}")/../../../../..")
+: "${CPU_PYTHON:=python3}"
 TINY= NPROC=2
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --tiny-checkpoint) [[ $# -ge 2 ]] || { echo 'missing DIR' >&2; exit 2; }; TINY=$(cd "$2" && pwd); shift 2 ;;
     --nproc) [[ $# -ge 2 ]] || { echo 'missing N' >&2; exit 2; }; NPROC=$2; shift 2 ;;
-    *) echo "unknown argument: $1" >&2; exit 2 ;;
+    *) echo "run_cpu.sh: unexpected argument '$1' (expected --tiny-checkpoint DIR or --nproc N)" >&2; exit 2 ;;
   esac
 done
 export PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"

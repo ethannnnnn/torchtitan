@@ -56,15 +56,17 @@ def read_header(path: Path) -> tuple[int, dict]:
 
 
 def truncated_config(config: dict, layers: int) -> dict:
-    out = json.loads(json.dumps(config))
-    text = out.get("text_config", out)
-    if layers > text["num_hidden_layers"]:
-        raise ValueError(f"checkpoint has {text['num_hidden_layers']} layers, asked for {layers}")
+    """A copy of ``config`` whose text decoder keeps only its first ``layers`` layers."""
+    import copy
+
+    result = copy.deepcopy(config)
+    text = result["text_config"] if "text_config" in result else result
+    available = text["num_hidden_layers"]
+    if layers > available:
+        raise ValueError(f"asked for {layers} decoder layers, but the source config has only {available}")
     text["num_hidden_layers"] = layers
-    for key in PER_LAYER_LISTS:
-        if isinstance(text.get(key), list):
-            text[key] = text[key][:layers]
-    return out
+    text.update({name: text[name][:layers] for name in PER_LAYER_LISTS if isinstance(text.get(name), list)})
+    return result
 
 
 def build(src: Path, out: Path, layers: int, threads: int) -> dict:
@@ -74,7 +76,7 @@ def build(src: Path, out: Path, layers: int, threads: int) -> dict:
     by_file: dict[str, list[str]] = {}
     for key in keys:
         by_file.setdefault(index[key], []).append(key)
-    out.mkdir(parents=True, exist_ok=True)
+    os.makedirs(out, exist_ok=True)
     headers = {}
 
     def header_of(name: str):
@@ -135,14 +137,22 @@ def build(src: Path, out: Path, layers: int, threads: int) -> dict:
             "gb_per_s": round(copied / max(seconds, 1e-9) / 1e9, 2), "out": str(out)}
 
 
+_CLI_FLAGS = (
+    ("--src", {"required": True, "help": "sharded Hugging Face checkpoint directory to read from"}),
+    ("--out", {"required": True, "help": "directory that receives the truncated checkpoint"}),
+    ("--layers", {"type": int, "required": True, "help": "how many leading decoder layers to keep"}),
+    ("--threads", {"type": int, "default": 16, "help": "files read in parallel (default: %(default)s)"}),
+)
+
+
 def main() -> int:
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--src", required=True)
-    ap.add_argument("--out", required=True)
-    ap.add_argument("--layers", type=int, required=True)
-    ap.add_argument("--threads", type=int, default=16)
-    args = ap.parse_args()
-    print(json.dumps(build(Path(args.src), Path(args.out), args.layers, args.threads)), flush=True)
+    trunc_cli = argparse.ArgumentParser(
+        description="Copy the first N decoder layers of a sharded Muse Spark checkpoint into a small one.")
+    for flag, settings in _CLI_FLAGS:
+        trunc_cli.add_argument(flag, **settings)
+    args = trunc_cli.parse_args()
+    report = build(Path(args.src), Path(args.out), args.layers, args.threads)
+    print(json.dumps(report), flush=True)
     return 0
 
 
