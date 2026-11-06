@@ -158,13 +158,21 @@ def load_manifest(directory: Path) -> tuple[dict, bytes]:
     return manifest, archive
 
 
-def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--repo", type=Path, default=Path("."), help="git checkout holding both commits")
-    ap.add_argument("--base", required=True, help="public base commit the pods fetch")
-    ap.add_argument("--candidate", default="HEAD", help="commit whose tree the pods must end up with")
-    ap.add_argument("--out", type=Path, required=True, help="new output directory")
-    args = ap.parse_args(argv)
+_OVERLAY_OPTIONS = (
+    ("--repo", {"type": Path, "default": Path("."),
+                "help": "git checkout that holds both commits (default: the current directory)"}),
+    ("--base", {"required": True, "help": "public base commit that every pod fetches before applying the overlay"}),
+    ("--candidate", {"default": "HEAD", "help": "commit whose tree the pods must end up with (default: HEAD)"}),
+    ("--out", {"type": Path, "required": True, "help": "output directory to create; it must not exist yet"}),
+)
+
+
+def main() -> int:
+    overlay_cli = argparse.ArgumentParser(
+        description="Package a candidate commit's changes against a public base as the pods' inline code overlay.")
+    for flag, settings in _OVERLAY_OPTIONS:
+        overlay_cli.add_argument(flag, **settings)
+    args = overlay_cli.parse_args()
     manifest = build(args.repo.resolve(), args.base, args.candidate, args.out)
     print(f"overlay: {len(manifest['files'])} files, {len(manifest['deleted'])} deletions, "
           f"{manifest['bytes']} bytes; base {manifest['base_commit']} -> tree {manifest['candidate_tree']}")
