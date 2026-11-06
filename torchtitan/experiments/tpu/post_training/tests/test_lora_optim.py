@@ -456,5 +456,36 @@ class LowBitOptimizerTest(unittest.TestCase):
     self.assertNotIsInstance(plain, PostTrainingOptimizersContainer.Config)
 
 
+class LowBitFactoryTest(unittest.TestCase):
+  """The optimizer builders that ``lowbit_factory`` returns (torchao)."""
+
+  def test_torch_switches_are_dropped(self):
+    from torchtitan.experiments.tpu.post_training import optimizers
+
+    build = optimizers.lowbit_factory("AdamW8bit")
+    param = torch.nn.Parameter(torch.zeros(64, 80))
+    optimizer = build([param], lr=1e-3, fused=None, foreach=False)
+    self.assertEqual(type(optimizer).__name__, "AdamW8bitStep")
+    self.assertFalse(optimizer.bf16_stochastic_round)
+
+  def test_bf16_rounding_is_on_by_default(self):
+    from torchtitan.experiments.tpu.post_training import optimizers
+
+    build = optimizers.lowbit_factory("AdamWBf16")
+    param = torch.nn.Parameter(torch.zeros(16, dtype=torch.bfloat16))
+    self.assertTrue(build([param], lr=1e-3).bf16_stochastic_round)
+    plain = build([param], lr=1e-3, bf16_stochastic_round=False, foreach=True)
+    self.assertFalse(plain.bf16_stochastic_round)
+    self.assertEqual(type(plain).__name__, "_AdamWStep")
+
+  def test_unknown_name_or_backend(self):
+    from torchtitan.experiments.tpu.post_training import optimizers
+
+    with self.assertRaises(ValueError):
+      optimizers.lowbit_factory("AdamW8bit", backend="xla")
+    with self.assertRaises(NotImplementedError):
+      optimizers.lowbit_factory("Lion")
+
+
 if __name__ == "__main__":
   unittest.main()
