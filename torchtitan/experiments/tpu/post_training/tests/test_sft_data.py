@@ -286,15 +286,13 @@ class ChatTemplateCallTest(unittest.TestCase):
     self.assertEqual(conversation, [dict(m) for m in self.CHAT[:2]])
     self.assertIsNot(conversation[1], self.CHAT[1])
     thinking = self.OPTIONS.with_extra(enable_thinking=False)
+    self.assertEqual(dict(thinking.extra), {"enable_thinking": False})
     ct.render_text(tok, self.CHAT, thinking, add_generation_prompt=False)
+    # The options' extra pairs arrive untouched next to the explicit keywords.
+    explicit = {"add_generation_prompt": False, "tokenize": False}
     self.assertEqual(
         tok.calls[-1][2],
-        {
-            "add_generation_prompt": False,
-            "tokenize": False,
-            "current_date": None,
-            "enable_thinking": False,
-        },
+        {**explicit, "current_date": None, **dict(thinking.extra)},
     )
     clash = self.OPTIONS.with_extra(tokenize=True)
     with self.assertRaises(TypeError):
@@ -306,7 +304,7 @@ class ChatTemplateCallTest(unittest.TestCase):
         tok = _WordTokenizer(bare=bare)
         ids = ct.encode_rendered(tok, "<user> hi <assistant> ")
         self.assertEqual(ids, [10, 11, 12])
-        self.assertTrue(all(type(token) is int for token in ids))
+        self.assertEqual(set(map(type, ids)), {int})  # plain ints only
         self.assertEqual(
             tok.calls,
             [("__call__", "<user> hi <assistant> ", {"add_special_tokens": False})],

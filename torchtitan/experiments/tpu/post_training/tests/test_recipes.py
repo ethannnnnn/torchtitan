@@ -153,6 +153,7 @@ class SparkRecipeTest(unittest.TestCase):
       with self.subTest(name=name):
         recipe = vars(cr)[name]
         config = recipe()
+        self.assertIsInstance(config.dataloader, ChatSFTDataLoader.Config)
         self.assertEqual(config.dataloader.reasoning_effort, "low")
         # Pallas fused CE carries the head's multiplier and soft cap.
         head = config.model_spec.model.lm_head
@@ -399,10 +400,9 @@ class BaseConfigTest(unittest.TestCase):
     self.assertTrue(checkpoint.enable)
     self.assertEqual(checkpoint.interval, 5)
     self.assertEqual(checkpoint.async_mode, "disabled")
-    self.assertTrue(checkpoint.initial_load_in_hf)
-    self.assertTrue(checkpoint.initial_load_model_only)
-    self.assertFalse(checkpoint.last_save_in_hf)
-    self.assertFalse(checkpoint.last_save_model_only)
+    load = (checkpoint.initial_load_in_hf, checkpoint.initial_load_model_only)
+    save = (checkpoint.last_save_in_hf, checkpoint.last_save_model_only)
+    self.assertEqual((load, save), ((True, True), (False, False)))
 
   def test_activation_checkpoint_names(self):
     from torchtitan.distributed.activation_checkpoint import FullAC, SelectiveAC
