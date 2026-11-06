@@ -176,6 +176,65 @@ class StepRecipesTest(unittest.TestCase):
     finally:
       os.environ.pop("SPARK_EXPERT_PLACEMENT_OUT", None)
 
+  def test_save_hook_empties_the_cache_and_settles_only_tpu_ranks(self):
+    """The installed ``CheckpointManager._save``: the original's result, a dropped cache, a TPU-only settle."""
+    import contextlib
+    import io
+    import types
+    from unittest import mock
+
+    import torch
+    from torchtitan.components.checkpointer.dcp import AsyncMode
+    from torchtitan.experiments.tpu.checkpointing import flush
+    from torchtitan.experiments.tpu.muse_spark import spark_64chip_recipes as recipes
+
+    if os.environ.get("SPARK_DROP_CKPT_CACHE", "1") != "1":
+      self.skipTest("SPARK_DROP_CKPT_CACHE=0 leaves CheckpointManager._save alone")
+
+    class StandInManager:
+      """Just enough of a CheckpointManager for upstream's ``_save`` to take its last-step path."""
+
+      def __init__(self, parts, *, writes=True, async_mode=AsyncMode.DISABLED):
+        self.states = {"model": types.SimpleNamespace(model=parts, cached_state_dict={"cached": 1})}
+        self.writes = writes
+        self.async_mode = async_mode
+
+      def _should_save(self, curr_step, last_step=False):
+        return self.writes
+
+      def maybe_wait_for_saving(self):
+        pass
+
+      def _purge_stale_checkpoints(self, saving_step):
+        pass
+
+      def _save_last_step(self, curr_step):
+        pass
+
+    tpu_part = types.SimpleNamespace(
+        parameters=lambda: iter([types.SimpleNamespace(device=types.SimpleNamespace(type="tpu"))]))
+    save = recipes.CheckpointManager._save
+    with mock.patch.object(flush, "device_flush", return_value=0.25) as settle:
+      on_cpu = StandInManager([torch.nn.Linear(2, 2)])
+      self.assertIs(save(on_cpu, 4, True), True)
+      self.assertEqual(on_cpu.states["model"].cached_state_dict, {})
+      not_written = StandInManager([tpu_part], writes=False)
+      self.assertIs(save(not_written, 5), False)
+      staged = StandInManager([tpu_part], async_mode=AsyncMode.ASYNC)
+      self.assertIs(save(staged, 5, True), True)
+      for manager in (not_written, staged):
+        self.assertEqual(manager.states["model"].cached_state_dict, {"cached": 1})
+      settle.assert_not_called()
+      for rank, expected_lines in (("1", 0), ("0", 1)):
+        printed = io.StringIO()
+        with contextlib.redirect_stdout(printed), mock.patch.dict(os.environ, {"RANK": rank}):
+          self.assertIs(save(StandInManager([tpu_part]), 6, True), True)
+        lines = printed.getvalue().splitlines()
+        self.assertEqual(len(lines), expected_lines, lines)
+      self.assertEqual(settle.call_count, 2)
+      self.assertEqual(settle.call_args.args[0].type, "tpu")
+      self.assertTrue(lines[0].startswith("[spark] ") and " 6 " in lines[0] and "0.250 s" in lines[0], lines)
+
 
 if __name__ == "__main__":
   unittest.main()
