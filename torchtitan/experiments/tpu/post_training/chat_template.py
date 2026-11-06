@@ -65,8 +65,10 @@ class ChatTemplateOptions:
   def with_extra(self, **kwargs: Any) -> ChatTemplateOptions:
     """A copy with ``kwargs`` merged into ``extra`` (they win on equal keys),
     the pairs sorted by key."""
-    combined = dict(self.extra) | kwargs
-    return dataclasses.replace(self, extra=tuple(sorted(combined.items())))
+    # dict() keeps the last value of a repeated key, and kwargs come last.
+    return dataclasses.replace(
+        self, extra=tuple(sorted(dict([*self.extra, *kwargs.items()]).items()))
+    )
 
 
 def load_hf_tokenizer(location: str | os.PathLike[str]) -> Any:
@@ -272,7 +274,8 @@ def _resolved_mask_mode(tokenizer: Any, requested: str) -> str:
 
 
 def _untrain_headers(chat: RenderedChat, header: list[int]) -> None:
-  """Clear the mask on the header at the start of each trained stretch."""
+  """Turn the mask off over ``header`` wherever a marked run begins with it,
+  never past the end of that run."""
   size = len(header)
   for start, stop in _true_runs(chat.assistant_mask):
     if chat.input_ids[start : start + size] == header:
