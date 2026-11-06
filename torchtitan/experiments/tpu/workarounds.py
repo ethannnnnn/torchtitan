@@ -287,6 +287,11 @@ def use_tokamax_splash_attention_patch(model: nn.Module, sa_config: Any) -> None
         "kernel's default tiling.", type(sa_config).__name__,
     )
   TokamaxConfig.update(**_tokamax_values)
+  # update() skips None, but None is a max_logit_const setting (the online row
+  # max, Tokamax's default), not "unset". Apply it too: TokamaxConfig is
+  # process-global, and a constant max set by an earlier patch in this process
+  # is only safe for the logits it was chosen for.
+  TokamaxConfig.max_logit_const = _tokamax_values["max_logit_const"]
   logger.info(
       "Tokamax splash: applied %s",
       {k: v for k, v in _tokamax_values.items() if v is not None},
