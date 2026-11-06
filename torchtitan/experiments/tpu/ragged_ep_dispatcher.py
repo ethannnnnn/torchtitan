@@ -37,11 +37,15 @@ Beyond that, with ``exchange="allgather"`` every rank knows the full count
 matrix, so the routes that would not fit a destination's buffer are not sent
 (their expert output counts as zero) and nothing is written past the buffer.
 With ``exchange="alltoall"`` the receive counts are known only after the
-exchange, so the buffer must cover the busiest rank: overflow is a
-configuration error. The received total is returned in the metadata
-(``received_rows``), and ``max_buffer_fill`` reports the largest demanded /
-buffer ratio (above 1.0: routes were dropped, or the buffer overflowed); raise
-``capacity_factor`` or balance the expert placement.
+exchange, too late to drop routes, so the buffer must cover the busiest rank:
+a dispatch that would overflow it fails with a ``RuntimeError`` that names the
+remedies. The check is asynchronous (``torch._assert_async``: no host round
+trip, so on an accelerator the error may surface later in the step) and is
+skipped under ``torch.compile``, like the RoPE position bounds check. The
+received total is returned in the metadata (``received_rows``), and
+``max_buffer_fill`` reports the largest demanded / buffer ratio (above 1.0:
+routes were dropped, or an all-to-all buffer overflowed under
+``torch.compile``); raise ``capacity_factor`` or balance the expert placement.
 ``ragged_all_to_all`` is differentiable with respect to its operand, and the
 row permutations use a gather-only VJP, so the backward pass mirrors the
 forward with the same static shapes.
@@ -66,7 +70,17 @@ from torchtitan.experiments.tpu.token_dispatcher import (
 from torchtitan.models.common.token_dispatcher import BaseEPTokenDispatcher
 
 # Live dispatchers, for buffer-fill monitoring (``max_buffer_fill``).
-_DISPATCHERS: "weakref.WeakSet[RaggedAllToAllTokenDispatcher]" = weakref.WeakSet()
+_DISPATCHERS: "weakref.WeakSet[BaseEPTokenDispatcher]" = weakref.WeakSet()
+
+
+def track_buffer_fill(dispatcher: BaseEPTokenDispatcher) -> None:
+    """Report a dispatcher through ``max_buffer_fill`` and ``max_dropped_fraction``.
+
+    The dispatcher keeps its largest fill in ``max_fill`` (and optionally its
+    largest dropped-route fraction in ``max_drop``) as a device tensor or None.
+    It is held weakly.
+    """
+    _DISPATCHERS.add(dispatcher)
 
 
 def max_dropped_fraction(reset: bool = True) -> float | None:
@@ -88,11 +102,15 @@ def max_dropped_fraction(reset: bool = True) -> float | None:
 
 
 def max_buffer_fill(reset: bool = True) -> float | None:
-    """Largest received-rows / buffer-rows ratio seen by this rank's dispatchers.
+    """Largest demanded-rows / buffer-rows ratio seen by this rank's dispatchers.
 
     Tracked on the device (no host sync inside the step); reading it syncs.
-    A value above 1.0 means a receive buffer overflowed: raise
-    ``capacity_factor``. Returns None if no dispatch ran since the last reset.
+    A value above 1.0 means routes were dropped because they did not fit a
+    receive buffer (``exchange="allgather"`` and ``AllGatherEPTokenDispatcher``)
+    or, with ``exchange="alltoall"``, which otherwise raises, that a buffer
+    overflowed under ``torch.compile`` (see the module docstring): raise
+    ``capacity_factor`` or balance the expert placement. Returns None if no
+    dispatch ran since the last reset.
     """
     fills = []
     for dispatcher in list(_DISPATCHERS):
@@ -170,7 +188,12 @@ class _SlotTable:
         return self._cache[key]
 
 
-def _slot_of_table(slot_to_logical: list[int] | None) -> "_SlotTable | None":
+def slot_of_table(slot_to_logical: list[int] | None) -> "_SlotTable | None":
+    """The ``slot_of`` table of ``physical_expert_ids`` for an explicit placement.
+
+    ``slot_to_logical[p]`` is the logical expert in physical slot ``p``; it must
+    be a permutation. None (no explicit placement) gives None.
+    """
     return None if slot_to_logical is None else _SlotTable(slot_to_logical)
 
 
@@ -202,6 +225,18 @@ def _exclusive_cumsum(v: torch.Tensor) -> torch.Tensor:
 def _exchange(t: torch.Tensor, group) -> torch.Tensor:
     """Equal-split all-to-all along dim 0 (functional, so it traces under compile)."""
     return funcol.all_to_all_single(t.contiguous(), None, None, group)
+
+
+def _assert_rows_fit(rows: torch.Tensor, buffer_rows: int, message: str) -> None:
+    """Fail with ``message`` if ``rows`` (a device scalar) exceeds ``buffer_rows``.
+
+    ``torch._assert_async`` checks on the device without a host round trip: on
+    CPU it raises a ``RuntimeError`` right away, on an accelerator the failure
+    surfaces when the queued work runs. Skipped under ``torch.compile``.
+    """
+    if torch.compiler.is_compiling():
+        return
+    torch._assert_async(rows <= buffer_rows, message)
 
 
 def plan_expert_major(
@@ -461,7 +496,8 @@ class RaggedAllToAllTokenDispatcher(BaseEPTokenDispatcher):
     @dataclass(kw_only=True, slots=True)
     class Config(BaseEPTokenDispatcher.Config):
         # Receive buffer rows = capacity_factor * tokens * top_k, rounded up to
-        # buffer_multiple. Must cover the most loaded rank's received rows.
+        # buffer_multiple. Routes past the buffer of the most loaded rank are
+        # dropped with exchange="allgather"; with "alltoall" dispatch raises.
         capacity_factor: float = 1.5
         buffer_multiple: int = 1024
         # "allgather": one all-gather of the (G, G, E_local) count matrix, every
@@ -484,9 +520,9 @@ class RaggedAllToAllTokenDispatcher(BaseEPTokenDispatcher):
         self.exchange = config.exchange
         self.placement = config.placement
         self.slot_to_logical = config.slot_to_logical
-        self._slot_of = _slot_of_table(config.slot_to_logical)
+        self._slot_of = slot_of_table(config.slot_to_logical)
         self.max_fill: torch.Tensor | None = None
-        _DISPATCHERS.add(self)
+        track_buffer_fill(self)
 
     def _group(self):
         if self.ep_mesh is None:
@@ -553,6 +589,20 @@ class RaggedAllToAllTokenDispatcher(BaseEPTokenDispatcher):
             else:
                 recv_counts_GE = _exchange(counts_GE, group)
                 demand = recv_counts_GE.sum()
+                # The receive counts arrive with the exchange, too late to
+                # drop routes: never plan or write past the buffer.
+                _assert_rows_fit(
+                    demand,
+                    buffer_rows,
+                    "RaggedAllToAllTokenDispatcher(exchange='alltoall'): EP rank"
+                    f" {dist.get_rank(group)} received more routed rows than its"
+                    f" {buffer_rows}-row receive buffer (capacity_factor="
+                    f"{self.capacity_factor} x {num_routes} routes). The"
+                    " all-to-all count exchange cannot drop routes: raise"
+                    " capacity_factor, balance the expert placement, or use"
+                    " exchange='allgather', which drops the routes that do not"
+                    " fit.",
+                )
                 recv_G = recv_counts_GE.sum(1).to(torch.int32)
                 send_offsets_G = _exclusive_cumsum(send_G)
                 recv_offsets_G = _exclusive_cumsum(recv_G)
@@ -567,7 +617,8 @@ class RaggedAllToAllTokenDispatcher(BaseEPTokenDispatcher):
                 recv_counts_GE, buffer_rows
             )
             # Demanded rows / buffer: > 1.0 means routes were dropped
-            # ("allgather" exchange) or the buffer overflowed ("alltoall").
+            # ("allgather" exchange) or, with "alltoall" under torch.compile
+            # (no check above), that the buffer overflowed.
             fill = demand.float() / buffer_rows
             self.max_fill = (
                 fill if self.max_fill is None else torch.maximum(self.max_fill, fill)
@@ -686,4 +737,6 @@ __all__ = [
     "permute_rows",
     "plan_expert_major",
     "ragged_all_to_all",
+    "slot_of_table",
+    "track_buffer_fill",
 ]

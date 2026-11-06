@@ -14,14 +14,15 @@ output and for the gradients of the tokens and of the local expert weights.
 Cases cover both count exchanges of ``RaggedAllToAllTokenDispatcher``,
 ``AllGatherEPTokenDispatcher``, and the contiguous, interleaved and explicit
 (measured) expert placements. A receive buffer smaller than the routes must drop
-routes, report it, and never write past the buffer. The planning helpers are
-checked on their own.
+routes, report it, and never write past the buffer; the all-to-all count
+exchange, which cannot drop routes, must raise a clear error instead. The
+planning helpers are checked on their own.
 
 The dispatchers import the TPU token-dispatcher module, which imports TorchTPU.
 Without TorchTPU, put the CPU stand-in first on the path:
 
   PYTHONPATH=torchtitan/experiments/tpu/tests/cpu_stubs:. \\
-      python -m pytest torchtitan/experiments/tpu/tests/test_ragged_ep_dispatcher.py
+      python -m pytest torchtitan/experiments/tpu/tests/test_ep_dispatchers.py
 """
 
 import os
@@ -34,12 +35,13 @@ import torch.multiprocessing as mp
 import torch.nn.functional as F
 
 from torchtitan.experiments.tpu.ragged_ep_dispatcher import (
-    _slot_of_table,
+    _assert_rows_fit,
     a2a_plans,
     cap_to_buffer,
     logical_expert_of_slot,
     physical_expert_ids,
     plan_expert_major,
+    slot_of_table,
 )
 
 _TOP_K, _TOKENS, _DIM, _HIDDEN = 4, 64, 32, 48
@@ -123,6 +125,13 @@ def _run_case(case, rank, world, ep_mesh, num_experts):
     w13 = (torch.randn(local, _DIM, 2 * _HIDDEN, generator=gw) * 0.1).requires_grad_(True)
     w2 = (torch.randn(local, _HIDDEN, _DIM, generator=gw) * 0.1).requires_grad_(True)
 
+    if case["expect_error"]:
+        # Every rank overflows, so every rank stops before the next collective.
+        try:
+            disp.dispatch(x, scores, ids, counts)
+        except RuntimeError as error:
+            return {"error": str(error)}
+        return {"error": None}
     routed, group_sizes, meta = disp.dispatch(x, scores, ids, counts)
     out = disp.combine(_experts(routed, w13, w2, group_sizes), meta, x)
     grad_out = torch.randn(out.shape, generator=g)
@@ -186,13 +195,21 @@ def _worker(rank, world, port, num_experts, cases, results):
         dist.destroy_process_group()
 
 
-def _case(dispatcher, placement, exchange="allgather", capacity=2.0, buffer_multiple=64):
+def _case(
+    dispatcher,
+    placement,
+    exchange="allgather",
+    capacity=2.0,
+    buffer_multiple=64,
+    expect_error=False,
+):
     return dict(
         dispatcher=dispatcher,
         placement=placement,
         exchange=exchange,
         capacity=capacity,
         buffer_multiple=buffer_multiple,
+        expect_error=expect_error,
     )
 
 
@@ -215,6 +232,16 @@ _CASES = {
         "allgather-overflow": _case(
             "allgather", "contiguous", capacity=0.1, buffer_multiple=8
         ),
+        # The same 32-row buffer with the all-to-all count exchange: no drops,
+        # dispatch raises on every rank.
+        "ragged-a2a-overflow": _case(
+            "ragged",
+            "contiguous",
+            exchange="alltoall",
+            capacity=0.1,
+            buffer_multiple=8,
+            expect_error=True,
+        ),
     },
 }
 
@@ -233,6 +260,11 @@ def test_ep_dispatchers_match_dense(world, num_experts):
     assert len(results) == world * len(cases)
     for key, r in results.items():
         name = key.split("/")[0]
+        if cases[name]["expect_error"]:
+            assert r["error"] is not None, (key, r)
+            assert "exchange='alltoall'" in r["error"], (key, r)
+            assert "32-row receive buffer" in r["error"], (key, r)
+            continue
         assert r["finite"], (key, r)
         assert r["received"] <= r["buffer"], (key, r)
         if name.endswith("-overflow"):
@@ -258,11 +290,11 @@ def test_expert_placements_map_logical_ids_to_slots():
         assert logical.tolist() == _slot_to_logical(placement, num_experts, ep)
     permutation = _slot_to_logical("measured", num_experts, ep)
     slot = physical_expert_ids(
-        ids, num_experts, ep, "contiguous", _slot_of_table(permutation)
+        ids, num_experts, ep, "contiguous", slot_of_table(permutation)
     )
     assert torch.equal(torch.tensor(permutation)[slot], ids)
     with pytest.raises(ValueError, match="permutation"):
-        _slot_of_table([0, 0, 1, 2])
+        slot_of_table([0, 0, 1, 2])
     with pytest.raises(ValueError, match="unknown expert placement"):
         physical_expert_ids(ids, num_experts, ep, "striped")
 
@@ -279,6 +311,12 @@ def test_cap_to_buffer_keeps_a_source_major_prefix_per_destination():
             kept = torch.minimum(torch.clamp(buffer_rows - before, min=0), demand)
             assert torch.equal(sent_SGE[:, dst].reshape(-1), kept), (buffer_rows, dst)
             assert int(sent_GG[:, dst].sum()) == min(int(demand.sum()), buffer_rows)
+
+
+def test_assert_rows_fit_raises_only_past_the_buffer():
+    _assert_rows_fit(torch.tensor(32, dtype=torch.int32), 32, "unused")
+    with pytest.raises(RuntimeError, match="does not fit"):
+        _assert_rows_fit(torch.tensor(33, dtype=torch.int32), 32, "does not fit")
 
 
 def test_plan_expert_major_regroups_rows_by_local_expert():

@@ -109,10 +109,10 @@ class AllGatherEPTokenDispatcher(BaseEPTokenDispatcher):
         self.buffer_multiple = config.buffer_multiple
         self.combine_dtype = _DTYPES[config.combine_dtype]
         self.placement = config.placement
-        self._slot_of = _red._slot_of_table(config.slot_to_logical)
+        self._slot_of = _red.slot_of_table(config.slot_to_logical)
         self.max_fill: torch.Tensor | None = None
         self.max_drop: torch.Tensor | None = None
-        _red._DISPATCHERS.add(self)  # shared fill monitor (max_buffer_fill)
+        _red.track_buffer_fill(self)  # shared fill monitor (max_buffer_fill)
 
     def _group(self):
         if self.ep_mesh is None:
