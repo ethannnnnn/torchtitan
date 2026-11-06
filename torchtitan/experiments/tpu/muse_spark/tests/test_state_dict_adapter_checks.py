@@ -65,11 +65,25 @@ def _write_spark_index(folder: str, names) -> None:
 
 
 def _spark_meta_checkpoint(adapter) -> dict[str, torch.Tensor]:
-  """Checkpoint-named meta tensors for every tensor of the adapter's decoder."""
-  return adapter.to_hf({
-      name: torch.empty(shape, device="meta")
-      for name, shape in adapter.expected_model_shapes.items()
-  })
+  """Tensors on the meta device for every checkpoint name the decoder loads.
+
+  A renamed tensor takes the shape of its TorchTitan counterpart. Each MoE
+  layer adds one packed ``gate_up_proj`` whose dim 1 stacks the gate rows on
+  top of the up rows.
+  """
+  checkpoint = {
+      hf_name: torch.empty(adapter.expected_model_shapes[tt_name], device="meta")
+      for hf_name, tt_name in adapter.from_hf_map.items()
+  }
+  for idx in adapter.moe_layers:
+    stem = f"layers.{idx}.{_SPARK_ROUTED}"
+    experts, gate_rows, dim = adapter.expected_model_shapes[f"{stem}.w1_EFD"]
+    up_rows = adapter.expected_model_shapes[f"{stem}.w3_EFD"][1]
+    packed = f"model.language_model.layers.{idx}.mlp.experts.gate_up_proj"
+    checkpoint[packed] = torch.empty(
+        experts, gate_rows + up_rows, dim, device="meta"
+    )
+  return checkpoint
 
 
 class SparkIndexFileTest(unittest.TestCase):
@@ -118,17 +132,22 @@ class SparkIndexFileTest(unittest.TestCase):
         self.assertIn(sample, str(caught.exception))
 
   def test_folder_without_index_defers_the_comparison_to_from_hf(self):
-    with self.assertLogs(level=logging.INFO) as logs:
+    with self.assertLogs(level=logging.INFO) as captured:
       adapter = MuseSparkStateDictAdapter(_config(num_layers=2), self.folder)
     self.assertIsNone(adapter.fqn_to_index_mapping)
-    # The base adapter may add its own WARNING about the absent index file.
-    notes = [
-        r.getMessage()
-        for r in logs.records
-        if r.levelno == logging.INFO and self.folder in r.getMessage()
+    # captured.output lines read "LEVEL:logger:message". The base adapter may
+    # also WARN that the index file is absent; only INFO lines are counted.
+    about_folder = [
+        line
+        for line in captured.output
+        if line.startswith("INFO:") and self.folder in line
     ]
-    self.assertEqual(len(notes), 1, notes)
-    self.assertIn("from_hf", notes[0])
+    # One INFO line names the folder, and it hands the comparison to from_hf.
+    self.assertEqual(
+        ["from_hf" in line for line in about_folder],
+        [True],
+        f"INFO lines naming the folder: {about_folder}",
+    )
 
 
 class SparkFromHfTest(unittest.TestCase):
@@ -148,12 +167,14 @@ class SparkFromHfTest(unittest.TestCase):
         state[name] = torch.randn(shape, generator=gen)
     checkpoint = self.adapter.to_hf(state)
     restored = self.adapter.from_hf(checkpoint)
-    self.assertEqual(set(restored), set(state))
-    for name, value in state.items():
-      if name in self.adapter.to_hf_map:
-        self.assertIs(restored[name], value, name)
+    self.assertEqual(restored.keys(), state.keys())
+    for tt_key, before in state.items():
+      after = restored[tt_key]
+      if tt_key in self.adapter.to_hf_map:
+        # A renamed tensor comes back as the very object that went in.
+        self.assertIs(after, before, f"{tt_key} was not passed through")
       else:
-        self.assertTrue(torch.equal(restored[name], value), name)
+        self.assertTrue(torch.equal(after, before), f"{tt_key} changed values")
     self.assertTrue(self.adapter.moe_layers)
     for idx in self.adapter.moe_layers:
       packed = checkpoint[f"model.language_model.layers.{idx}.mlp.experts.gate_up_proj"]

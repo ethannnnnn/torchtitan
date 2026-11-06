@@ -57,8 +57,10 @@ Placement: when the routed-expert rows use a non-contiguous placement,
 
 from __future__ import annotations
 
+import heapq
 import os
 import re
+from collections.abc import Collection, Iterator
 from typing import Any
 
 import torch
@@ -225,6 +227,60 @@ class ExpertPermutingHFStorageReader(HuggingFaceStorageReader):
     return fut
 
 
+# How many names of one kind an adapter error spells out.
+_SPARK_NAMES_SHOWN = 10
+
+
+def _spark_tally(names: Collection[str]) -> str:
+  """``names`` as the adapter's errors print them: a count, then a sample.
+
+  The sample is the list of the ten names that sort first, which keeps a
+  message short when a whole layer or tower is affected.
+  """
+  sample = heapq.nsmallest(_SPARK_NAMES_SHOWN, names)
+  return "%d %r" % (len(names), sample)
+
+
+def _spark_decoder_shapes(
+    model_config: MuseSparkModel.Config,
+) -> Iterator[tuple[str, tuple[int, ...]]]:
+  """``(TorchTitan key, shape)`` of each decoder tensor, LoRA matrices aside.
+
+  The decoder is instantiated on the meta device, so its parameters take no
+  memory, and it is released once the iteration ends.
+  """
+  with torch.device("meta"):
+    meta_decoder = model_config.build()
+  for tt_key, tensor in meta_decoder.state_dict().items():
+    if _LORA_KEY.search(tt_key) is None:
+      yield tt_key, tuple(tensor.shape)
+
+
+def _spark_shape_report(
+    produced: dict[str, Any], recorded: dict[str, Any]
+) -> tuple[tuple[str, list[str]], ...]:
+  """The sections of the ``from_hf`` coverage error, one per kind of fault.
+
+  ``recorded`` is a shape table keyed by TorchTitan names. Each section pairs
+  a heading with the names at fault; all lists empty means ``produced`` fits.
+  """
+  absent = [key for key in recorded if key not in produced]
+  off_shape: list[str] = []
+  unlisted: list[str] = []
+  for key, tensor in produced.items():
+    if key not in recorded:
+      unlisted.append(key)
+      continue
+    got, want = tuple(tensor.shape), tuple(recorded[key])
+    if got != want:
+      off_shape.append(f"{key} {got} vs {want}")
+  return (
+      ("Table entries never produced", absent),
+      ("Shapes produced vs recorded", off_shape),
+      ("Produced names the table does not list", unlisted),
+  )
+
+
 class MuseSparkStateDictAdapter(StateDictAdapter):
   """Muse Spark text-decoder state dict <-> HF checkpoint; see the module doc."""
 
@@ -251,38 +307,25 @@ class MuseSparkStateDictAdapter(StateDictAdapter):
     self.to_hf_map = {tt_key: hf_key for hf_key, tt_key in self.from_hf_map.items()}
     self._decoder_hf_names = frozenset(hf_text_keys_for_config(model_config))
 
-    # One shape per tensor of the decoder, LoRA matrices aside, taken from a
-    # build on the meta device (no parameter memory). from_hf looks the table
-    # up on every call, so a subclass or wrapper may replace it.
-    with torch.device("meta"):
-      model = model_config.build()
-    self.expected_model_shapes = {}
-    for tt_key, entry in model.state_dict().items():
-      if _LORA_KEY.search(tt_key) is None:
-        self.expected_model_shapes[tt_key] = tuple(entry.shape)
-    del model
-
+    decoder_shapes = dict(_spark_decoder_shapes(model_config))
     mapped = set(self.from_hf_map.values())
     for idx in self.moe_layers:
       mapped.update(
           f"layers.{idx}.{_EXPERTS}.{half}" for half in ("w1_EFD", "w3_EFD")
       )
-    model_keys = set(self.expected_model_shapes)
+    model_keys = set(decoder_shapes)
     if mapped != model_keys:
       raise ValueError(
           f"{type(self).__name__} construction: the HF name mapping and the"
           " decoder built from model_config list different TorchTitan tensors."
-          f" Only the mapping yields {self._count_and_first_ten(mapped - model_keys)};"
+          f" Only the mapping yields {_spark_tally(mapped - model_keys)};"
           " only the built decoder has"
-          f" {self._count_and_first_ten(model_keys - mapped)}"
+          f" {_spark_tally(model_keys - mapped)}"
       )
+    # Published only after the self-check. from_hf reads this attribute on
+    # every call, so a subclass or wrapper may swap in its own table later.
+    self.expected_model_shapes = decoder_shapes
     self._compare_index_with_decoder()
-
-  @staticmethod
-  def _count_and_first_ten(entries) -> str:
-    """``"<count> [first ten in sorted order]"``, for the error messages."""
-    ordered = sorted(entries)
-    return f"{len(ordered)} {ordered[:10]}"
 
   def _compare_index_with_decoder(self) -> None:
     """Holds the names in the folder's index file against the text decoder."""
@@ -306,10 +349,10 @@ class MuseSparkStateDictAdapter(StateDictAdapter):
       raise ValueError(
           f"{type(self).__name__} construction: {index_file} does not fit the"
           f" {self._decoder_depth}-layer text decoder. Decoder tensors the"
-          f" index file omits: {self._count_and_first_ten(missing)}. Listed"
+          f" index file omits: {_spark_tally(missing)}. Listed"
           " names belonging to neither the decoder, its vision and audio"
           " towers nor a layer past the layer count:"
-          f" {self._count_and_first_ten(unknown)}"
+          f" {_spark_tally(unknown)}"
       )
 
   def _classify_hf_key(self, hf_name: str) -> str:
@@ -362,7 +405,7 @@ class MuseSparkStateDictAdapter(StateDictAdapter):
       raise ValueError(
           f"{where}: checkpoint names outside the text decoder, its vision and"
           " audio towers and the layers past its layer count:"
-          f" {self._count_and_first_ten(unknown)}"
+          f" {_spark_tally(unknown)}"
       )
 
     state: dict[str, Any] = {}
@@ -380,21 +423,14 @@ class MuseSparkStateDictAdapter(StateDictAdapter):
       state[f"{stem}.w1_EFD"] = packed.narrow(1, 0, mid)
       state[f"{stem}.w3_EFD"] = packed.narrow(1, mid, packed.shape[1] - mid)
 
-    table = self.expected_model_shapes
-    missing = [n for n in table if n not in state]
-    extra = [n for n in state if n not in table]
-    mismatches = [
-        f"{n} {tuple(state[n].shape)} vs {tuple(table[n])}"
-        for n in state
-        if n in table and tuple(state[n].shape) != tuple(table[n])
-    ]
-    if missing or extra or mismatches:
+    sections = _spark_shape_report(state, self.expected_model_shapes)
+    if any(names for _, names in sections):
+      details = ". ".join(
+          f"{heading}: {_spark_tally(names)}" for heading, names in sections
+      )
       raise ValueError(
           f"{where}: the converted decoder tensors do not fit"
-          " expected_model_shapes. Table entries never produced:"
-          f" {self._count_and_first_ten(missing)}. Shapes produced vs recorded:"
-          f" {self._count_and_first_ten(mismatches)}. Produced names the table"
-          f" does not list: {self._count_and_first_ten(extra)}"
+          f" expected_model_shapes. {details}"
       )
     return state
 
