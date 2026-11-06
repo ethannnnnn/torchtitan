@@ -35,18 +35,20 @@ from __future__ import annotations
 import logging
 import os
 import time
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
 import torch
 import torch.distributed as dist
 
+from torchtitan.config.configurable import Configurable
 from torchtitan.experiments.tpu.checkpointing.lora_checkpoint import enable_adapter_only_checkpoints
 from torchtitan.experiments.tpu.muse_spark import state_dict_adapter as spark_sda
 from torchtitan.experiments.tpu.post_training.lora import is_lora_key
 from torchtitan.experiments.tpu.post_training.sft_train import SFTTPUTrainer
 
-from .peft_adapter import adapter_spec_from_model, gather_peft_adapter, load_peft_into_model, save_peft_dir
+from .peft_adapter import export_spark_adapter, load_spark_adapter, lora_hyperparams_of, write_spark_adapter_dir
 
 logger = logging.getLogger(__name__)
 
@@ -98,7 +100,7 @@ class _AdapterExportMixin:
         self._spark_adapter_exports: list[dict[str, Any]] = []
         self._spark_started = False
         if self._spark_lora:
-            self._spark_spec = adapter_spec_from_model(self.model_parts[0])
+            self._spark_spec = lora_hyperparams_of(self.model_parts[0])
             if getattr(self.checkpointer, "enable", False):
                 # Saves: adapters + optimizer + LR schedule + dataloader + train
                 # state. Loads: HF base, then the newest complete step-N.
@@ -118,7 +120,7 @@ class _AdapterExportMixin:
             logger.info("[spark] resumed from adapter checkpoint step %d; SPARK_ADAPTER_INIT=%s ignored",
                         resumed, init)
         elif init:
-            info = load_peft_into_model(self.model_parts[0], init)
+            info = load_spark_adapter(self.model_parts[0], init)
             logger.info("[spark] adapter initialized from %s", info)
 
     def _spark_export_adapter(self, step: int, *, tag: str = "step") -> dict[str, Any] | None:
@@ -126,15 +128,15 @@ class _AdapterExportMixin:
             return None
         t0 = time.perf_counter()
         keep = self._spark_rank == 0
-        tensors = gather_peft_adapter(self.model_parts, keep=keep)
+        tensors = export_spark_adapter(self.model_parts, keep=keep)
         info = None
         if keep:
             out = Path(self.config.dump_folder) / "adapter" / f"{tag}-{step}"
             info = {"step": step, "dir": str(out), "tensors": len(tensors),
                     "params": int(sum(t.numel() for t in tensors.values())),
                     "seconds": round(time.perf_counter() - t0, 3)}
-            save_peft_dir(out, tensors, self._spark_spec, base=str(self.config.hf_assets_path),
-                          extra=info)
+            write_spark_adapter_dir(out, tensors, self._spark_spec, base_model_path=str(self.config.hf_assets_path),
+                                    export_info=info)
             logger.info("[spark] PEFT adapter exported %s", info)
             self._spark_adapter_exports.append(info)
         if dist.is_initialized():
@@ -151,12 +153,12 @@ class SparkSFTTrainer(_AdapterExportMixin, SFTTPUTrainer):
     rank takes the same decision (the export is a collective).
     """
 
-    def __init__(self, job_config: Any) -> None:
+    def __init__(self, job_config: Configurable.Config):
         super().__init__(job_config)
         self._spark_lora_setup()
         self._spark_export_every = _export_every()
 
-    def train_step(self, data_iterator):
+    def train_step(self, data_iterator: Iterator[dict[str, Any]]):
         self._spark_first_step()
         result = super().train_step(data_iterator)
         every = self._spark_export_every
