@@ -270,6 +270,22 @@ class PeftAdapterTest(unittest.TestCase):
         self.assertEqual((out / "adapter_config.json").read_text(), json.dumps(expected, indent=2))
         self.assertFalse((out / "export_info.json").exists())
 
+    def test_target_modules_follow_plain_path_order(self):
+        import re
+
+        from torchtitan.experiments.tpu.spark_e2e import peft_adapter
+
+        paths = sorted(f"model.language_model.layers.{i}.self_attn.{p}_proj" for i in range(12) for p in "qkvo")
+        # Plain-text order: layer 1, then 10 and 11, then 2. Escaping first would put 10 ahead of 1.
+        self.assertEqual([int(path.split(".")[3]) for path in paths[::4]], [0, 1, 10, 11, 2, 3, 4, 5, 6, 7, 8, 9])
+        tensors = {f"base_model.model.{path}.lora_{ab}.weight": torch.zeros(2, 2)
+                   for path in reversed(paths) for ab in "AB"}
+        written = peft_adapter.write_spark_adapter_dir(
+            self.tmp / "twelve", tensors, peft_adapter.LoraHyperparams(2, 4.0))
+        text = (written / "adapter_config.json").read_text()
+        pattern = "^(?:" + "|".join(map(re.escape, paths)) + ")$"
+        self.assertEqual(text, json.dumps({**json.loads(text), "target_modules": pattern}, indent=2))
+
     def test_module_names_and_pairing(self):
         from torchtitan.experiments.tpu.spark_e2e import peft_adapter
 

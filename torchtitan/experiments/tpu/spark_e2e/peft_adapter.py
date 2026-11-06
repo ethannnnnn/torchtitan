@@ -285,7 +285,7 @@ def write_spark_adapter_dir(
         bias="none",
         fan_in_fan_out=False,
         inference_mode=True,
-        target_modules="^(?:" + "|".join(sorted(re.escape(path) for path in modules)) + ")$",
+        target_modules="^(?:" + "|".join(re.escape(path) for path in sorted(modules)) + ")$",
         base_model_name_or_path=str(base_model_path),
     )
     with open(os.path.join(directory, _CONFIG_FILE), "w", encoding="utf-8") as handle:
