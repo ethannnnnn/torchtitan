@@ -4,43 +4,45 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Chat-template rendering for SFT.
+"""Chat rendering for SFT on top of Hugging Face ``apply_chat_template``.
 
-Every prompt and every SFT conversation is rendered by the checkpoint's own
-Hugging Face chat template (for Muse Spark: the public template shipped with
-the open weights). This module adds the three things the trainers need on top
-of ``apply_chat_template``:
+Conversations and prompts are rendered by the chat template that comes with
+the model's tokenizer; for Muse Spark that is the public template published
+together with the open weights. Around the plain Hugging Face call this
+module adds three things:
 
-* Deterministic rendering. Templates that stamp today's date when
-  ``current_date`` is undefined (the Muse Spark template does) would make
-  prompts change from day to day; ``ChatTemplateOptions`` always passes
-  ``current_date`` explicitly (``None`` omits the date line).
-* Template keyword arguments such as ``reasoning_effort`` are passed only when
-  the template references them, so one options object serves templates with
-  and without them.
-* An assistant-only token mask. ``"generation"`` uses the template's
-  ``{% generation %}`` blocks (``return_assistant_tokens_mask``); ``"prefix"``
-  renders each assistant turn's prompt and checks that it is a token prefix of
-  the full conversation; ``"auto"`` picks ``"generation"`` when the template has
-  the blocks. By default the generation prompt that opens an assistant turn
-  (``<|start|>assistant`` for Muse Spark) is not trained: at inference the
-  prompt supplies it.
+1. Repeatable text. Templates that print the current day when
+   ``current_date`` is undefined always receive ``current_date`` from
+   ``ChatTemplateOptions``, so a render never depends on the clock; ``None``
+   leaves the date line out.
+2. Optional template switches such as ``reasoning_effort``, handed only to a
+   template whose source refers to them.
+3. A mask over the assistant's tokens, built in one of ``MASK_MODES``.
+   ``"generation"`` reads the template's ``{% generation %}`` sections with
+   ``return_assistant_tokens_mask``. ``"prefix"`` renders the conversation
+   up to every assistant turn and requires each of those renders to match
+   the start of the full render token for token. ``"auto"`` takes
+   ``"generation"`` when the template has such sections, else ``"prefix"``.
+   The generation prompt that opens an assistant turn (``<|start|>assistant``
+   for Muse Spark) stays untrained unless ``train_on_generation_prompt``.
 
-The response helpers split a sampled completion into the assistant messages of
-a header-style template (``<|start|>assistant to=RECIPIENT<|message|>BODY``
-closed by ``<|eot|>`` / ``<|eom|>``) and return the final user-facing message.
-Completions without those markers fall back to the decoded text with special
-tokens and ``<think>`` blocks removed.
+Sampled replies of templates with message headers
+(``<|start|>assistant to=RECIPIENT<|message|>BODY``, ended by ``<|eot|>`` or
+``<|eom|>``) are cut into assistant messages by ``split_response``, and
+``decode_final_answer`` picks the one meant for the user. Text without
+headers falls back to the decoded string minus special tokens and
+``<think>`` blocks.
 """
 
 from __future__ import annotations
 
 import dataclasses
 import json
+import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 MASK_MODES = ("auto", "generation", "prefix")
 
@@ -60,17 +62,20 @@ class ChatTemplateOptions:
   extra: tuple[tuple[str, Any], ...] = ()
   """Further template keyword arguments, e.g. (("enable_thinking", False),)."""
 
-  def with_extra(self, **kwargs: Any) -> "ChatTemplateOptions":
-    merged = dict(self.extra)
-    merged.update(kwargs)
-    return dataclasses.replace(self, extra=tuple(sorted(merged.items())))
+  def with_extra(self, **kwargs: Any) -> ChatTemplateOptions:
+    """A copy with ``kwargs`` merged into ``extra`` (they win on equal keys),
+    the pairs sorted by key."""
+    combined = dict(self.extra) | kwargs
+    return dataclasses.replace(self, extra=tuple(sorted(combined.items())))
 
 
-def load_hf_tokenizer(path: str | Path) -> Any:
-  """The checkpoint's Hugging Face tokenizer, with its chat template."""
-  from transformers import AutoTokenizer
+def load_hf_tokenizer(location: str | os.PathLike[str]) -> Any:
+  """``transformers.AutoTokenizer`` loaded from a local folder or a hub id;
+  its ``chat_template`` is what this module renders with. ``transformers`` is
+  imported on the first call only."""
+  import transformers
 
-  return AutoTokenizer.from_pretrained(str(path))
+  return transformers.AutoTokenizer.from_pretrained(os.fspath(location))
 
 
 def template_source(tokenizer: Any) -> str:
@@ -107,38 +112,40 @@ def template_kwargs(
   return kwargs
 
 
-def _as_ids(value: Any) -> list[int]:
-  if isinstance(value, dict) or hasattr(value, "keys"):
-    value = value["input_ids"]
-  return [int(t) for t in value]
+# A conversation: chat messages, each a mapping with at least ``"role"``.
+Conversation = Sequence[Mapping[str, Any]]
 
 
 def render_text(
     tokenizer: Any,
-    messages: Sequence[dict[str, Any]],
+    messages: Conversation,
     options: ChatTemplateOptions,
     *,
     add_generation_prompt: bool,
 ) -> str:
+  """The template's output for plain ``dict`` copies of ``messages``."""
   return tokenizer.apply_chat_template(
-      [dict(m) for m in messages],
-      tokenize=False,
+      [*map(dict, messages)],
       add_generation_prompt=add_generation_prompt,
+      tokenize=False,
       **template_kwargs(tokenizer, options),
   )
 
 
 def encode_rendered(tokenizer: Any, text: str) -> list[int]:
-  """Token ids of rendered template text (the template emits BOS itself)."""
-  return _as_ids(tokenizer(text, add_special_tokens=False))
+  """Token ids of rendered text. The template wrote the BOS token already,
+  so the tokenizer adds no special tokens."""
+  encoded = tokenizer(text, add_special_tokens=False)
+  is_mapping = hasattr(encoded, "keys")
+  return [
+      int(token) for token in (encoded["input_ids"] if is_mapping else encoded)
+  ]
 
 
-def render_prompt_ids(
-    tokenizer: Any,
-    messages: Sequence[dict[str, Any]],
-    options: ChatTemplateOptions,
-) -> list[int]:
-  """Prompt ids ending with the generation prompt, where sampling starts."""
+def render_prompt_ids(tokenizer: Any, messages: Conversation,
+                      options: ChatTemplateOptions) -> list[int]:
+  """Ids of ``messages`` followed by the generation prompt, where sampling
+  starts."""
   return encode_rendered(
       tokenizer,
       render_text(tokenizer, messages, options, add_generation_prompt=True),
@@ -169,126 +176,170 @@ class RenderedChat:
     return sum(self.assistant_mask)
 
 
-def _spans(mask: Sequence[bool]) -> list[tuple[int, int]]:
-  spans: list[tuple[int, int]] = []
-  start = None
-  for index, value in enumerate(mask):
-    if value and start is None:
-      start = index
-    elif not value and start is not None:
-      spans.append((start, index))
-      start = None
-  if start is not None:
-    spans.append((start, len(mask)))
-  return spans
+def _true_runs(mask: Sequence[bool]) -> list[tuple[int, int]]:
+  """``(start, stop)`` of every maximal stretch of true entries (stop
+  exclusive), in order."""
+  padded = [False, *map(bool, mask), False]
+  edges = [i for i in range(len(padded) - 1) if padded[i] != padded[i + 1]]
+  return list(zip(edges[::2], edges[1::2]))
 
 
-def _generation_mask(tokenizer: Any, messages, options) -> RenderedChat:
-  enc = tokenizer.apply_chat_template(
-      [dict(m) for m in messages],
+def _mask_from_generation_blocks(
+    tokenizer: Any, messages: Conversation, options: ChatTemplateOptions
+) -> RenderedChat:
+  """The template's own assistant mask: its ``{% generation %}`` sections,
+  which begin with the generation prompt."""
+  encoded = tokenizer.apply_chat_template(
+      [*map(dict, messages)],
       tokenize=True,
       return_dict=True,
       return_assistant_tokens_mask=True,
       **template_kwargs(tokenizer, options),
   )
-  ids = [int(t) for t in enc["input_ids"]]
-  mask = [bool(v) for v in enc["assistant_masks"]]
-  if len(ids) != len(mask):
-    raise ValueError("assistant mask length differs from the token count")
+  ids = list(map(int, encoded["input_ids"]))
+  mask = list(map(bool, encoded["assistant_masks"]))
+  if len(mask) != len(ids):
+    raise ValueError(
+        "the template returned {} assistant-mask entries for {} tokens".format(
+            len(mask), len(ids)
+        )
+    )
   return RenderedChat(ids, mask)
 
 
-def _prefix_mask(tokenizer: Any, messages, options) -> RenderedChat:
-  full = encode_rendered(
-      tokenizer,
-      render_text(tokenizer, messages, options, add_generation_prompt=False),
-  )
-  mask = [False] * len(full)
-  for index, message in enumerate(messages):
-    if message.get("role") != "assistant":
-      continue
-    start = encode_rendered(
-        tokenizer,
-        render_text(
-            tokenizer, messages[:index], options, add_generation_prompt=True
-        ),
-    )
-    end = encode_rendered(
+def _mask_from_prefixes(
+    tokenizer: Any, messages: Conversation, options: ChatTemplateOptions
+) -> RenderedChat:
+  """Assistant mask found by rendering the conversation up to each reply:
+  a reply is what the render that includes it adds to the render that ends
+  with the generation prompt."""
+
+  def encoded_head(count: int, open_reply: bool) -> list[int]:
+    return encode_rendered(
         tokenizer,
         render_text(
             tokenizer,
-            messages[: index + 1],
+            messages[:count],
             options,
-            add_generation_prompt=False,
+            add_generation_prompt=open_reply,
         ),
     )
-    if full[: len(start)] != start or full[: len(end)] != end:
+
+  whole = encoded_head(len(messages), False)
+  replies = [
+      index
+      for index, message in enumerate(messages)
+      if message.get("role") == "assistant"
+  ]
+  mask = [False] * len(whole)
+  for index in replies:
+    opened, closed = encoded_head(index, True), encoded_head(index + 1, False)
+    if whole[: len(opened)] != opened or whole[: len(closed)] != closed:
       raise ValueError(
-          f"assistant turn {index} is not a token prefix of the conversation; "
-          "use mask_mode='generation' with a template that has generation blocks"
+          "message {}: the renders up to this assistant reply are not token "
+          "prefixes of the whole conversation; use a template with "
+          '{{% generation %}} blocks and mask_mode="generation"'.format(index)
       )
-    for position in range(len(start), len(end)):
-      mask[position] = True
-  return RenderedChat(full, mask)
+    mask[len(opened) : len(closed)] = [True] * (len(closed) - len(opened))
+  return RenderedChat(whole, mask)
+
+
+# A ``{% generation %}`` tag, with or without whitespace control and spaces.
+_GENERATION_TAG = re.compile(r"\{%-?\s*generation\s*-?%\}")
+
+# The mask builder of each resolved mode, and whether the stretches it marks
+# include the generation prompt: generation sections start with it, while a
+# prefix render already ends with it, before the reply.
+_MASK_BUILDERS = {
+    "generation": (_mask_from_generation_blocks, True),
+    "prefix": (_mask_from_prefixes, False),
+}
+
+
+def _resolved_mask_mode(tokenizer: Any, requested: str) -> str:
+  """``requested``, with ``"auto"`` settled by the template source."""
+  if requested == "auto":
+    if _GENERATION_TAG.search(template_source(tokenizer)):
+      return "generation"
+    return "prefix"
+  if requested in MASK_MODES:
+    return requested
+  raise ValueError(
+      "mask_mode {!r} is not supported; pick one of {}".format(
+          requested, MASK_MODES
+      )
+  )
+
+
+def _untrain_headers(chat: RenderedChat, header: list[int]) -> None:
+  """Clear the mask on the header at the start of each trained stretch."""
+  size = len(header)
+  for start, stop in _true_runs(chat.assistant_mask):
+    if chat.input_ids[start : start + size] == header:
+      end = min(start + size, stop)
+      chat.assistant_mask[start:end] = [False] * (end - start)
+
+
+def _train_headers(chat: RenderedChat, header: list[int]) -> None:
+  """Set the mask on the header just before each trained stretch."""
+  size = len(header)
+  for start, _ in _true_runs(chat.assistant_mask):
+    first = start - size
+    if first >= 0 and chat.input_ids[first:start] == header:
+      chat.assistant_mask[first:start] = [True] * size
 
 
 def render_chat(
     tokenizer: Any,
-    messages: Sequence[dict[str, Any]],
+    messages: Conversation,
     options: ChatTemplateOptions,
     *,
     mask_mode: str = "auto",
     train_on_generation_prompt: bool = False,
 ) -> RenderedChat:
-  """Tokenize a conversation and mark the tokens an SFT loss should train."""
-  if mask_mode not in MASK_MODES:
-    raise ValueError(f"mask_mode {mask_mode!r} must be one of {MASK_MODES}")
-  if mask_mode == "auto":
-    source = template_source(tokenizer)
-    mask_mode = (
-        "generation"
-        if re.search(r"{%-?\s*generation\s*-?%}", source)
-        else "prefix"
-    )
-  if mask_mode == "generation":
-    rendered = _generation_mask(tokenizer, messages, options)
-    if not train_on_generation_prompt:
-      prompt = encode_rendered(
-          tokenizer, generation_prompt_text(tokenizer, options)
-      )
-      for start, end in _spans(rendered.assistant_mask):
-        if prompt and rendered.input_ids[start : start + len(prompt)] == prompt:
-          for position in range(start, min(start + len(prompt), end)):
-            rendered.assistant_mask[position] = False
-    return rendered
-  rendered = _prefix_mask(tokenizer, messages, options)
-  if train_on_generation_prompt:
-    prompt = encode_rendered(
-        tokenizer, generation_prompt_text(tokenizer, options)
-    )
-    for start, _ in _spans(rendered.assistant_mask):
-      begin = start - len(prompt)
-      if begin >= 0 and rendered.input_ids[begin:start] == prompt:
-        for position in range(begin, start):
-          rendered.assistant_mask[position] = True
-  return rendered
+  """Ids of the whole conversation and the mask of its assistant tokens.
+
+  ``mask_mode`` is one of ``MASK_MODES``. The generation prompt in front of
+  each reply joins the mask only with ``train_on_generation_prompt``.
+  """
+  mode = _resolved_mask_mode(tokenizer, mask_mode)
+  build, header_inside = _MASK_BUILDERS[mode]
+  chat = build(tokenizer, messages, options)
+  if header_inside == bool(train_on_generation_prompt):
+    return chat
+  header = encode_rendered(
+      tokenizer, generation_prompt_text(tokenizer, options)
+  )
+  adjust = _train_headers if train_on_generation_prompt else _untrain_headers
+  if header:
+    adjust(chat, header)
+  return chat
 
 
-def stop_token_ids(model_dir: str | Path | None, tokenizer: Any) -> list[int]:
-  """End-of-turn ids: ``generation_config.json`` eos ids, else the tokenizer eos."""
+def stop_token_ids(
+    model_dir: str | os.PathLike[str] | None, tokenizer: Any
+) -> list[int]:
+  """Ids that end a sampled reply.
+
+  ``eos_token_id`` of ``<model_dir>/generation_config.json`` when that file
+  exists and holds an int or a non-empty list there; otherwise the
+  tokenizer's ``eos_token_id``.
+  """
   if model_dir is not None:
-    path = Path(model_dir) / "generation_config.json"
-    if path.is_file():
-      eos = json.loads(path.read_text()).get("eos_token_id")
+    settings = Path(model_dir) / "generation_config.json"
+    if settings.is_file():
+      eos = json.loads(settings.read_text(encoding="utf-8")).get("eos_token_id")
       if isinstance(eos, int):
         return [eos]
       if isinstance(eos, list) and eos:
-        return [int(t) for t in eos]
-  if getattr(tokenizer, "eos_token_id", None) is None:
+        return list(map(int, eos))
+  fallback = getattr(tokenizer, "eos_token_id", None)
+  if fallback is None:
     raise ValueError(
-        "no eos token id in generation_config.json or the tokenizer"
+        "cannot tell where replies end: no eos_token_id in "
+        "generation_config.json or on the tokenizer"
     )
-  return [int(tokenizer.eos_token_id)]
+  return [int(fallback)]
 
 
 # ---------------------------------------------------------------------------
@@ -376,12 +427,13 @@ def split_response(
 
 def decode_final_answer(
     tokenizer: Any,
-    token_ids: Sequence[int],
+    completion_ids: Sequence[int],
     markers: ResponseMarkers = ResponseMarkers(),
 ) -> ParsedResponse:
-  """Decode sampled ids with special tokens kept and split the messages."""
+  """``split_response`` of sampled ids decoded with their special tokens
+  (the prompt is taken to end with the generation prompt)."""
   text = tokenizer.decode(
-      [int(t) for t in token_ids], skip_special_tokens=False
+      list(map(int, completion_ids)), skip_special_tokens=False
   )
-  specials = list(getattr(tokenizer, "all_special_tokens", []) or [])
+  specials = list(getattr(tokenizer, "all_special_tokens", None) or [])
   return split_response(text, special_tokens=specials, markers=markers)
