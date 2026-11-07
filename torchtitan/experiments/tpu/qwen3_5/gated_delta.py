@@ -194,6 +194,106 @@ def causal_conv_silu(
   return _CausalConvSilu.apply(x_BSC, weight_C1W, segment_ids_BS)
 
 
+class _ChunkRecurrence(torch.autograd.Function):
+  """The chunk loop of ``_inter_chunk_recurrence``, with a short backward loop.
+
+  The forward loop runs only what feeds the state: per chunk ``W S`` gives
+  ``v_new = U - W S``, and the state becomes ``S * chunk_decay + K_decayed^T
+  v_new``. It stacks the state that enters each chunk and ``v_new`` (in the
+  loop matmuls' dtype, bf16 under autocast, as the batched ``qk @ v_new``
+  reads it). The inter-chunk output ``exp(g) Q S`` of every chunk is then one
+  batched matmul of the decayed queries with the stacked states, so the stack
+  is a forward value, and ``TPUSelectiveAC`` saves it (``aten.stack``): the
+  backward does not re-run the loop.
+
+  Autograd's backward of the loop would compute, for every chunk and between
+  two steps of the state's gradient, the gradients of that chunk's own inputs
+  (``W`` and the decayed queries, the decayed keys, the chunk decay): about a
+  dozen small ops per chunk, run one after another. This backward's loop runs
+  only the two matmuls that carry the gradient to the previous chunk's state.
+  The per-chunk gradients of the other inputs then come from the stacked
+  states and gradients, as two batched matmuls and one reduction over all
+  chunks.
+
+  Each product, cast and sum is the one the previous loop (all of ``wq`` times
+  the state per chunk) and autograd compute, with the same operands and
+  dtypes: the forward's rows of ``W S`` and ``exp(g) Q S`` are those rows of
+  ``wq @ S``, and the backward's state gradient takes ``wq^T`` times the
+  stacked gradient of both row blocks in one matmul, as autograd does. The
+  output and the gradients are unchanged.
+  """
+
+  @staticmethod
+  def forward(ctx, wq, u, k_decayed_t, chunk_decay):
+    bs, n_heads, num_chunks, chunk, d_v = u.shape
+    state = torch.zeros(
+        bs, n_heads, wq.shape[-1], d_v, dtype=wq.dtype, device=wq.device
+    )
+    w_c, u_c = wq[..., :chunk, :].unbind(2), u.unbind(2)
+    k_decayed_t_c, chunk_decay_c = k_decayed_t.unbind(2), chunk_decay.unbind(2)
+    v_new_c, states = [], []
+    for i in range(num_chunks):
+      states.append(state)
+      w_state = w_c[i] @ state
+      v_new = u_c[i] - w_state
+      v_new_c.append(v_new.to(w_state.dtype))
+      state = state * chunk_decay_c[i] + k_decayed_t_c[i] @ v_new
+    states, v_new = torch.stack(states, dim=2), torch.stack(v_new_c, dim=2)
+    ctx.save_for_backward(wq, k_decayed_t, chunk_decay, states, v_new)
+    return wq[..., chunk:, :] @ states, v_new
+
+  @staticmethod
+  def backward(ctx, grad_inter, grad_v_new):
+    wq, k_decayed_t, chunk_decay, states, v_new = ctx.saved_tensors
+    mm_dtype, state_dtype = v_new.dtype, states.dtype
+    num_chunks, chunk = wq.shape[2], wq.shape[3] // 2
+    if grad_inter is None:
+      grad_inter = v_new.new_zeros(v_new.shape)
+    if grad_v_new is None:
+      grad_v_new = torch.zeros_like(v_new)
+    # Copies, so that no per-chunk view here is the forward's own (the graph's
+    # CSE would merge them, and torch_tpu fences recomputed views one by one).
+    wq_c = wq.to(mm_dtype, copy=True).unbind(2)
+    k_decayed_t_c = k_decayed_t.to(mm_dtype, copy=True).unbind(2)
+    chunk_decay_c = chunk_decay.clone().unbind(2)
+    grad_inter_c, grad_v_new_c = grad_inter.unbind(2), grad_v_new.unbind(2)
+    # The gradient of the state leaving chunk i (none leaves the last chunk).
+    grad_state = None
+    grad_u, grad_wq_state, grad_states = [], [], []
+    for i in reversed(range(num_chunks)):
+      grad_v = grad_v_new_c[i].to(state_dtype)
+      if grad_state is not None:
+        grad_v = (
+            k_decayed_t_c[i].transpose(-1, -2) @ grad_state.to(mm_dtype)
+        ).to(state_dtype) + grad_v
+      grad_ws = torch.cat([(-grad_v).to(mm_dtype), grad_inter_c[i]], dim=-2)
+      grad_u.append(grad_v)
+      grad_wq_state.append(grad_ws)
+      grad_states.append(
+          torch.zeros_like(states[:, :, 0])
+          if grad_state is None
+          else grad_state
+      )
+      if i:  # The state entering chunk 0 is zero: no gradient.
+        grad_prev = (wq_c[i].transpose(-1, -2) @ grad_ws).to(state_dtype)
+        grad_state = (
+            grad_prev
+            if grad_state is None
+            else grad_state * chunk_decay_c[i] + grad_prev
+        )
+    grad_u = torch.stack(grad_u[::-1], dim=2)
+    grad_wq_state = torch.stack(grad_wq_state[::-1], dim=2)
+    grad_states = torch.stack(grad_states[::-1], dim=2)
+    grad_wq = (
+        grad_wq_state @ states.to(mm_dtype).transpose(-1, -2)
+    ).to(state_dtype)
+    grad_k_decayed_t = (
+        grad_states.to(mm_dtype) @ v_new.transpose(-1, -2)
+    ).to(state_dtype)
+    grad_chunk_decay = (grad_states * states).sum(dim=(-2, -1), keepdim=True)
+    return grad_wq, grad_u, grad_k_decayed_t, grad_chunk_decay
+
+
 def _inter_chunk_recurrence(
     wq: torch.Tensor,
     u: torch.Tensor,
@@ -203,19 +303,17 @@ def _inter_chunk_recurrence(
 ) -> torch.Tensor:
   """State recurrence across the chunks of ``chunked_gated_delta``.
 
-  Each step takes its chunk from one ``unbind`` per tensor, done before the
-  loop. Indexing ``t[:, :, i]`` in the loop reads the same views, but autograd
-  turns every index into a ``select_backward`` that writes a zero buffer the
-  size of all of ``t`` for one chunk and sums ``num_chunks`` such buffers, so
-  the backward would write O(seq_len^2 / chunk_size) bytes. The backward of
-  ``unbind`` is one ``stack`` of the same per-chunk gradients, without the
-  additions of zeros.
+  Only the two matmuls that read or update the state run in the loop
+  (``_ChunkRecurrence``): per chunk, ``W S`` gives ``v_new = U - W S``, and
+  the state becomes ``S * chunk_decay + K_decayed^T v_new``. Each step takes
+  its chunk from one ``unbind`` per tensor, done before the loop. The decayed
+  queries' ``exp(g) Q S`` (the inter-chunk output) is one batched matmul with
+  the stacked states after the loop.
 
-  Only the two matmuls that read or update the state run in the loop. The
-  intra-chunk term ``qk[:, :, i] @ v_new`` does not feed the state, so it runs
-  after the loop for all chunks at once, as one batched matmul of ``qk`` with
-  the stacked ``v_new``. ``qk`` is then never unbound, and its gradient is that
-  matmul's gradient instead of a ``stack`` of ``num_chunks`` per-chunk
+  The intra-chunk term ``qk[:, :, i] @ v_new`` does not feed the state, so it
+  runs after the loop for all chunks at once, as one batched matmul of ``qk``
+  with the stacked ``v_new``. ``qk`` is then never unbound, and its gradient is
+  that matmul's gradient instead of a ``stack`` of ``num_chunks`` per-chunk
   gradients (which XLA on TPU lays out with the chunk axis minor-most, at a
   few GB/s). Each chunk's product and sum are the ones the loop computed, so
   the output and the gradients are unchanged.
@@ -235,22 +333,10 @@ def _inter_chunk_recurrence(
   Returns:
     ``(bs, n_heads, num_chunks, chunk, value_head_dim)`` output of each chunk.
   """
-  bs, n_heads, num_chunks, chunk, d_v = u.shape
-  state = torch.zeros(
-      bs, n_heads, wq.shape[-1], d_v, dtype=wq.dtype, device=wq.device
-  )
-  wq_c, u_c = wq.unbind(2), u.unbind(2)
-  k_decayed_t_c, chunk_decay_c = k_decayed_t.unbind(2), chunk_decay.unbind(2)
-  inter, v_new_c = [], []
-  for i in range(num_chunks):
-    wq_state = wq_c[i] @ state
-    v_new = u_c[i] - wq_state[..., :chunk, :]
-    inter.append(wq_state[..., chunk:, :])
-    v_new_c.append(v_new)
-    state = state * chunk_decay_c[i] + k_decayed_t_c[i] @ v_new
+  inter, v_new = _ChunkRecurrence.apply(wq, u, k_decayed_t, chunk_decay)
   # The intra-chunk term of every chunk in one batched matmul: `qk` is used
   # whole, so its gradient is one batched matmul too.
-  return torch.stack(inter, dim=2) + qk @ torch.stack(v_new_c, dim=2)
+  return inter + qk @ v_new
 
 
 def chunked_gated_delta(

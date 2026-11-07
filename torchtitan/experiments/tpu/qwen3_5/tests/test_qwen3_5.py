@@ -150,6 +150,34 @@ def _unbind_inter_chunk_recurrence(
   return torch.stack(outs, dim=2)
 
 
+def _batched_qk_inter_chunk_recurrence(
+    wq: torch.Tensor,
+    u: torch.Tensor,
+    qk: torch.Tensor,
+    k_decayed_t: torch.Tensor,
+    chunk_decay: torch.Tensor,
+) -> torch.Tensor:
+  """``gated_delta._inter_chunk_recurrence`` before its custom backward.
+
+  The intra-chunk term is one batched matmul after the loop; the loop itself
+  is differentiated by autograd, chunk by chunk.
+  """
+  bs, n_heads, num_chunks, chunk, d_v = u.shape
+  state = torch.zeros(
+      bs, n_heads, wq.shape[-1], d_v, dtype=wq.dtype, device=wq.device
+  )
+  wq_c, u_c = wq.unbind(2), u.unbind(2)
+  k_decayed_t_c, chunk_decay_c = k_decayed_t.unbind(2), chunk_decay.unbind(2)
+  inter, v_new_c = [], []
+  for i in range(num_chunks):
+    wq_state = wq_c[i] @ state
+    v_new = u_c[i] - wq_state[..., :chunk, :]
+    inter.append(wq_state[..., chunk:, :])
+    v_new_c.append(v_new)
+    state = state * chunk_decay_c[i] + k_decayed_t_c[i] @ v_new
+  return torch.stack(inter, dim=2) + qk @ torch.stack(v_new_c, dim=2)
+
+
 def _gated_delta_inputs(
     bs: int,
     seq_len: int,
@@ -742,6 +770,24 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
           packed=True,
           reference=_unbind_inter_chunk_recurrence,
       ),
+      dict(
+          testcase_name="_fp32_autograd_loop",
+          dtype=torch.float32,
+          packed=False,
+          reference=_batched_qk_inter_chunk_recurrence,
+      ),
+      dict(
+          testcase_name="_fp32_packed_autograd_loop",
+          dtype=torch.float32,
+          packed=True,
+          reference=_batched_qk_inter_chunk_recurrence,
+      ),
+      dict(
+          testcase_name="_bf16_packed_autograd_loop",
+          dtype=torch.bfloat16,
+          packed=True,
+          reference=_batched_qk_inter_chunk_recurrence,
+      ),
   )
   def test_chunked_gated_delta_matches_indexed_loop_bitwise(
       self, dtype: torch.dtype, packed: bool, reference
@@ -750,9 +796,11 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
 
     The forward and all five input gradients of ``chunked_gated_delta`` must
     have the same bit patterns as with the earlier forms of the inter-chunk
-    loop: indexing every chunk (``_indexed_inter_chunk_recurrence``) and taking
-    ``qk`` per chunk inside the loop (``_unbind_inter_chunk_recurrence``). Runs
-    on CPU with one thread, where the kernels themselves are deterministic.
+    loop: indexing every chunk (``_indexed_inter_chunk_recurrence``), taking
+    ``qk`` per chunk inside the loop (``_unbind_inter_chunk_recurrence``) and
+    differentiating the loop with autograd
+    (``_batched_qk_inter_chunk_recurrence``). Runs on CPU with one thread,
+    where the kernels themselves are deterministic.
     """
     num_threads = torch.get_num_threads()
     torch.set_num_threads(1)
@@ -1025,6 +1073,99 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
               expected.contiguous().view(torch.uint8),
           )
       )
+
+  @parameterized.named_parameters(
+      dict(testcase_name="_fp32", autocast=False, compiled=False),
+      dict(testcase_name="_bf16_autocast", autocast=True, compiled=False),
+      dict(
+          testcase_name="_bf16_autocast_compiled", autocast=True, compiled=True
+      ),
+  )
+  def test_chunk_recurrence_backward_matches_autograd_bitwise(
+      self, autocast: bool, compiled: bool
+  ):
+    """Tests the chunk loop's custom backward against autograd, bit for bit.
+
+    ``chunked_gated_delta`` with ``_ChunkRecurrence`` and with the loop that
+    autograd differentiates chunk by chunk must give the same output and five
+    input gradients, with packed documents, in fp32 and under bf16 autocast
+    (as in training), eagerly and compiled with ``aot_eager``.
+    """
+    num_threads = torch.get_num_threads()
+    torch.set_num_threads(1)
+    self.addCleanup(torch.set_num_threads, num_threads)
+    torch.manual_seed(0)
+    seq_len, n_heads, d = 200, 4, 32
+    leaves = _gated_delta_inputs(1, seq_len, n_heads, d, d)
+    grad = torch.randn(1, seq_len, n_heads, d)
+    segment_ids = segment_ids_from_positions(
+        _packed_positions((63, 71, 66))
+    ).unsqueeze(0)
+
+    def forward_and_grads():
+      fn = gated_delta.chunked_gated_delta
+      if compiled:
+        torch._dynamo.reset()  # pylint: disable=protected-access
+        fn = torch.compile(fn, fullgraph=True, backend="aot_eager")
+      inputs = tuple(x.clone().requires_grad_() for x in leaves)
+      with torch.autocast("cpu", dtype=torch.bfloat16, enabled=autocast):
+        out = fn(*inputs, chunk_size=64, segment_ids=segment_ids)
+      return (
+          out.detach(),
+          *torch.autograd.grad(out, inputs, grad.to(out.dtype)),
+      )
+
+    custom = forward_and_grads()
+    with mock.patch.object(
+        gated_delta,
+        "_inter_chunk_recurrence",
+        _batched_qk_inter_chunk_recurrence,
+    ):
+      autograd_loop = forward_and_grads()
+    names = ("out", "q grad", "k grad", "v grad", "g grad", "beta grad")
+    for name, actual, expected in zip(
+        names, custom, autograd_loop, strict=True
+    ):
+      self.assertTrue(torch.isfinite(actual).all(), msg=name)
+      self.assertTrue(
+          torch.equal(
+              actual.contiguous().view(torch.uint8),
+              expected.contiguous().view(torch.uint8),
+          ),
+          msg=f"{name} differs from autograd of the loop",
+      )
+
+  def test_chunk_recurrence_gradcheck(self):
+    """Tests ``_ChunkRecurrence``'s backward in fp64, output by output."""
+    chunk_recurrence = gated_delta._ChunkRecurrence  # pylint: disable=protected-access
+    gen = torch.Generator().manual_seed(7)
+    bs, n_heads, num_chunks, chunk, d_k, d_v = 1, 2, 3, 4, 3, 5
+
+    def leaf(*shape, rand=torch.randn):
+      return rand(*shape, dtype=torch.float64, generator=gen).requires_grad_()
+
+    wq = leaf(bs, n_heads, num_chunks, 2 * chunk, d_k)
+    u = leaf(bs, n_heads, num_chunks, chunk, d_v)
+    k_decayed_t = leaf(bs, n_heads, num_chunks, d_k, chunk)
+    chunk_decay = leaf(bs, n_heads, num_chunks, 1, 1, rand=torch.rand)
+    ins = (wq, u, k_decayed_t, chunk_decay)
+    self.assertTrue(torch.autograd.gradcheck(chunk_recurrence.apply, ins))
+    # Either output's gradient alone (the other one's is None in backward)
+    # equals autograd of the loop.
+    for which in (0, 1):
+      got = torch.autograd.grad(chunk_recurrence.apply(*ins)[which].sum(), ins)
+      state = torch.zeros(bs, n_heads, d_k, d_v, dtype=torch.float64)
+      inter, v_new_c = [], []
+      for i in range(num_chunks):
+        wq_state = wq[:, :, i] @ state
+        v_new = u[:, :, i] - wq_state[..., :chunk, :]
+        inter.append(wq_state[..., chunk:, :])
+        v_new_c.append(v_new)
+        state = state * chunk_decay[:, :, i] + k_decayed_t[:, :, i] @ v_new
+      ref = (torch.stack(inter, dim=2), torch.stack(v_new_c, dim=2))[which]
+      want = torch.autograd.grad(ref.sum(), ins)
+      for g_got, g_want in zip(got, want, strict=True):
+        torch.testing.assert_close(g_got, g_want, rtol=0, atol=1e-12)
 
   @parameterized.named_parameters(
       # Documents start mid-chunk and at chunk starts (16 and 48 with 16-token
