@@ -60,7 +60,7 @@ from __future__ import annotations
 import heapq
 import os
 import re
-from collections.abc import Collection, Iterator
+from collections.abc import Collection
 from typing import Any
 
 import torch
@@ -241,46 +241,6 @@ def _spark_tally(names: Collection[str]) -> str:
   return "%d %r" % (len(names), sample)
 
 
-def _spark_decoder_shapes(
-    model_config: MuseSparkModel.Config,
-) -> Iterator[tuple[str, tuple[int, ...]]]:
-  """``(TorchTitan key, shape)`` of each decoder tensor, LoRA matrices aside.
-
-  The decoder is instantiated on the meta device, so its parameters take no
-  memory, and it is released once the iteration ends.
-  """
-  with torch.device("meta"):
-    meta_decoder = model_config.build()
-  for tt_key, tensor in meta_decoder.state_dict().items():
-    if _LORA_KEY.search(tt_key) is None:
-      yield tt_key, tuple(tensor.shape)
-
-
-def _spark_shape_report(
-    produced: dict[str, Any], recorded: dict[str, Any]
-) -> tuple[tuple[str, list[str]], ...]:
-  """The sections of the ``from_hf`` coverage error, one per kind of fault.
-
-  ``recorded`` is a shape table keyed by TorchTitan names. Each section pairs
-  a heading with the names at fault; all lists empty means ``produced`` fits.
-  """
-  absent = [key for key in recorded if key not in produced]
-  off_shape: list[str] = []
-  unlisted: list[str] = []
-  for key, tensor in produced.items():
-    if key not in recorded:
-      unlisted.append(key)
-      continue
-    got, want = tuple(tensor.shape), tuple(recorded[key])
-    if got != want:
-      off_shape.append(f"{key} {got} vs {want}")
-  return (
-      ("Table entries never produced", absent),
-      ("Shapes produced vs recorded", off_shape),
-      ("Produced names the table does not list", unlisted),
-  )
-
-
 class MuseSparkStateDictAdapter(StateDictAdapter):
   """Muse Spark text-decoder state dict <-> HF checkpoint; see the module doc."""
 
@@ -307,7 +267,16 @@ class MuseSparkStateDictAdapter(StateDictAdapter):
     self.to_hf_map = {tt_key: hf_key for hf_key, tt_key in self.from_hf_map.items()}
     self._decoder_hf_names = frozenset(hf_text_keys_for_config(model_config))
 
-    decoder_shapes = dict(_spark_decoder_shapes(model_config))
+    # Shapes come from a throwaway decoder on the meta device, which holds no
+    # parameter memory. LoRA matrices are not part of the table.
+    with torch.device("meta"):
+      meta_decoder = model_config.build()
+    decoder_shapes = {}
+    for tt_key, tensor in meta_decoder.state_dict().items():
+      if _LORA_KEY.search(tt_key) is None:
+        decoder_shapes[tt_key] = tuple(map(int, tensor.shape))
+    del meta_decoder
+
     mapped = set(self.from_hf_map.values())
     for idx in self.moe_layers:
       mapped.update(
@@ -324,7 +293,7 @@ class MuseSparkStateDictAdapter(StateDictAdapter):
       )
     # Published only after the self-check. from_hf reads this attribute on
     # every call, so a subclass or wrapper may swap in its own table later.
-    self.expected_model_shapes = decoder_shapes
+    self.expected_model_shapes: dict[str, tuple[int, ...]] = decoder_shapes
     self._compare_index_with_decoder()
 
   def _compare_index_with_decoder(self) -> None:
@@ -423,7 +392,21 @@ class MuseSparkStateDictAdapter(StateDictAdapter):
       state[f"{stem}.w1_EFD"] = packed.narrow(1, 0, mid)
       state[f"{stem}.w3_EFD"] = packed.narrow(1, mid, packed.shape[1] - mid)
 
-    sections = _spark_shape_report(state, self.expected_model_shapes)
+    # expected_model_shapes is looked up on each call, so a table swapped in
+    # after construction is the one this load is held against.
+    common = state.keys() & self.expected_model_shapes.keys()
+    compared = (
+        (key, tuple(state[key].shape), tuple(self.expected_model_shapes[key]))
+        for key in common
+    )
+    sections = (
+        ("Table entries never produced", self.expected_model_shapes.keys() - common),
+        (
+            "Shapes produced vs recorded",
+            [f"{key} {got} vs {want}" for key, got, want in compared if got != want],
+        ),
+        ("Produced names the table does not list", state.keys() - common),
+    )
     if any(names for _, names in sections):
       details = ". ".join(
           f"{heading}: {_spark_tally(names)}" for heading, names in sections

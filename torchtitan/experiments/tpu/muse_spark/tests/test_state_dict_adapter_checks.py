@@ -23,7 +23,7 @@ import dataclasses
 import json
 import logging
 import math
-import pathlib
+import os
 import shutil
 import tempfile
 import unittest
@@ -54,14 +54,15 @@ def _config(flavor: str = "debugmodel", num_layers: int | None = None):
 
 
 def _write_spark_index(folder: str, names) -> None:
-  """An index file for a two-shard checkpoint listing ``names`` (no shards)."""
-  shard_map = {
-      name: f"model-{1 + pos % 2:05d}-of-00002.safetensors"
-      for pos, name in enumerate(sorted(names))
-  }
-  pathlib.Path(folder, "model.safetensors.index.json").write_text(
-      json.dumps({"metadata": {"total_size": 0}, "weight_map": shard_map})
-  )
+  """Writes ``model.safetensors.index.json`` into ``folder``, listing ``names``.
+
+  Every name points at one shard file that is never created: the base adapter
+  takes nothing from that file name but its shard number.
+  """
+  shard = "model-00001-of-00001.safetensors"
+  contents = {"weight_map": dict.fromkeys(sorted(names), shard)}
+  with open(os.path.join(folder, "model.safetensors.index.json"), "w") as f:
+    json.dump(contents, f, indent=2)
 
 
 def _spark_meta_checkpoint(adapter) -> dict[str, torch.Tensor]:
