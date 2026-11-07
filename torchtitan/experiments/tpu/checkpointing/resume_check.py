@@ -46,7 +46,7 @@ __all__ = ["install", "batch_sha256"]
 
 
 def batch_sha256(batch: Mapping[str, Any]) -> str:
-    """Hex SHA-256 over the tensors of ``batch``, visited in sorted key order.
+    """Hex SHA-256 of the tensors in ``batch``, visited in sorted key order.
 
     Each tensor contributes its key (UTF-8) followed by its elements as raw
     bytes, row-major from a detached CPU copy. Other values are skipped, so
