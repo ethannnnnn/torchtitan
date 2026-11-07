@@ -92,7 +92,7 @@ def device_flush(device: torch.device | str) -> float:
     """
     start_ns = time.perf_counter_ns()
     if _ranks_in_default_group() > 1:
-        probe = torch.ones(1, dtype=torch.int32, device=device)
+        probe = torch.tensor([1], device=device, dtype=torch.int32)
         dist.all_reduce(probe)  # the default reduction is SUM
         probe.item()
     return (time.perf_counter_ns() - start_ns) / 1e9

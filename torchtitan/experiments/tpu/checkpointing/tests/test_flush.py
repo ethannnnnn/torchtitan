@@ -238,7 +238,8 @@ class DeviceFlushTest(unittest.TestCase):
         real_item = torch.Tensor.item
 
         def recording_item(tensor):
-            reads.append((reduce.call_count, tensor))
+            seen_collectives = reduce.call_count
+            reads.append((seen_collectives, tensor))
             return real_item(tensor)
 
         with _simulated_group(16) as reduce, mock.patch.object(torch.Tensor, "item", recording_item):
