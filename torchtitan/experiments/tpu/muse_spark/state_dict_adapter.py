@@ -394,18 +394,18 @@ class MuseSparkStateDictAdapter(StateDictAdapter):
 
     # expected_model_shapes is looked up on each call, so a table swapped in
     # after construction is the one this load is held against.
-    common = state.keys() & self.expected_model_shapes.keys()
+    overlap = state.keys() & self.expected_model_shapes.keys()
     compared = (
         (key, tuple(state[key].shape), tuple(self.expected_model_shapes[key]))
-        for key in common
+        for key in overlap
     )
     sections = (
-        ("Table entries never produced", self.expected_model_shapes.keys() - common),
+        ("Table entries never produced", self.expected_model_shapes.keys() - overlap),
         (
             "Shapes produced vs recorded",
             [f"{key} {got} vs {want}" for key, got, want in compared if got != want],
         ),
-        ("Produced names the table does not list", state.keys() - common),
+        ("Produced names the table does not list", state.keys() - overlap),
     )
     if any(names for _, names in sections):
       details = ". ".join(

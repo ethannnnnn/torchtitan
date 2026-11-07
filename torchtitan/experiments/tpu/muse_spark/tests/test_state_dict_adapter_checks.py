@@ -59,8 +59,9 @@ def _write_spark_index(folder: str, names) -> None:
   Every name points at one shard file that is never created: the base adapter
   takes nothing from that file name but its shard number.
   """
-  shard = "model-00001-of-00001.safetensors"
-  contents = {"weight_map": dict.fromkeys(sorted(names), shard)}
+  contents = {
+      "weight_map": dict.fromkeys(sorted(names), "model-00001-of-00001.safetensors")
+  }
   with open(os.path.join(folder, "model.safetensors.index.json"), "w") as f:
     json.dump(contents, f, indent=2)
 
