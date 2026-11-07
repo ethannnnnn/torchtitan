@@ -27,6 +27,7 @@ from absl.testing import absltest
 from absl.testing import parameterized
 import torch
 from torch.fx.experimental.proxy_tensor import make_fx
+from torch._subclasses.fake_tensor import FakeTensorMode
 import torch.nn.functional as F
 from torchtitan.config.manager import ConfigManager
 from torchtitan.experiments.tpu import accelerator_device_type as device_type
@@ -908,6 +909,122 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
     self.assertGreaterEqual(
         qk_gradient_stacks(_unbind_inter_chunk_recurrence), 1
     )
+
+  def test_gdn_unit_solve_triangular_fake_strides_match_the_kernel(self):
+    """Tests that the solve op's fake strides are C-contiguous, as its output.
+
+    A saved tensor reaches the compiled backward with the strides of its real
+    value while the backward was compiled for those of its fake value. Unlike
+    ``aten.linalg_solve_triangular``, whose meta kernel reports column-major
+    matrices, the op's fake and real outputs are both C-contiguous.
+    """
+    solve_op = torch.ops.torchtitan_tpu.gdn_unit_solve_triangular.default
+    self.assertEqual(
+        gated_delta.GDN_SOLVE_OP, "torchtitan_tpu::gdn_unit_solve_triangular"
+    )
+    # The shapes at 16384 tokens: 256 chunks of 64, 16 heads, d_k + d_v = 256.
+    with FakeTensorMode():
+      a, rhs = torch.empty(1, 16, 256, 64, 64), torch.empty(1, 16, 256, 64, 256)
+      fake = solve_op(a, rhs)
+      aten_meta = torch.linalg.solve_triangular(
+          a, rhs, upper=False, unitriangular=True
+      )
+    self.assertEqual(tuple(fake.shape), (1, 16, 256, 64, 256))
+    self.assertTrue(fake.is_contiguous())
+    self.assertFalse(aten_meta.is_contiguous())  # Column-major matrices.
+    torch.manual_seed(0)
+    a = (torch.randn(1, 2, 3, 64, 64) * 0.3).tril(-1)
+    self.assertTrue(solve_op(a, torch.randn(1, 2, 3, 64, 32)).is_contiguous())
+
+  @parameterized.named_parameters(
+      dict(testcase_name="_fp32", dtype=torch.float32),
+      dict(testcase_name="_fp64", dtype=torch.float64),
+  )
+  def test_gdn_unit_solve_triangular_matches_aten_bitwise(self, dtype):
+    """Tests the solve op's forward and backward against aten's, bit for bit.
+
+    Only the strictly lower triangle of ``a`` is read, batch dimensions
+    broadcast as in aten, and the gradients of every subset of inputs equal
+    those of autograd through ``torch.linalg.solve_triangular``.
+    """
+    solve_op = torch.ops.torchtitan_tpu.gdn_unit_solve_triangular.default
+    torch.manual_seed(0)
+
+    def aten_solve(a, rhs):
+      return torch.linalg.solve_triangular(
+          a, rhs, upper=False, unitriangular=True
+      )
+
+    a = (torch.randn(1, 4, 3, 64, 64, dtype=dtype) * 0.3).tril(-1)
+    rhs = torch.randn(1, 4, 3, 64, 96, dtype=dtype)
+    out = solve_op(a, rhs)
+    self.assertTrue(torch.equal(out, aten_solve(a, rhs)))
+    upper = torch.randn(a.shape, dtype=dtype).triu()
+    self.assertTrue(torch.equal(solve_op(a + upper, rhs), out))
+    a_b, rhs_b = a[:, :1], torch.randn(2, 4, 3, 64, 32, dtype=dtype)
+    self.assertTrue(torch.equal(solve_op(a_b, rhs_b), aten_solve(a_b, rhs_b)))
+    grad = torch.randn_like(out)
+    for grad_a, grad_rhs in ((True, True), (True, False), (False, True)):
+      with self.subTest(grad_a=grad_a, grad_rhs=grad_rhs):
+        ins = (
+            a.clone().requires_grad_(grad_a),
+            rhs.clone().requires_grad_(grad_rhs),
+        )
+        ref = (
+            a.clone().requires_grad_(grad_a),
+            rhs.clone().requires_grad_(grad_rhs),
+        )
+        got = torch.autograd.grad(
+            solve_op(*ins), [t for t in ins if t.requires_grad], grad
+        )
+        want = torch.autograd.grad(
+            aten_solve(*ref), [t for t in ref if t.requires_grad], grad
+        )
+        for g_got, g_want in zip(got, want, strict=True):
+          self.assertTrue(torch.equal(g_got, g_want))
+    if dtype == torch.float64:
+      small_a = torch.randn(1, 2, 2, 8, 8, dtype=dtype).requires_grad_()
+      small_rhs = torch.randn(1, 2, 2, 8, 5, dtype=dtype).requires_grad_()
+      self.assertTrue(
+          torch.autograd.gradcheck(
+              lambda a, rhs: solve_op(a.tril(-1), rhs), (small_a, small_rhs)
+          )
+      )
+      torch.library.opcheck(
+          solve_op, (a.clone().requires_grad_(), rhs.clone().requires_grad_())
+      )
+
+  def test_chunked_gated_delta_solve_op_matches_aten_solve_bitwise(self):
+    """Tests that the UT transform's solve op changes no bit of the layer.
+
+    ``chunked_gated_delta`` with ``torch.linalg.solve_triangular`` in place of
+    the custom op gives the same output and input gradients, bit for bit.
+    """
+    torch.manual_seed(0)
+    leaves = _gated_delta_inputs(2, 70, 2, 16, 16)
+    grad = torch.randn(2, 70, 2, 16)
+
+    def forward_and_grads():
+      inputs = tuple(x.clone().requires_grad_() for x in leaves)
+      out = gated_delta.chunked_gated_delta(*inputs, chunk_size=16)
+      return (out.detach(), *torch.autograd.grad(out, inputs, grad))
+
+    with_op = forward_and_grads()
+    with mock.patch.object(
+        gated_delta,
+        "gdn_unit_solve_triangular",
+        lambda a, rhs: torch.linalg.solve_triangular(
+            a, rhs, upper=False, unitriangular=True
+        ),
+    ):
+      with_aten = forward_and_grads()
+    for actual, expected in zip(with_op, with_aten, strict=True):
+      self.assertTrue(
+          torch.equal(
+              actual.contiguous().view(torch.uint8),
+              expected.contiguous().view(torch.uint8),
+          )
+      )
 
   @parameterized.named_parameters(
       # Documents start mid-chunk and at chunk starts (16 and 48 with 16-token

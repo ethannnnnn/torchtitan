@@ -15,8 +15,11 @@ from torch import nn
 from torch.utils._python_dispatch import TorchDispatchMode
 from torchtitan.distributed.activation_checkpoint import SelectiveAC
 from torchtitan.experiments.tpu import activation_checkpoint as tpu_ac
+# Registers the GatedDeltaNet solve op, and the ops of the modules it imports,
+# before any save set is built: the default save set lists registered ops.
+from torchtitan.experiments.tpu.qwen3_5 import gated_delta  # pylint: disable=unused-import
 
-_FLAGS = ("recompute_bmm", "save_pallas_attention")
+_FLAGS = ("recompute_bmm", "save_pallas_attention", "save_triangular_solve")
 _COLLECTIVES = {
     torch.ops._c10d_functional.all_to_all_single.default,
     torch.ops._c10d_functional.reduce_scatter_tensor.default,
@@ -138,7 +141,7 @@ class TPUSelectiveACFlagsTest(parameterized.TestCase):
       self.assertIs(getattr(config, flag), False, msg=flag)
 
   def test_flags_off_is_the_unchanged_policy(self):
-    """Both flags off: core ``SelectiveAC``'s save set minus the collectives."""
+    """All flags off: core ``SelectiveAC``'s save set minus the collectives."""
     off = _save_ops()
     core = SelectiveAC(SelectiveAC.Config()).get_save_ops()
     self.assertIs(type(off), set)
@@ -164,15 +167,32 @@ class TPUSelectiveACFlagsTest(parameterized.TestCase):
     self.assertIn(splash_like.default, save_ops)
     self.assertNotIn(_SPLASH_BWD, save_ops)
 
+  def test_save_triangular_solve_adds_only_the_custom_solve_op(self):
+    """The GatedDeltaNet solve op, never ``aten.linalg_solve_triangular``."""
+    off = _save_ops()
+    save_ops = _save_ops(save_triangular_solve=True)
+    solve_op = torch.ops.torchtitan_tpu.gdn_unit_solve_triangular.default
+    self.assertNotIn(solve_op, off)
+    self.assertEqual(save_ops, off | {solve_op})
+    self.assertNotIn(torch.ops.aten.linalg_solve_triangular.default, save_ops)
+
   @parameterized.product(
-      recompute_bmm=(False, True), save_pallas_attention=(False, True)
+      recompute_bmm=(False, True),
+      save_pallas_attention=(False, True),
+      save_triangular_solve=(False, True),
   )
-  def test_flags_compose(self, recompute_bmm, save_pallas_attention):
+  def test_flags_compose(
+      self, recompute_bmm, save_pallas_attention, save_triangular_solve
+  ):
     off = _save_ops()
     save_ops = _save_ops(
-        recompute_bmm=recompute_bmm, save_pallas_attention=save_pallas_attention
+        recompute_bmm=recompute_bmm,
+        save_pallas_attention=save_pallas_attention,
+        save_triangular_solve=save_triangular_solve,
     )
     want = off - ({torch.ops.aten.bmm.default} if recompute_bmm else set())
+    if save_triangular_solve:
+      want |= {torch.ops.torchtitan_tpu.gdn_unit_solve_triangular.default}
     self.assertEqual(set(save_ops), want)
     self.assertEqual(_SPLASH_FWD in save_ops, save_pallas_attention)
 
@@ -180,6 +200,7 @@ class TPUSelectiveACFlagsTest(parameterized.TestCase):
     config = tpu_ac.TPUSelectiveAC.Config(
         recompute_bmm=True,
         save_pallas_attention=True,
+        save_triangular_solve=True,
         preserve_rng_state=False,
         debug=True,
     )
@@ -187,6 +208,7 @@ class TPUSelectiveACFlagsTest(parameterized.TestCase):
     self.assertIs(type(policy), tpu_ac.TPUSelectiveAC)
     self.assertTrue(policy.config.recompute_bmm)
     self.assertTrue(policy.config.save_pallas_attention)
+    self.assertTrue(policy.config.save_triangular_solve)
     self.assertFalse(policy.config.preserve_rng_state)
     self.assertTrue(policy.config.debug)
 

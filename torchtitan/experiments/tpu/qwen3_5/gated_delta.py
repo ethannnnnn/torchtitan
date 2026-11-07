@@ -345,11 +345,12 @@ def chunked_gated_delta(
   # UT transform for all chunks at once:
   #   [W | U] = T [diag(beta) diag(exp(g)) K | diag(beta) V],
   #   T = (I + tril_{-1}(diag(beta) (K K^T * decay)))^-1.
-  # `unitriangular=True` takes the unit diagonal of `I + a` as given.
+  # `gdn_unit_solve_triangular` (end of module) takes the unit diagonal as
+  # given.
   k_beta = k * beta
   a = (k_beta @ k.transpose(-1, -2) * decay).tril(-1)
   rhs = torch.cat([k_beta * state_decay.unsqueeze(-1), v * beta], dim=-1)
-  wu = torch.linalg.solve_triangular(a, rhs, upper=False, unitriangular=True)
+  wu = gdn_unit_solve_triangular(a, rhs)
   w, u = wu[..., :d_k], wu[..., d_k:]
 
   # State-independent per-chunk terms, batched over all chunks.
@@ -566,3 +567,65 @@ class TpuGatedDeltaNet(GatedDeltaNet):
     output_THV = self.norm(output_THV, gate_THV)
     out_TD = output_THV.reshape(num_tokens, -1)
     return self.out_proj(out_TD)
+
+
+# The UT transform's unit-lower-triangular solve as a custom op. Selective AC
+# may save its output (``TPUSelectiveAC``'s ``save_triangular_solve``), and a
+# saved tensor crosses from the compiled forward program to the compiled
+# backward program. torch-tpu compiles the backward for the strides of the saved
+# tensor's fake (meta) value, the forward returns the strides of the real
+# kernel's output, and the buffer is passed between them without comparing the
+# two. ``aten.linalg_solve_triangular``'s meta kernel reports column-major
+# matrices while torch-tpu's kernel returns a row-major (C-contiguous) tensor,
+# so saving the aten op hands the backward a scrambled buffer. This op's fake is
+# C-contiguous and its implementation returns the solve's output made contiguous
+# (a no-op on TPU), so its fake and real strides agree on every backend. Its
+# backward is aten's (``linalg_solve_triangular_backward`` for ``upper=False,
+# left=True, unitriangular=True``), op for op.
+GDN_SOLVE_OP = "torchtitan_tpu::gdn_unit_solve_triangular"
+
+
+@torch.library.custom_op(GDN_SOLVE_OP, mutates_args=())
+def gdn_unit_solve_triangular(
+    a: torch.Tensor, rhs: torch.Tensor
+) -> torch.Tensor:
+  """``(I + tril_{-1}(a))^-1 rhs``, C-contiguous.
+
+  ``torch.linalg.solve_triangular(a, rhs, upper=False, unitriangular=True)``:
+  the unit diagonal of ``I + a`` is taken as given, so only the strictly lower
+  triangle of ``a`` is read.
+  """
+  return torch.linalg.solve_triangular(
+      a, rhs, upper=False, unitriangular=True
+  ).contiguous()
+
+
+@gdn_unit_solve_triangular.register_fake
+def _gdn_unit_solve_triangular_fake(
+    a: torch.Tensor, rhs: torch.Tensor
+) -> torch.Tensor:
+  shape = torch.broadcast_shapes(a.shape[:-2], rhs.shape[:-2]) + rhs.shape[-2:]
+  return rhs.new_empty(shape, dtype=torch.promote_types(a.dtype, rhs.dtype))
+
+
+def _gdn_unit_solve_triangular_setup_context(ctx, inputs, output):
+  ctx.save_for_backward(inputs[0], output)
+
+
+def _gdn_unit_solve_triangular_backward(ctx, grad):
+  # G_rhs = (I + a)^-H grad and G_a = tril_{-1}(-G_rhs X^H), as aten computes
+  # them.
+  a, x = ctx.saved_tensors
+  grad_rhs = torch.linalg.solve_triangular(
+      a.mH, grad, upper=True, left=True, unitriangular=True
+  )
+  grad_a = None
+  if ctx.needs_input_grad[0]:
+    grad_a = (-torch.matmul(grad_rhs, x.mH)).tril(-1)
+  return grad_a, grad_rhs if ctx.needs_input_grad[1] else None
+
+
+gdn_unit_solve_triangular.register_autograd(
+    _gdn_unit_solve_triangular_backward,
+    setup_context=_gdn_unit_solve_triangular_setup_context,
+)
