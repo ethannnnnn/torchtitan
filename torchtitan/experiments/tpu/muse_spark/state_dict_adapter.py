@@ -4,34 +4,63 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Hugging Face checkpoint mapping for the Muse Spark Open text decoder.
+"""Muse Spark text decoder state dicts and the public Hugging Face checkpoint.
 
-The public checkpoint (``MuseSparkForConditionalGeneration``) stores the text
-decoder under ``model.language_model.*`` plus ``lm_head.weight``, next to the
-vision and audio towers, which the text-only model does not build. The
-mapping is one-to-one except for the routed experts: the checkpoint packs
-``gate_up_proj`` as ``[E, 2F, D]`` (gate rows first), while TorchTitan keeps
-``w1_EFD`` (gate) and ``w3_EFD`` (up) separately. Both sides use the
-rotate-half RoPE convention, so Q/K weights are not permuted.
+Three pieces live here. ``MuseSparkStateDictAdapter`` translates between the
+public ``MuseSparkForConditionalGeneration`` checkpoint and the state dict of
+TorchTitan's Muse Spark text decoder. ``ExpertPermutingHFStorageReader`` reads
+that checkpoint into a decoder whose routed-expert rows sit in a
+non-contiguous placement, and ``expert_slot_to_logical`` builds the slot map
+of such a placement: for each physical expert row, the logical expert in it.
 
-The adapter is strict about the text decoder:
+What a load reads: the decoder tensors under ``model.language_model.`` and
+the output head ``lm_head.weight``. The vision tower, vision adapter, vision
+projection and audio tower stay unread in the checkpoint, and so does every
+decoder layer a truncated flavor leaves out (layer index at or above its
+layer count).
 
-* With ``hf_assets_path``, the checkpoint index must contain every text
-  tensor of the model's layers (deeper layers of a truncated model and the
-  vision/audio towers are ignored).
-* ``to_hf`` must map every model key; ``from_hf`` rejects unknown keys and
-  must produce exactly the model's keys and shapes.
+How names and tensors convert:
 
-LoRA adapter weights (``*.lora_a.weight`` / ``*.lora_b.weight``) are not part
-of the checkpoint: they are skipped by ``to_hf`` and not expected from
-``from_hf`` (the checkpointer loads the base weights non-strictly).
+* Most decoder tensors only change their name.
+* Each MoE layer of the checkpoint packs the gate and up projections of all
+  routed experts into ``mlp.experts.gate_up_proj``, shaped ``[E, 2F, D]``.
+  Rows ``0..F-1`` along dim 1 become ``w1_EFD`` (gate) and rows ``F..2F-1``
+  become ``w3_EFD`` (up); ``mlp.experts.down_proj`` maps to ``w2_EDF`` as is.
+* Q and K projection rows keep their order, with no per-head reshuffle: the
+  checkpoint and this decoder both rotate the two halves of every head
+  dimension (rotate-half RoPE), so their rotary pairs already coincide.
+
+What triggers a ``ValueError``:
+
+* Constructing the adapter for a checkpoint folder that has an index file
+  (``model.safetensors.index.json``) holds that file against the decoder.
+  A decoder tensor that the index file lacks, or a listed name that is not
+  a decoder tensor, not a tower tensor and not inside a layer past the
+  layer count, aborts construction. On a folder without an index file that
+  comparison moves to ``from_hf``. Construction also aborts if the name
+  mapping and the decoder built from the config disagree about the
+  TorchTitan tensor names.
+* In ``from_hf``, a name of that unplaceable kind aborts the load before
+  any tensor is converted; after conversion, a decoder tensor that was not
+  produced, or whose shape differs from the built decoder's, aborts it.
+* ``to_hf`` aborts on a state-dict key it has no checkpoint name for, and on
+  an expert gate tensor that comes without its up tensor, or the reverse.
+
+LoRA: the adapter matrices that ``torchtitan.components.lora`` adds have no
+tensors in a base checkpoint. Conversion leaves them out in both directions
+and the shape table omits them. That is safe because a LoRA model loads its
+base weights non-strictly, so its adapters keep their initial values.
+
+Placement: when the routed-expert rows use a non-contiguous placement,
+``get_hf_storage_reader`` hands out the permuting reader.
 """
 
 from __future__ import annotations
 
-import json
+import heapq
 import os
 import re
+from collections.abc import Collection
 from typing import Any
 
 import torch
@@ -46,23 +75,22 @@ from .model import MuseSparkModel
 
 __all__ = ["MuseSparkStateDictAdapter", "hf_text_keys_for_config"]
 
-TEXT_PREFIX = "model.language_model"
-# Checkpoint families the text-only model has no parameters for.
-EXCLUDED_HF_PREFIXES = (
+_SPARK_DECODER_ROOT = "model.language_model"
+_SPARK_VISION_AUDIO_TOWERS = (
     "model.vision_tower.",
     "model.vision_adapter.",
     "model.vision_projection.",
     "model.audio_tower.",
 )
 _EXPERTS = "moe.routed_experts.inner_experts"
-_LAYER_KEY = re.compile(re.escape(TEXT_PREFIX) + r"\.layers\.(\d+)\.")
+_LAYER_KEY = re.compile(re.escape(_SPARK_DECODER_ROOT) + r"\.layers\.(\d+)\.")
 # LoRA adapters (``torchtitan.components.lora``) have no checkpoint tensors.
 _LORA_KEY = re.compile(r"\.lora_[ab]\.weight$")
 
 
 def _layer_map(layer_id: int, layer_config: Any) -> dict[str, str]:
   """HF key -> TT key for one layer (excluding the packed experts)."""
-  hf = f"{TEXT_PREFIX}.layers.{layer_id}"
+  hf = f"{_SPARK_DECODER_ROOT}.layers.{layer_id}"
   tt = f"layers.{layer_id}"
   mapping = {
       f"{hf}.input_layernorm.weight": f"{tt}.attention_norm.weight",
@@ -102,7 +130,7 @@ def _layer_map(layer_id: int, layer_config: Any) -> dict[str, str]:
 
 
 def _gate_up_key(layer_id: int) -> str:
-  return f"{TEXT_PREFIX}.layers.{layer_id}.mlp.experts.gate_up_proj"
+  return f"{_SPARK_DECODER_ROOT}.layers.{layer_id}.mlp.experts.gate_up_proj"
 
 
 def hf_text_keys_for_config(model_config: MuseSparkModel.Config) -> list[str]:
@@ -117,8 +145,8 @@ def hf_text_keys_for_config(model_config: MuseSparkModel.Config) -> list[str]:
 
 def _build_from_hf_map(model_config: MuseSparkModel.Config) -> dict[str, str]:
   mapping = {
-      f"{TEXT_PREFIX}.embed_tokens.weight": "tok_embeddings.embedding.weight",
-      f"{TEXT_PREFIX}.norm.weight": "norm.weight",
+      f"{_SPARK_DECODER_ROOT}.embed_tokens.weight": "tok_embeddings.embedding.weight",
+      f"{_SPARK_DECODER_ROOT}.norm.weight": "norm.weight",
       "lm_head.weight": "lm_head.weight",
   }
   for layer_id, layer in enumerate(model_config.layers):
@@ -199,8 +227,22 @@ class ExpertPermutingHFStorageReader(HuggingFaceStorageReader):
     return fut
 
 
+# How many names of one kind an adapter error spells out.
+_SPARK_NAMES_SHOWN = 10
+
+
+def _spark_tally(names: Collection[str]) -> str:
+  """``names`` as the adapter's errors print them: a count, then a sample.
+
+  The sample is the list of the ten names that sort first, which keeps a
+  message short when a whole layer or tower is affected.
+  """
+  sample = heapq.nsmallest(_SPARK_NAMES_SHOWN, names)
+  return "%d %r" % (len(names), sample)
+
+
 class MuseSparkStateDictAdapter(StateDictAdapter):
-  """Strict HF <-> TorchTitan mapping for the text decoder (module docstring)."""
+  """Muse Spark text-decoder state dict <-> HF checkpoint; see the module doc."""
 
   def __init__(
       self, model_config: MuseSparkModel.Config, hf_assets_path: str | None
@@ -217,63 +259,84 @@ class MuseSparkStateDictAdapter(StateDictAdapter):
       self.expert_slot_to_logical = expert_slot_to_logical(
           moe.num_experts if moe is not None else 0, degree, placement
       )
-    self.num_layers = len(model_config.layers)
-    self.from_hf_map = _build_from_hf_map(model_config)
-    self.to_hf_map = {tt: hf for hf, tt in self.from_hf_map.items()}
+    self._decoder_depth = len(model_config.layers)
     self.moe_layers = [
-        i for i, layer in enumerate(model_config.layers) if layer.moe is not None
+        idx for idx, block in enumerate(model_config.layers) if block.moe is not None
     ]
-    self.expected_hf_keys = set(hf_text_keys_for_config(model_config))
-    with torch.device("meta"):
-      model = model_config.build()
-    self.expected_model_shapes = {
-        k: tuple(v.shape)
-        for k, v in model.state_dict().items()
-        if not _LORA_KEY.search(k)
-    }
-    del model
-    expected_tt = set(self.from_hf_map.values()) | {
-        f"layers.{i}.{_EXPERTS}.{w}" for i in self.moe_layers for w in ("w1_EFD", "w3_EFD")
-    }
-    if expected_tt != set(self.expected_model_shapes):
-      raise ValueError(
-          "MuseSparkStateDictAdapter does not cover the model: missing"
-          f" {sorted(set(self.expected_model_shapes) - expected_tt)[:10]},"
-          f" unknown {sorted(expected_tt - set(self.expected_model_shapes))[:10]}"
-      )
-    if hf_assets_path:
-      self._check_index(hf_assets_path)
+    self.from_hf_map = _build_from_hf_map(model_config)
+    self.to_hf_map = {tt_key: hf_key for hf_key, tt_key in self.from_hf_map.items()}
+    self._decoder_hf_names = frozenset(hf_text_keys_for_config(model_config))
 
-  def _check_index(self, hf_assets_path: str) -> None:
-    index_path = os.path.join(hf_assets_path, "model.safetensors.index.json")
-    if not os.path.isfile(index_path):
-      # The trainer builds the adapter for tokenizer-only asset folders too;
-      # a single-file or absent checkpoint is checked in from_hf instead.
+    # Shapes come from a throwaway decoder on the meta device, which holds no
+    # parameter memory. LoRA matrices are not part of the table.
+    with torch.device("meta"):
+      meta_decoder = model_config.build()
+    decoder_shapes = {}
+    for tt_key, tensor in meta_decoder.state_dict().items():
+      if _LORA_KEY.search(tt_key) is None:
+        decoder_shapes[tt_key] = tuple(map(int, tensor.shape))
+    del meta_decoder
+
+    mapped = set(self.from_hf_map.values())
+    for idx in self.moe_layers:
+      mapped.update(
+          f"layers.{idx}.{_EXPERTS}.{half}" for half in ("w1_EFD", "w3_EFD")
+      )
+    model_keys = set(decoder_shapes)
+    if mapped != model_keys:
+      raise ValueError(
+          f"{type(self).__name__} construction: the HF name mapping and the"
+          " decoder built from model_config list different TorchTitan tensors."
+          f" Only the mapping yields {_spark_tally(mapped - model_keys)};"
+          " only the built decoder has"
+          f" {_spark_tally(model_keys - mapped)}"
+      )
+    # Published only after the self-check. from_hf reads this attribute on
+    # every call, so a subclass or wrapper may swap in its own table later.
+    self.expected_model_shapes: dict[str, tuple[int, ...]] = decoder_shapes
+    self._compare_index_with_decoder()
+
+  def _compare_index_with_decoder(self) -> None:
+    """Holds the names in the folder's index file against the text decoder."""
+    folder = self.hf_assets_path
+    if not folder:
+      return
+    checkpoint_keys = self.fqn_to_index_mapping
+    if checkpoint_keys is None:
       logger.info(
-          "Muse Spark: no checkpoint index in %s; keys are checked on load",
-          hf_assets_path,
+          f"{type(self).__name__}: {folder} holds no model.safetensors.index.json;"
+          " the text decoder's tensor names get compared with the checkpoint"
+          " once from_hf runs"
       )
       return
-    with open(index_path) as f:
-      weight_map = json.load(f)["weight_map"]
-    missing = sorted(self.expected_hf_keys - set(weight_map))
-    unknown = sorted(
-        k for k in weight_map if self._classify_hf_key(k) == "unknown"
-    )
+    missing = self._decoder_hf_names.difference(checkpoint_keys)
+    unknown = [
+        n for n in checkpoint_keys if self._classify_hf_key(n) == "unknown"
+    ]
     if missing or unknown:
+      index_file = os.path.join(folder, "model.safetensors.index.json")
       raise ValueError(
-          f"Muse Spark checkpoint {hf_assets_path} does not match the text"
-          f" model: missing {missing[:10]}, unknown {unknown[:10]}"
+          f"{type(self).__name__} construction: {index_file} does not fit the"
+          f" {self._decoder_depth}-layer text decoder. Decoder tensors the"
+          f" index file omits: {_spark_tally(missing)}. Listed"
+          " names belonging to neither the decoder, its vision and audio"
+          " towers nor a layer past the layer count:"
+          f" {_spark_tally(unknown)}"
       )
 
-  def _classify_hf_key(self, hf_key: str) -> str:
-    """``expected`` | ``excluded`` (towers, deeper layers) | ``unknown``."""
-    if hf_key in self.expected_hf_keys:
+  def _classify_hf_key(self, hf_name: str) -> str:
+    """Label of one checkpoint name, shared by from_hf and the index check.
+
+    ``"expected"``: the text decoder loads it. ``"excluded"``: a tower tensor,
+    or a tensor of a layer at or past the layer count; it stays in the file.
+    ``"unknown"``: anything else; both checks reject it.
+    """
+    if hf_name in self._decoder_hf_names:
       return "expected"
-    if hf_key.startswith(EXCLUDED_HF_PREFIXES):
+    if hf_name.startswith(_SPARK_VISION_AUDIO_TOWERS):
       return "excluded"
-    match = _LAYER_KEY.match(hf_key)
-    if match is not None and int(match.group(1)) >= self.num_layers:
+    found = _LAYER_KEY.match(hf_name)
+    if found is not None and int(found.group(1)) >= self._decoder_depth:
       return "excluded"
     return "unknown"
 
@@ -304,49 +367,74 @@ class MuseSparkStateDictAdapter(StateDictAdapter):
     return hf_state_dict
 
   def from_hf(self, hf_state_dict: dict[str, Any]) -> dict[str, Any]:
-    state_dict: dict[str, Any] = {}
-    unknown = []
-    for hf_key, value in hf_state_dict.items():
-      kind = self._classify_hf_key(hf_key)
-      if kind == "excluded":
-        continue
-      if kind == "unknown":
-        unknown.append(hf_key)
-        continue
-      if hf_key in self.from_hf_map:
-        state_dict[self.from_hf_map[hf_key]] = value
-        continue
-      layer_id = int(_LAYER_KEY.match(hf_key).group(1))
-      gate, up = value.chunk(2, dim=1)
-      state_dict[f"layers.{layer_id}.{_EXPERTS}.w1_EFD"] = gate
-      state_dict[f"layers.{layer_id}.{_EXPERTS}.w3_EFD"] = up
+    where = f"{type(self).__name__}.from_hf"
+    labels = {name: self._classify_hf_key(name) for name in hf_state_dict}
+    unknown = [name for name, label in labels.items() if label == "unknown"]
     if unknown:
       raise ValueError(
-          f"MuseSparkStateDictAdapter.from_hf: unexpected checkpoint keys {unknown[:10]}"
+          f"{where}: checkpoint names outside the text decoder, its vision and"
+          " audio towers and the layers past its layer count:"
+          f" {_spark_tally(unknown)}"
       )
-    missing = sorted(set(self.expected_model_shapes) - set(state_dict))
-    mismatched = [
-        f"{k}: {tuple(v.shape)} vs {self.expected_model_shapes[k]}"
-        for k, v in state_dict.items()
-        if tuple(v.shape) != self.expected_model_shapes[k]
-    ]
-    if missing or mismatched:
+
+    state: dict[str, Any] = {}
+    for name, label in labels.items():
+      if label != "expected":
+        continue
+      if name in self.from_hf_map:
+        state[self.from_hf_map[name]] = hf_state_dict[name]
+        continue
+      # Every other decoder name is a packed [E, 2F, D] expert tensor; views of
+      # the first and second half of dim 1 are w1_EFD (gate) and w3_EFD (up).
+      packed = hf_state_dict[name]
+      stem = f"layers.{_LAYER_KEY.match(name).group(1)}.{_EXPERTS}"
+      mid = packed.shape[1] // 2
+      state[f"{stem}.w1_EFD"] = packed.narrow(1, 0, mid)
+      state[f"{stem}.w3_EFD"] = packed.narrow(1, mid, packed.shape[1] - mid)
+
+    # expected_model_shapes is looked up on each call, so a table swapped in
+    # after construction is the one this load is held against.
+    overlap = state.keys() & self.expected_model_shapes.keys()
+    compared = (
+        (key, tuple(state[key].shape), tuple(self.expected_model_shapes[key]))
+        for key in overlap
+    )
+    sections = (
+        ("Table entries never produced", self.expected_model_shapes.keys() - overlap),
+        (
+            "Shapes produced vs recorded",
+            [f"{key} {got} vs {want}" for key, got, want in compared if got != want],
+        ),
+        ("Produced names the table does not list", state.keys() - overlap),
+    )
+    if any(names for _, names in sections):
+      details = ". ".join(
+          f"{heading}: {_spark_tally(names)}" for heading, names in sections
+      )
       raise ValueError(
-          "MuseSparkStateDictAdapter.from_hf: the checkpoint does not cover the"
-          f" model: missing {missing[:10]}, shape mismatches {mismatched[:10]}"
+          f"{where}: the converted decoder tensors do not fit"
+          f" expected_model_shapes. {details}"
       )
-    return state_dict
+    return state
 
   @property
   def permutes_experts(self) -> bool:
-    """True when expert rows are stored in a non-contiguous placement's slot
-    order. HF loading then reads each physical row from its logical row; a
-    TorchTitan checkpoint saved from such a model keeps the slot order (an HF
-    export must apply ``expert_slot_to_logical`` to the expert dim)."""
-    maps = self.expert_slot_to_logical
-    if isinstance(maps, dict):
-      return any(m != sorted(m) for m in maps.values())
-    return maps != sorted(maps)
+    """Whether some stored expert row holds a logical expert other than its own.
+
+    ``expert_slot_to_logical`` is one slot map for every layer or a dict of
+    per-layer maps keyed by the layer index as a string; it is read on each
+    call. When this is True, a Hugging Face load goes through
+    ``ExpertPermutingHFStorageReader``, which fills stored row ``p`` of every
+    routed-expert tensor from the checkpoint row of the logical expert the
+    map names for ``p``. TorchTitan checkpoints of such a model keep the
+    stored row order, so exporting one to Hugging Face has to invert the
+    permutation along the expert dimension with the same map.
+    """
+    layout = self.expert_slot_to_logical
+    for order in layout.values() if isinstance(layout, dict) else (layout,):
+      if any(int(logical) != row for row, logical in enumerate(order)):
+        return True
+    return False
 
   def get_hf_storage_reader(self, path, from_quantized=False):
     if self.permutes_experts:
