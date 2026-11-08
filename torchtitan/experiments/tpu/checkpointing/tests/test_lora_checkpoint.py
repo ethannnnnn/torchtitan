@@ -45,7 +45,7 @@ def _deps():
     try:
         from torchtitan.experiments.tpu.muse_spark import MuseSparkArgs  # noqa: F401
         from torchtitan.experiments.tpu.post_training import lora  # noqa: F401
-    except Exception:  # noqa: BLE001
+    except Exception:
         return False
     return True
 

@@ -107,7 +107,7 @@ def _is_url(path: str) -> bool:
 
 
 def _local(path: str) -> str:
-    return path[len("file://"):] if path.startswith("file://") else path
+    return path.removeprefix("file://")
 
 
 def _join(root: str, name: str) -> str:
@@ -379,7 +379,7 @@ def discover_hf_dependencies(adapter: Any, meta: dict[str, torch.Tensor]) -> dic
             continue
         try:
             out = to_hf({key: value})
-        except Exception:  # noqa: BLE001 - needs its partners
+        except Exception:  # needs its partners
             pending[_layer_of(key)].append(key)
             continue
         if len(out) == 1:
@@ -513,7 +513,7 @@ class DcpSource:
 def assign_files(layout: HfLayout, num_workers: int) -> list[list[str]]:
     """Greedy largest-first assignment of shard files to workers by bytes."""
     loads = [0] * num_workers
-    out: list[list[str]] = [[] for _ in range(num_workers)]
+    out = [list() for _ in range(num_workers)]
     for file in sorted(layout.files, key=lambda f: (-layout.file_bytes(f), f)):
         i = min(range(num_workers), key=lambda j: (loads[j], j))
         out[i].append(file)
@@ -732,10 +732,10 @@ def _load_factory(spec: str) -> Callable[..., Any]:
 
 
 def _gcs():
-    """The ``gcs`` helpers of this package, or the copy next to this file (standalone use)."""
+    """Cloud Storage helpers: the package module, or the ``gcs.py`` beside this file when run as a script."""
     try:
         from torchtitan.experiments.tpu.checkpointing import gcs
-    except Exception:  # noqa: BLE001 - standalone use
+    except Exception:  # standalone use
         sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
         import gcs  # type: ignore[no-redef]
     return gcs

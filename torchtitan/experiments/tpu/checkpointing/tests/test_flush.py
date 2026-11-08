@@ -56,13 +56,22 @@ def _fake_flush(events: list):
     return fake
 
 
+def _initialized_group(ranks: int, **more):
+    """One ``mock.patch.multiple`` that makes ``torch.distributed`` report an initialized group of ``ranks``."""
+    return mock.patch.multiple(
+        dist,
+        is_available=lambda: True,
+        is_initialized=lambda: True,
+        get_world_size=lambda group=None: ranks,
+        **more,
+    )
+
+
 @contextlib.contextmanager
-def _simulated_group(world_size: int, all_reduce):
-    """Pretend an initialized default process group of ``world_size`` ranks; ``all_reduce`` replaces the collective."""
-    with mock.patch.object(dist, "is_available", return_value=True), \
-            mock.patch.object(dist, "is_initialized", return_value=True), \
-            mock.patch.object(dist, "get_world_size", return_value=world_size), \
-            mock.patch.object(dist, "all_reduce", side_effect=all_reduce) as reduce:
+def _simulated_group(ranks: int, collective=None):
+    """Pretend a default group of ``ranks`` exists; ``all_reduce`` becomes a mock that runs ``collective``."""
+    reduce = mock.Mock(side_effect=collective)
+    with _initialized_group(ranks, all_reduce=reduce):
         yield reduce
 
 
@@ -195,9 +204,7 @@ class DeviceFlushTest(unittest.TestCase):
             "current process": [],
             "distributed unavailable": [mock.patch.object(dist, "is_available", return_value=False)],
             "not initialized": [mock.patch.object(dist, "is_initialized", return_value=False)],
-            "one rank": [mock.patch.object(dist, "is_available", return_value=True),
-                         mock.patch.object(dist, "is_initialized", return_value=True),
-                         mock.patch.object(dist, "get_world_size", return_value=1)],
+            "one rank": [_initialized_group(1)],
         }
         for name, patches in cases.items():
             with self.subTest(name), contextlib.ExitStack() as stack:
@@ -225,16 +232,24 @@ class DeviceFlushTest(unittest.TestCase):
         self.assertIsInstance(seconds, float)
         self.assertGreaterEqual(seconds, 0.0)
 
-    def test_wrong_count_raises(self):
-        """A sum other than the world size raises RuntimeError naming both numbers."""
+    def test_unexpected_sum_is_read_back_without_a_check(self):
+        """A sum other than the world size is accepted; the host read happens after the collective."""
+        reads = []
+        real_item = torch.Tensor.item
 
-        def short_by_three(tensor, *args, **kwargs):
-            tensor.fill_(13)
+        def recording_item(tensor):
+            seen_collectives = reduce.call_count
+            reads.append((seen_collectives, tensor))
+            return real_item(tensor)
 
-        with _simulated_group(16, short_by_three), self.assertRaises(RuntimeError) as caught:
-            flush.device_flush("cpu")
-        self.assertRegex(str(caught.exception), r"\b13\b")
-        self.assertRegex(str(caught.exception), r"\b16\b")
+        with _simulated_group(16) as reduce, mock.patch.object(torch.Tensor, "item", recording_item):
+            seconds = flush.device_flush("cpu")
+        self.assertIsInstance(seconds, float)
+        self.assertGreaterEqual(seconds, 0.0)
+        reduce.assert_called_once()
+        self.assertEqual([calls for calls, _ in reads], [1])  # one host read, after the collective
+        self.assertIs(reads[0][1], reduce.call_args.args[0])  # of the tensor that was reduced
+        self.assertEqual(reads[0][1].tolist(), [1])  # still 1 with 16 ranks, and no error
 
 
 def _gloo_rank(rank: int, workdir: str) -> None:

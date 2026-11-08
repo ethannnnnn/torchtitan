@@ -50,11 +50,9 @@ TINY_DIR = os.environ.get("MUSE_SPARK_TINY_DIR")
 
 
 def _sha(path: str) -> str:
-    h = hashlib.sha256()
+    """Hex SHA-256 of the file at ``path`` (what ``sha256sum`` prints)."""
     with open(path, "rb") as f:
-        for b in iter(lambda: f.read(1 << 22), b""):
-            h.update(b)
-    return h.hexdigest()
+        return hashlib.file_digest(f, "sha256").hexdigest()
 
 
 def _same(a: torch.Tensor, b: torch.Tensor) -> bool:
@@ -570,7 +568,8 @@ class HfExportTest(unittest.TestCase):
         self.assertEqual(rep["finalize"]["replaced_tensors"], 8)
         layout, exported = HfLayout(TINY_DIR), HfLayout(out)
         scale = alpha / rank
-        for key in source.keys():
+        target_keys = sorted(source.keys())
+        for key in target_keys:
             module = key[: -len(".weight")]
             a = peft[f"base_model.model.{module}.lora_A.weight"].float()
             b = peft[f"base_model.model.{module}.lora_B.weight"].float()
@@ -594,10 +593,11 @@ class HfExportTest(unittest.TestCase):
         unmerged = _logits(peft_model, ids)
         peft_merged = peft_model.merge_and_unload().eval()
         merged_sd = peft_merged.state_dict()
-        for key in source.keys():
+        target_keys = sorted(source.keys())
+        for key in target_keys:
             self.assertTrue(torch.equal(merged_sd[key].to(torch.bfloat16), exported.read_tensor(key)), key)
         with torch.no_grad():
-            for key in source.keys():
+            for key in target_keys:
                 merged_sd[key].copy_(merged_sd[key].to(torch.bfloat16).float())
         ours = _logits(_hf_model(out, torch.float32), ids)
         self.assertTrue(torch.equal(ours, _logits(peft_merged, ids)))
@@ -610,7 +610,7 @@ def _spark():
     try:
         from torchtitan.experiments.tpu.muse_spark import MuseSparkArgs, MuseSparkStateDictAdapter
         from torchtitan.experiments.tpu.muse_spark.configs import build_muse_spark_config
-    except Exception:  # noqa: BLE001
+    except Exception:
         return None
     return MuseSparkArgs, MuseSparkStateDictAdapter, build_muse_spark_config
 

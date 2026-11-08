@@ -46,6 +46,7 @@ import os
 import re
 import time
 from collections import defaultdict
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 import torch
@@ -318,7 +319,7 @@ def tt_lora_to_peft(lora: dict[str, torch.Tensor], adapter: Any) -> dict[str, to
 
 
 def peft_to_tt_lora(
-    peft: dict[str, torch.Tensor], adapter: Any, model_lora_shapes: dict[str, tuple[int, ...]]
+    peft: dict[str, torch.Tensor], adapter: Any, model_lora_shapes: Mapping[str, Sequence[int]]
 ) -> dict[str, torch.Tensor]:
     """Inverse of ``tt_lora_to_peft`` for a model whose LoRA tensors have the given shapes."""
     pairs: dict[str, dict[str, torch.Tensor]] = defaultdict(dict)

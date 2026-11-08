@@ -12,8 +12,8 @@ projections of every text layer) into a Hugging Face checkpoint with
 ``hf_export`` on several hosts and workers, then verifies the result:
 
 * every output shard has the original header bytes and size;
-* shards the adapter does not touch are byte-identical to the original
-  (their streamed SHA-256 equals the published per-shard SHA-256, if given);
+* shards without an adapted weight stay bit-identical; with ``--public-sha256``
+  the SHA-256 computed while writing each one must equal its published value;
 * sampled merged tensors equal ``bf16(W + alpha / r * B @ A)`` recomputed from
   the original weights.
 
@@ -47,7 +47,7 @@ DEFAULT_TARGETS = r"model\.language_model\.layers\.\d+\.self_attn\.(q|k|v|o)_pro
 def _modules():
     try:
         from torchtitan.experiments.tpu.checkpointing import gcs, hf_export, lora_checkpoint
-    except Exception:  # noqa: BLE001 - standalone use next to the other files
+    except Exception:  # standalone use next to the other files
         sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
         import gcs  # type: ignore
         import hf_export  # type: ignore
@@ -89,7 +89,7 @@ def _worker(args, worker: int, num_workers: int, adapter_dir: str, q) -> None:
             storage_options=storage, out_storage_options=storage, staging_dir=args.staging_dir,
             gcs_client=client, sha256=True, finalize=False)
         q.put((worker, {k: v for k, v in rep.items() if k != "source"}))
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         import traceback
 
         q.put((worker, {"error": f"{type(exc).__name__}: {exc}", "trace": traceback.format_exc()[-3000:]}))
@@ -97,22 +97,30 @@ def _worker(args, worker: int, num_workers: int, adapter_dir: str, q) -> None:
 
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--base", required=True)
-    p.add_argument("--out", required=True)
-    p.add_argument("--staging-dir", required=True)
-    p.add_argument("--hosts", type=int, default=int(os.environ.get("NNODES", "1")))
-    p.add_argument("--host", type=int, default=int(os.environ.get("JOB_COMPLETION_INDEX", "0")))
-    p.add_argument("--workers-per-host", type=int, default=4)
-    p.add_argument("--targets", default=DEFAULT_TARGETS)
-    p.add_argument("--rank", type=int, default=16)
-    p.add_argument("--alpha", type=float, default=32.0)
-    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--base", required=True,
+                   help="Hugging Face checkpoint the adapter is merged into (local path or Cloud Storage)")
+    p.add_argument("--out", required=True, help="destination of the merged export (local path or Cloud Storage)")
+    p.add_argument("--staging-dir", required=True,
+                   help="local scratch folder for the generated adapter and for shards bound for Cloud Storage")
+    p.add_argument("--hosts", type=int, default=int(os.environ.get("NNODES", "1")),
+                   help="number of hosts running this check (default: $NNODES, else 1)")
+    p.add_argument("--host", type=int, default=int(os.environ.get("JOB_COMPLETION_INDEX", "0")),
+                   help="this host's index from 0; host 0 finalizes and verifies (default: $JOB_COMPLETION_INDEX or 0)")
+    p.add_argument("--workers-per-host", type=int, default=4, help="export processes started on each host")
+    p.add_argument("--targets", default=DEFAULT_TARGETS,
+                   help="regular expression; every weight it fully matches receives a random LoRA pair")
+    p.add_argument("--rank", type=int, default=16, help="LoRA rank of the random adapter")
+    p.add_argument("--alpha", type=float, default=32.0, help="LoRA alpha; the merge scale is alpha / rank")
+    p.add_argument("--seed", type=int, default=0, help="seed from which the adapter weights are derived")
     p.add_argument("--public-sha256", default="", help="sha256sum-style list of the original shards")
-    p.add_argument("--verify-tensors", type=int, default=8)
-    p.add_argument("--report", default="")
+    p.add_argument("--verify-tensors", type=int, default=8,
+                   help="number of merged tensors that host 0 recomputes and compares")
+    p.add_argument("--report", default="", help="also write the JSON report to this file")
     p.add_argument("--cleanup", action="store_true", help="delete the export after verifying")
-    p.add_argument("--finalize-timeout-s", type=float, default=3000)
-    p.add_argument("--auth", default="auto")
+    p.add_argument("--finalize-timeout-s", type=float, default=3000,
+                   help="seconds host 0 waits for the manifests of all workers before giving up")
+    p.add_argument("--auth", default="auto",
+                   help="Cloud Storage credentials: auto, ksa, default, or none for local paths only")
     args = p.parse_args(argv)
 
     t0 = time.time()

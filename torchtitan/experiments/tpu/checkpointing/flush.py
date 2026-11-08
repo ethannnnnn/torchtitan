@@ -4,7 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Drain the TorchTPU device queue on every rank after a checkpoint save.
+"""Drain each TorchTPU rank's queued device work right after a save that wrote a checkpoint.
 
 TorchTPU executes device work lazily: operations issued by the host are queued
 and only run when the host next has to read a value back from the device.
@@ -21,11 +21,12 @@ happens somewhere in the next training step. Two things follow:
 * if rank 0 dies inside that window, the other ranks stay blocked until the
   collective times out, although every checkpoint file was already written.
 
-``device_flush`` closes the window. Each rank adds up a single integer over
-all ranks with a collective on its device and copies the total to the host.
-The host read executes everything queued before it, in order, and completes
-only once every rank has arrived. ``flush_after_saves`` runs it after each
-``save`` call that wrote a checkpoint::
+``device_flush`` closes that window. Each rank feeds the integer 1 into a
+group-wide sum that a collective computes on the rank's own device, then
+copies the result to the host. That copy makes the device execute its backlog
+in the order it was issued, and it cannot complete before the whole group has
+added its share. ``flush_after_saves`` hooks this onto a checkpoint manager so
+that it runs whenever ``save`` reports a written checkpoint::
 
     from torchtitan.experiments.tpu.checkpointing.flush import flush_after_saves
 
@@ -42,6 +43,7 @@ until the group's timeout.
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import time
 from typing import Any, Callable
@@ -62,51 +64,55 @@ def _ranks_in_default_group() -> int:
 
 
 def device_flush(device: torch.device | str) -> float:
-    """Execute this rank's queued device work and wait until all ranks did the same.
+    """Synchronous barrier issued on ``device``; returns the seconds it took.
 
-    With more than one rank in the default process group, a one-element
-    ``int32`` tensor holding 1 is created on ``device``, summed over the group
-    with ``all_reduce`` and copied to the host; reading it there is what makes
-    the device run its queue. A sum other than the group size raises
-    ``RuntimeError``. With no initialized group, or a single rank, nothing else
-    happens and ``device`` is not used.
+    When the default process group has two or more ranks, the call
 
-    Every rank of the default group has to call this at the same point (it is a
-    collective). Errors and timeouts from ``torch.distributed`` propagate as
-    they are.
+    1. creates a one-element ``torch.int32`` tensor holding 1 on ``device``,
+    2. sums it over the default group with a blocking ``all_reduce``, and
+    3. fetches the reduced value to the host with ``Tensor.item()``.
 
-    Returns:
-        Seconds spent in this call.
+    Step 3 does the work. On TorchTPU, producing that host value means first
+    running everything submitted to the device before it, in submission
+    order, and the value only exists once the whole group has contributed to
+    the sum. TorchTPU's process group uses the same recipe for its own
+    synchronous barrier. ``torch.distributed.barrier()`` would not do: its
+    backend is picked from the device types the group was created with, and
+    when the default group combines a TorchTPU backend with a CPU one, the
+    barrier is served by the CPU backend and the device queue stays as it is.
+    The fetched value is not inspected.
+
+    Without an initialized process group, or with a single rank, nothing is
+    created or communicated and ``device`` is never used.
+
+    It is a collective, so all ranks of the default group must reach it
+    together; a rank that arrives alone hangs until the process group times
+    out. Errors and timeouts raised by ``torch.distributed`` propagate
+    unchanged. The returned wall time is never negative.
     """
-    entered = time.perf_counter()
-    ranks = _ranks_in_default_group()
-    if ranks > 1:
-        tally = torch.full((1,), 1, dtype=torch.int32, device=device)
-        dist.all_reduce(tally, op=dist.ReduceOp.SUM)
-        (arrived,) = tally.cpu().tolist()
-        if arrived != ranks:
-            raise RuntimeError(
-                f"device flush: the all_reduce over the default process group summed to "
-                f"{arrived}, but the group has {ranks} ranks"
-            )
-    return time.perf_counter() - entered
+    start_ns = time.perf_counter_ns()
+    if _ranks_in_default_group() > 1:
+        probe = torch.tensor([1], device=device, dtype=torch.int32)
+        dist.all_reduce(probe)  # the default reduction is SUM
+        probe.item()
+    return (time.perf_counter_ns() - start_ns) / 1e9
 
 
-class _FlushOnWrite:
-    """Instance-level ``save`` for one checkpoint manager: delegate, then flush if it wrote."""
+@dataclasses.dataclass(frozen=True)
+class _SaveThenFlush:
+    """Instance-level ``save`` installed by ``flush_after_saves``."""
 
-    def __init__(self, delegate: Callable[..., Any], device: torch.device | str) -> None:
-        self.delegate = delegate
-        self.device = device
+    inner_save: Callable[..., Any]
+    device: torch.device | str
 
     def __call__(self, curr_step: int, last_step: bool = False) -> Any:
-        outcome = self.delegate(curr_step, last_step=last_step)
-        if outcome:
-            # ``device_flush`` is looked up in the module namespace on each call,
-            # so patching the module attribute intercepts this flush as well.
-            seconds = device_flush(self.device)
-            logger.info("Checkpoint step %d: device queues drained on all ranks in %.3f s", curr_step, seconds)
-        return outcome
+        result = self.inner_save(curr_step, last_step=last_step)
+        if not result:
+            return result
+        logger.info(
+            "Checkpoint of step %s written; device queue drained in %.3f s", curr_step, device_flush(self.device)
+        )
+        return result
 
 
 def flush_after_saves(checkpointer: Any, device: torch.device | str) -> None:
@@ -133,6 +139,6 @@ def flush_after_saves(checkpointer: Any, device: torch.device | str) -> None:
     """
     if not getattr(checkpointer, "enable", False):
         return
-    if isinstance(checkpointer.save, _FlushOnWrite):
+    if isinstance(checkpointer.save, _SaveThenFlush):
         return
-    checkpointer.save = _FlushOnWrite(checkpointer.save, device)
+    checkpointer.save = _SaveThenFlush(checkpointer.save, device)

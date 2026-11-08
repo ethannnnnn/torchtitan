@@ -36,6 +36,7 @@ import json
 import logging
 import os
 import signal
+from collections.abc import Iterator, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -44,16 +45,26 @@ logger = logging.getLogger(__name__)
 __all__ = ["install", "batch_sha256"]
 
 
-def batch_sha256(batch: dict[str, Any]) -> str:
+def batch_sha256(batch: Mapping[str, Any]) -> str:
+    """Hex SHA-256 of the tensors in ``batch``, visited in sorted key order.
+
+    Each tensor contributes its key (UTF-8) followed by its elements as raw
+    bytes, row-major from a detached CPU copy. Other values are skipped, so
+    the digest ignores insertion order and non-tensor entries. Records from
+    earlier runs stay comparable only while this byte layout is unchanged.
+    """
     import torch
 
-    digest = hashlib.sha256()
-    for key in sorted(batch):
-        value = batch[key]
-        if isinstance(value, torch.Tensor):
-            digest.update(key.encode())
-            digest.update(value.detach().cpu().contiguous().view(-1).view(torch.uint8).numpy().tobytes())
-    return digest.hexdigest()
+    h = hashlib.sha256()
+    for name in sorted(batch):
+        value = batch[name]
+        if not isinstance(value, torch.Tensor):
+            continue
+        t = value.detach().cpu().contiguous().view(-1).view(torch.uint8)
+        raw_bytes = t.numpy().tobytes()
+        h.update(name.encode("utf-8"))
+        h.update(raw_bytes)
+    return h.hexdigest()
 
 
 def install() -> bool:
@@ -65,7 +76,7 @@ def install() -> bool:
     from torchtitan.components.metrics import MetricsProcessor
     from torchtitan.trainer import Trainer
 
-    if getattr(Trainer.batch_generator, "_resume_check", False):
+    if getattr(Trainer.batch_generator, "_rc_hook", False):
         return True
     rank = int(os.environ.get("RANK", "0"))
     orig_batches = Trainer.batch_generator
@@ -83,7 +94,7 @@ def install() -> bool:
                 self._resume_check_batches.append(batch_sha256(batch))
             yield batch
 
-    def train_step(self, data_iterator):
+    def train_step(self, data_iterator: Iterator[dict[str, Any]]):
         self._resume_check_batches = []
         out = orig_step(self, data_iterator)
         if records_dir:
@@ -94,11 +105,11 @@ def install() -> bool:
                 handle.write(json.dumps(line, sort_keys=True) + "\n")
         return out
 
-    batch_generator._resume_check = True
+    batch_generator._rc_hook = True
     Trainer.batch_generator = batch_generator
     Trainer.train_step = train_step
 
-    if records_dir and not getattr(MetricsProcessor.log, "_resume_check", False):
+    if records_dir and not getattr(MetricsProcessor.log, "_rc_hook", False):
         orig_log = MetricsProcessor.log
 
         def log(self, step, global_avg_loss, global_max_loss, grad_norm, *args, **kwargs):
@@ -107,7 +118,7 @@ def install() -> bool:
                             float(global_avg_loss), float(global_max_loss), float(grad_norm))
             return orig_log(self, step, global_avg_loss, global_max_loss, grad_norm, *args, **kwargs)
 
-        log._resume_check = True
+        log._rc_hook = True
         MetricsProcessor.log = log
     if rank == 0:
         logger.warning("[resume-check] installed: kill_step=%s records_dir=%s", kill_step or None,
