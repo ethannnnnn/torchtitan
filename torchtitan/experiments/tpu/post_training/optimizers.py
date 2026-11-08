@@ -47,7 +47,7 @@ def _lowbit_class(base_cls: type, backend: str) -> type:
   """``base_cls`` with its step running ``single_param_adam`` on ``backend``."""
   from torchao.optim.adam import single_param_adam
 
-  update: Callable[..., Any] = (
+  update = (
       single_param_adam
       if not backend
       else torch.compile(
@@ -104,32 +104,42 @@ def _lowbit_class(base_cls: type, backend: str) -> type:
 
 
 def lowbit_factory(name: str, backend: str = "") -> Callable[..., Optimizer]:
-  if backend not in COMPILE_BACKENDS:
+  """Builder of the torchao optimizer ``name`` (one of ``LOWBIT_OPTIMIZERS``)
+  whose update runs on the compile ``backend``.
+
+  The builder takes ``(params, **kwargs)``; it drops torch.optim's ``fused``
+  and ``foreach`` switches, which these classes do not take.
+  """
+  known_backend = backend in COMPILE_BACKENDS
+  if not known_backend:
     raise ValueError(
-        f"lowbit_compile_backend must be one of {COMPILE_BACKENDS}"
+        "low-bit optimizer backend {!r}; expected one of {}".format(
+            backend, COMPILE_BACKENDS
+        )
     )
   from torchao.optim import AdamW8bit, _AdamW
 
-  if name == "AdamW8bit":
-    cls = _lowbit_class(AdamW8bit, backend)
+  variants = {
+      "AdamW8bit": (AdamW8bit, {}),
+      "AdamWBf16": (_AdamW, {"bf16_stochastic_round": True}),
+  }
+  chosen = variants.get(name)
+  if chosen is None:
+    raise NotImplementedError(
+        "no low-bit optimizer named {!r}; expected one of {}".format(
+            name, LOWBIT_OPTIMIZERS
+        )
+    )
+  torchao_cls, defaults = chosen
+  optimizer_cls = _lowbit_class(torchao_cls, backend)
 
-    def build(params, **kwargs):
-      kwargs.pop("fused", None)
-      kwargs.pop("foreach", None)
-      return cls(params, **kwargs)
+  def build(params: Any, **kwargs: Any) -> Optimizer:
+    present = [switch for switch in ("fused", "foreach") if switch in kwargs]
+    for switch in present:
+      del kwargs[switch]
+    return optimizer_cls(params, **(defaults | kwargs))
 
-    return build
-  if name == "AdamWBf16":
-    cls = _lowbit_class(_AdamW, backend)
-
-    def build_bf16(params, **kwargs):
-      kwargs.pop("fused", None)
-      kwargs.pop("foreach", None)
-      kwargs.setdefault("bf16_stochastic_round", True)
-      return cls(params, **kwargs)
-
-    return build_bf16
-  raise NotImplementedError(f"unknown low-bit optimizer {name}")
+  return build
 
 
 class PostTrainingOptimizersContainer(OptimizersContainer):

@@ -30,9 +30,9 @@ from torchtitan.experiments.tpu.post_training.sft_data import ChatSFTDataLoader
 from torchtitan.experiments.tpu.post_training.tests import cpu_recipes, smoke_common
 from torchtitan.experiments.tpu.tpu_job_config import TpuTrainerCompileConfig
 
-SPARK_RECIPES = sorted(
-    n for n in dir(cr) if n.startswith("muse_spark_816b_a42b_")
-)
+SPARK_RECIPES = [
+    name for name in sorted(vars(cr)) if name.startswith("muse_spark_")
+]
 
 
 def _lora_configs(model_config):
@@ -99,12 +99,8 @@ class SparkRecipeTest(unittest.TestCase):
         self.assertIsInstance(config.compile, TpuTrainerCompileConfig)
         self.assertTrue(config.compile.compile_grad_norm)
         self.assertEqual(config.tpu_config.eager_mode, "DEFER_AND_FUSE")
-        experts = [
-            e
-            for _, e, _, _ in config.model_spec.model.traverse(
-                TpuGroupedExperts.Config
-            )
-        ]
+        traversal = config.model_spec.model.traverse(TpuGroupedExperts.Config)
+        experts = [found[1] for found in traversal]
         self.assertEqual(len(experts), 2)
         for e in experts:
           self.assertTrue(e.use_pallas_grouped_mm)
@@ -155,7 +151,8 @@ class SparkRecipeTest(unittest.TestCase):
   def test_sft_recipes(self):
     for name in SPARK_RECIPES:
       with self.subTest(name=name):
-        config = getattr(cr, name)()
+        recipe = vars(cr)[name]
+        config = recipe()
         self.assertIsInstance(config.dataloader, ChatSFTDataLoader.Config)
         self.assertEqual(config.dataloader.reasoning_effort, "low")
         # Pallas fused CE carries the head's multiplier and soft cap.
@@ -297,6 +294,166 @@ class CPURecipeTest(unittest.TestCase):
       with self.subTest(name=name):
         config = getattr(cpu_recipes, name)()
         self.assertEqual(config.training.max_context_length, 512)
+
+
+class BaseConfigTest(unittest.TestCase):
+  """The sections of ``base_config``, which every SFT recipe builds on."""
+
+  SHAPE = cr.TrainShape(
+      seq_len=512,
+      rows_per_microbatch=2,
+      num_chunks=4,
+      steps=7,
+      warmup_steps=2,
+      lr=3e-4,
+      lr_decay="linear",
+      lr_min_factor=0.5,
+      betas=(0.8, 0.9),
+      weight_decay=0.1,
+      max_norm=0.5,
+  )
+
+  def _config(self, parallel=None, shape=None):
+    from torchtitan.components.loss import CrossEntropyLoss
+
+    self.loss = ChunkedLossWrapper.Config(
+        num_chunks=4, loss_fn=CrossEntropyLoss.Config()
+    )
+    self.dataloader = ChatSFTDataLoader.Config(data_path="/data/sft.jsonl")
+    return cr.base_config(
+        model_spec=smoke_common.debug_model_spec(),
+        hf_assets_path="/weights",
+        loss=self.loss,
+        dataloader=self.dataloader,
+        shape=shape or self.SHAPE,
+        precision=cr.Precision(dtype="bfloat16", optimizer="AdamW"),
+        parallel=parallel or cr.Parallel(),
+        num_tokens_per_train_step=cr.AUTO_STEP_TOKENS,
+        checkpoint_interval=5,
+        seed=11,
+    )
+
+  def test_training_schedule_and_fixed_sections(self):
+    config = self._config()
+    training = config.training
+    self.assertEqual(
+        (training.steps, training.max_context_length, training.max_norm),
+        (7, 512, 0.5),
+    )
+    self.assertEqual(training.num_tokens_per_microbatch_per_dp_rank, 1024)
+    self.assertEqual(training.num_tokens_per_train_step, -1)
+    self.assertEqual(training.dtype, "bfloat16")
+    self.assertEqual(
+        (training.mixed_precision_param, training.mixed_precision_reduce),
+        ("bfloat16", "float32"),
+    )
+    schedule = config.lr_scheduler
+    self.assertEqual(
+        (schedule.warmup_steps, schedule.decay_type, schedule.min_lr_factor),
+        (2, "linear", 0.5),
+    )
+    group = config.optimizer.param_groups[0]
+    self.assertEqual(group.optimizer_name, "AdamW")
+    self.assertEqual(
+        group.optimizer_kwargs,
+        {"lr": 3e-4, "betas": (0.8, 0.9), "eps": 1e-8, "weight_decay": 0.1},
+    )
+    self.assertIs(config.loss, self.loss)
+    self.assertIs(config.dataloader, self.dataloader)
+    self.assertEqual(config.hf_assets_path, "/weights")
+    self.assertEqual(config.metrics.log_freq, 1)
+    self.assertEqual(config.debug.seed, 11)
+    self.assertEqual(config.comm.train_timeout_seconds, 1800)
+    self.assertEqual(cr.TRAIN_COMM_TIMEOUT_SECONDS, 1800)
+    self.assertFalse(config.validator.enable)
+    self.assertFalse(config.loss_kernel.use_loss_kernel)
+    self.assertFalse(config.tpu_config.enable_amp)
+
+  def test_parallelism(self):
+    parallel = cr.Parallel(
+        dp_shard=4,
+        tensor_parallel=2,
+        fsdp_reshard_after_forward="never",
+    )
+    mesh = self._config(parallel).parallelism
+    self.assertEqual(
+        (
+            mesh.data_parallel_shard_degree,
+            mesh.tensor_parallel_degree,
+            mesh.expert_parallel_degree,
+        ),
+        (4, 2, 1),
+    )
+    self.assertEqual(
+        (
+            mesh.data_parallel_replicate_degree,
+            mesh.context_parallel_degree,
+            mesh.pipeline_parallel_degree,
+        ),
+        (1, 1, 1),
+    )
+    self.assertTrue(mesh.use_simple_fsdp)
+    self.assertEqual(mesh.fsdp_reshard_after_forward, "never")
+
+  def test_checkpoint_switches(self):
+    checkpoint = self._config().checkpoint
+    self.assertTrue(checkpoint.enable)
+    self.assertEqual(checkpoint.interval, 5)
+    self.assertEqual(checkpoint.async_mode, "disabled")
+    load = (checkpoint.initial_load_in_hf, checkpoint.initial_load_model_only)
+    save = (checkpoint.last_save_in_hf, checkpoint.last_save_model_only)
+    self.assertEqual((load, save), ((True, True), (False, False)))
+
+  def test_activation_checkpoint_names(self):
+    from torchtitan.distributed.activation_checkpoint import FullAC, SelectiveAC
+
+    def policy(name):
+      parallel = cr.Parallel(activation_checkpoint=name)
+      return self._config(parallel).activation_checkpoint
+
+    self.assertIsNone(policy("none"))
+    for name, kind in (
+        ("selective", SelectiveAC.Config),
+        ("full", FullAC.Config),
+    ):
+      with self.subTest(name):
+        self.assertIs(type(policy(name)), kind)
+        self.assertFalse(policy(name).preserve_rng_state)
+    with self.assertRaises(KeyError):
+      self._config(cr.Parallel(activation_checkpoint="region"))
+
+  def test_compile_and_eager_mode(self):
+    plain = self._config(cr.Parallel(compile_grad_norm=True))
+    self.assertFalse(plain.compile.enable)
+    self.assertEqual(plain.compile.components, ["model", "loss"])
+    self.assertEqual(
+        (plain.compile.backend, plain.compile.mode), ("tpu", "layer")
+    )
+    self.assertTrue(plain.compile.compile_grad_norm)
+    self.assertEqual(plain.tpu_config.eager_mode, "")
+    compiled = self._config(cr.Parallel(compile_model=True))
+    self.assertTrue(compiled.compile.enable)
+    self.assertEqual(compiled.compile.components, ["model"])
+    self.assertFalse(compiled.compile.compile_grad_norm)
+    self.assertEqual(compiled.tpu_config.eager_mode, "DEFER_AND_FUSE")
+    chosen = self._config(
+        cr.Parallel(compile_model=True, eager_mode="DEFER_NEVER")
+    )
+    self.assertEqual(chosen.tpu_config.eager_mode, "DEFER_NEVER")
+    eager_only = self._config(cr.Parallel(eager_mode="INTERNAL_DEFER_ALL"))
+    self.assertEqual(eager_only.tpu_config.eager_mode, "INTERNAL_DEFER_ALL")
+
+  def test_chunks_must_divide_the_microbatch(self):
+    shape = cr.TrainShape(seq_len=512, rows_per_microbatch=2, num_chunks=3)
+    with self.assertRaises(ValueError) as caught:
+      self._config(shape=shape)
+    self.assertIn("3", str(caught.exception))
+    self.assertIn("1024", str(caught.exception))
+
+  def test_sft_recipes_derive_the_step_tokens(self):
+    config = cpu_recipes.sft_debug_smoke()
+    self.assertEqual(config.training.num_tokens_per_train_step, -1)
+    self.assertEqual(cr.AUTO_STEP_TOKENS, -1)
 
 
 if __name__ == "__main__":

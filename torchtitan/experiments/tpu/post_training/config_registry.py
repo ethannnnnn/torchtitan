@@ -155,6 +155,95 @@ def _model_spec(
   return spec
 
 
+# Upstream derives a step's token count when this is -1 (one microbatch per
+# data-parallel rank); SFTTPUTrainer then sets the number of accumulated
+# microbatches from the loader before every step.
+AUTO_STEP_TOKENS = -1
+# Collective timeout once the first step has run, in seconds.
+TRAIN_COMM_TIMEOUT_SECONDS = 1800
+
+# Parallel.activation_checkpoint -> config class; None trains without it.
+_ACTIVATION_CHECKPOINT_TYPES = {
+    "none": None,
+    "selective": SelectiveAC.Config,
+    "full": FullAC.Config,
+}
+# The checkpoint switches in two groups: a fresh run reads only the model,
+# from the Hugging Face weights; the final save is a DCP save of the whole
+# training state.
+_FIRST_LOAD_HF_MODEL = {
+    "initial_load_in_hf": True,
+    "initial_load_model_only": True,
+}
+_LAST_SAVE_DCP_STATE = {
+    "last_save_in_hf": False,
+    "last_save_model_only": False,
+}
+
+
+def _training_section(
+    shape: TrainShape, precision: Precision, step_tokens: int
+) -> TrainingConfig:
+  slots_per_rank = shape.rows_per_microbatch * shape.seq_len
+  if slots_per_rank % shape.num_chunks != 0:
+    raise ValueError(
+        "num_chunks={} must divide the {} token slots of a microbatch "
+        "(rows_per_microbatch x seq_len)".format(
+            shape.num_chunks, slots_per_rank
+        )
+    )
+  return TrainingConfig(
+      steps=shape.steps,
+      max_context_length=shape.seq_len,
+      num_tokens_per_microbatch_per_dp_rank=slots_per_rank,
+      num_tokens_per_train_step=step_tokens,
+      dtype=precision.dtype,
+      mixed_precision_param="bfloat16",
+      mixed_precision_reduce="float32",
+      max_norm=shape.max_norm,
+  )
+
+
+def _parallelism_section(parallel: Parallel) -> ParallelismConfig:
+  return ParallelismConfig(
+      data_parallel_shard_degree=parallel.dp_shard,
+      tensor_parallel_degree=parallel.tensor_parallel,
+      expert_parallel_degree=parallel.expert_parallel,
+      data_parallel_replicate_degree=1,
+      context_parallel_degree=1,
+      pipeline_parallel_degree=1,
+      use_simple_fsdp=True,
+      fsdp_reshard_after_forward=parallel.fsdp_reshard_after_forward,
+  )
+
+
+def _checkpoint_section(interval: int) -> CheckpointManager.Config:
+  return CheckpointManager.Config(
+      enable=True,
+      interval=interval,
+      async_mode="disabled",
+      **_FIRST_LOAD_HF_MODEL,
+      **_LAST_SAVE_DCP_STATE,
+  )
+
+
+def _compile_section(parallel: Parallel) -> TpuTrainerCompileConfig:
+  # The component list keeps its default unless the model is compiled.
+  components = {"components": ["model"]} if parallel.compile_model else {}
+  return TpuTrainerCompileConfig(
+      enable=parallel.compile_model,
+      backend="tpu",
+      mode="layer",
+      compile_grad_norm=parallel.compile_grad_norm,
+      **components,
+  )
+
+
+def _tpu_section(parallel: Parallel) -> TPUConfig:
+  implied = "DEFER_AND_FUSE" if parallel.compile_model else ""
+  return TPUConfig(enable_amp=False, eager_mode=parallel.eager_mode or implied)
+
+
 def base_config(
     *,
     model_spec: Any,
@@ -168,31 +257,34 @@ def base_config(
     checkpoint_interval: int,
     seed: int,
 ) -> TPUTrainerConfig:
-  """The trainer config every SFT recipe builds on.
+  """The TPU trainer config that SFT recipes start from.
 
-  ``shape`` sets the microbatch geometry, run length, learning-rate schedule
-  and AdamW hyperparameters, ``precision`` the weight dtype and optimizer, and
-  ``parallel`` the parallelism, activation checkpointing and compile policy.
-  The checkpointer loads the initial weights from the Hugging Face checkpoint
-  in ``hf_assets_path`` and saves every ``checkpoint_interval`` steps;
-  gradients are reduced in fp32.
+  ``shape`` gives the run length, the learning-rate schedule and the
+  microbatch geometry (``rows_per_microbatch`` rows of ``seq_len`` tokens per
+  data-parallel rank, a multiple of ``num_chunks``); ``precision`` the weight
+  dtype and the optimizer; ``parallel`` the mesh, compile and activation
+  checkpoint settings. Checkpoints are saved synchronously every
+  ``checkpoint_interval`` steps, and a fresh run loads the model from the
+  Hugging Face weights in ``hf_assets_path``.
   """
-  microbatch_tokens = shape.rows_per_microbatch * shape.seq_len
-  if microbatch_tokens % shape.num_chunks:
-    raise ValueError(
-        f"num_chunks {shape.num_chunks} must divide {microbatch_tokens}"
-    )
+  training = _training_section(shape, precision, num_tokens_per_train_step)
+  ac_type = _ACTIVATION_CHECKPOINT_TYPES[parallel.activation_checkpoint]
   return TPUTrainerConfig(
-      hf_assets_path=hf_assets_path,
       model_spec=model_spec,
-      loss=loss,
-      loss_kernel=LossKernelConfig(use_loss_kernel=False),
-      metrics=MetricsProcessor.Config(log_freq=1),
+      hf_assets_path=hf_assets_path,
+      debug=DebugConfig(seed=seed),
+      training=training,
+      parallelism=_parallelism_section(parallel),
+      activation_checkpoint=(
+          None if ac_type is None else ac_type(preserve_rng_state=False)
+      ),
+      compile=_compile_section(parallel),
+      tpu_config=_tpu_section(parallel),
       optimizer=adamw_config(
           lr=shape.lr,
-          name=precision.optimizer,
           betas=shape.betas,
           weight_decay=shape.weight_decay,
+          name=precision.optimizer,
           lowbit_compile_backend=precision.lowbit_compile_backend,
       ),
       lr_scheduler=LRSchedulersContainer.Config(
@@ -200,67 +292,13 @@ def base_config(
           decay_type=shape.lr_decay,
           min_lr_factor=shape.lr_min_factor,
       ),
-      training=TrainingConfig(
-          steps=shape.steps,
-          max_context_length=shape.seq_len,
-          num_tokens_per_microbatch_per_dp_rank=microbatch_tokens,
-          num_tokens_per_train_step=num_tokens_per_train_step,
-          dtype=precision.dtype,
-          mixed_precision_param="bfloat16",
-          mixed_precision_reduce="float32",
-          max_norm=shape.max_norm,
-      ),
+      loss=loss,
+      loss_kernel=LossKernelConfig(use_loss_kernel=False),
       dataloader=dataloader,
-      parallelism=ParallelismConfig(
-          data_parallel_shard_degree=parallel.dp_shard,
-          data_parallel_replicate_degree=1,
-          tensor_parallel_degree=parallel.tensor_parallel,
-          context_parallel_degree=1,
-          pipeline_parallel_degree=1,
-          expert_parallel_degree=parallel.expert_parallel,
-          use_simple_fsdp=True,
-          fsdp_reshard_after_forward=parallel.fsdp_reshard_after_forward,
-      ),
-      checkpoint=CheckpointManager.Config(
-          enable=True,
-          initial_load_in_hf=True,
-          initial_load_model_only=True,
-          interval=checkpoint_interval,
-          last_save_model_only=False,
-          last_save_in_hf=False,
-          async_mode="disabled",
-      ),
-      activation_checkpoint={
-          "none": None,
-          "selective": SelectiveAC.Config(preserve_rng_state=False),
-          "full": FullAC.Config(preserve_rng_state=False),
-      }[parallel.activation_checkpoint],
-      # Per-layer TorchTPU compile ("layer") of the model when compiling;
-      # the compiled gradient norm is independent of model compilation.
-      compile=(
-          TpuTrainerCompileConfig(
-              enable=True,
-              backend="tpu",
-              components=["model"],
-              mode="layer",
-              compile_grad_norm=parallel.compile_grad_norm,
-          )
-          if parallel.compile_model
-          else TpuTrainerCompileConfig(
-              enable=False,
-              backend="tpu",
-              mode="layer",
-              compile_grad_norm=parallel.compile_grad_norm,
-          )
-      ),
-      comm=CommConfig(train_timeout_seconds=1800),
+      checkpoint=_checkpoint_section(checkpoint_interval),
+      metrics=MetricsProcessor.Config(log_freq=1),
       validator=Validator.Config(enable=False),
-      debug=DebugConfig(seed=seed),
-      tpu_config=TPUConfig(
-          enable_amp=False,
-          eager_mode=parallel.eager_mode
-          or ("DEFER_AND_FUSE" if parallel.compile_model else ""),
-      ),
+      comm=CommConfig(train_timeout_seconds=TRAIN_COMM_TIMEOUT_SECONDS),
   )
 
 
@@ -308,9 +346,7 @@ def build_sft_config(recipe: SFTRecipe) -> SFTTrainerConfig:
       shape=shape,
       precision=recipe.precision,
       parallel=recipe.parallel,
-      # SFTTPUTrainer takes the accumulation count from the dataloader
-      # (microbatches_per_step), independent of the data-parallel degree.
-      num_tokens_per_train_step=-1,
+      num_tokens_per_train_step=AUTO_STEP_TOKENS,
       checkpoint_interval=recipe.checkpoint_interval,
       seed=recipe.seed,
   )

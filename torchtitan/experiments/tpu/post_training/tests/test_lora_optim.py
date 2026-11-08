@@ -10,6 +10,7 @@ low-bit AdamW options, on TorchTitan's llama3 debug model."""
 from __future__ import annotations
 
 import copy
+import functools
 import json
 import tempfile
 import unittest
@@ -26,8 +27,11 @@ from torchtitan.experiments.tpu.post_training.optimizers import (
 from torchtitan.models.llama3 import model_registry
 
 
-def _spec():
-  return model_registry("debugmodel", seq_len=32, attn_backend="sdpa")
+# The llama3 debug model for the 32-token inputs below, with SDPA attention
+# (no attention masks needed); every call builds a new spec.
+_spec = functools.partial(
+    model_registry, "debugmodel", seq_len=32, attn_backend="sdpa"
+)
 
 
 def _build(spec, seed=0):
@@ -104,9 +108,8 @@ class LoRATest(unittest.TestCase):
     with torch.no_grad():
       lora_out = model(tokens)
       base_out = base(tokens)
-    self.assertGreater(
-        float((lora_out - base_out).abs().max()), 1e-4
-    )  # adapters act
+    largest_change = float((lora_out - base_out).abs().max())
+    self.assertGreater(largest_change, 1e-3)  # the adapters move the output
     merged = lora_mod.merge_lora_state_dict(
         model.state_dict(), self.options.scaling, self.layouts
     )
@@ -210,8 +213,10 @@ class LoRATest(unittest.TestCase):
         fused_layouts={},
     )
     self.assertEqual(len(named), 2 * len(lora_mod.lora_prefixes(state)))
-    with tempfile.TemporaryDirectory() as tmp:
-      out = lora_mod.save_peft_adapter(tmp, tensors, options=self.options)
+    with tempfile.TemporaryDirectory() as tmpdir:
+      out = lora_mod.save_peft_adapter(
+          Path(tmpdir) / "peft", tensors, options=self.options
+      )
       config = json.loads((out / "adapter_config.json").read_text())
       self.assertEqual((config["r"], config["lora_alpha"]), (4, 8.0))
       self.assertEqual(
@@ -222,6 +227,156 @@ class LoRATest(unittest.TestCase):
       self.assertEqual(
           set(load_file(str(out / "adapter_model.safetensors"))), set(tensors)
       )
+
+
+class LoRAHelperTest(unittest.TestCase):
+  """target_regex, merge errors and the PEFT folder, without a model."""
+
+  PATH = r"(?:^|.*\.)(?:attention|self_attn|attn)(?:\.[^.]+)*\."
+
+  def test_target_regex(self):
+    cases = {
+        ("q", "k", "v", "o"): (
+            "k_proj|o_proj|q_proj|qkv_proj|v_proj|wk|wkv|wo|wq|wqkv|wv"
+        ),
+        ("q",): "q_proj|wq",
+        ("o", "q"): "o_proj|q_proj|wo|wq",
+        ("v", "k", "q"): "k_proj|q_proj|qkv_proj|v_proj|wk|wkv|wq|wqkv|wv",
+        ("qkv",): "qkv_proj|wqkv",
+        (): "",
+    }
+    for projections, names in cases.items():
+      with self.subTest(projections=projections):
+        self.assertEqual(
+            lora_mod.target_regex(projections), self.PATH + f"(?:{names})"
+        )
+    self.assertEqual(
+        lora_mod.target_regex(), lora_mod.target_regex(("q", "k", "v", "o"))
+    )
+    with self.assertRaisesRegex(ValueError, "'z'"):
+      lora_mod.target_regex(("q", "z"))
+
+  def test_merge_values_and_errors(self):
+    weight = torch.arange(6.0).reshape(2, 3).to(torch.bfloat16)
+    a, b = torch.full((1, 3), 0.5), torch.tensor([[1.0], [-2.0]])
+    other = torch.ones(1)
+    state = {
+        "m.weight": weight,
+        "m.lora_a.weight": a,
+        "m.lora_b.weight": b,
+        "other": other,
+    }
+    merged = lora_mod.merge_lora_state_dict(state, 2.0)
+    self.assertEqual(set(merged), {"m.weight", "other"})
+    self.assertIs(merged["other"], other)
+    self.assertEqual(merged["m.weight"].dtype, torch.bfloat16)
+    want = (weight.float() + 2.0 * (b @ a)).to(torch.bfloat16)
+    self.assertTrue(torch.equal(merged["m.weight"], want))
+    on_meta = {key: value.to("meta") for key, value in state.items()}
+    self.assertEqual(
+        lora_mod.merge_lora_state_dict(on_meta, 2.0)["m.weight"].shape, (2, 3)
+    )
+    broken = {
+        "no lora_b": ({"m.weight": weight, "m.lora_a.weight": a}, KeyError),
+        "no base weight": (
+            {"m.lora_a.weight": a, "m.lora_b.weight": b},
+            KeyError,
+        ),
+        "shape": (
+            {
+                "m.weight": torch.zeros(3, 3),
+                "m.lora_a.weight": a,
+                "m.lora_b.weight": b,
+            },
+            ValueError,
+        ),
+    }
+    for label, (bad, error) in broken.items():
+      with self.subTest(label), self.assertRaises(error):
+        lora_mod.merge_lora_state_dict(bad, 1.0)
+
+  def test_merge_splits_a_fused_adapter(self):
+    layout = lora_mod.FusedLayout(n_heads=2, n_kv_heads=1, head_dim=1)
+    a = torch.tensor([[1.0, 2.0, 3.0]])
+    b = torch.tensor([[1.0], [2.0], [3.0], [4.0]])  # q, q, k, v rows
+    base = {
+        "blk.attn.wq.weight": torch.zeros(2, 3),
+        "blk.attn.wk.weight": torch.zeros(1, 3),
+        "blk.attn.wv.weight": torch.zeros(1, 3),
+    }
+    state = dict(
+        base,
+        **{"blk.attn.wqkv.lora_a.weight": a, "blk.attn.wqkv.lora_b.weight": b},
+    )
+    merged = lora_mod.merge_lora_state_dict(
+        state, 0.5, {"blk.attn.wqkv": layout}
+    )
+    delta = 0.5 * (b @ a)
+    self.assertEqual(set(merged), set(base))
+    self.assertTrue(torch.equal(merged["blk.attn.wq.weight"], delta[:2]))
+    self.assertTrue(torch.equal(merged["blk.attn.wk.weight"], delta[2:3]))
+    self.assertTrue(torch.equal(merged["blk.attn.wv.weight"], delta[3:]))
+
+  def test_peft_folder(self):
+    from safetensors.torch import load_file
+
+    shared = torch.arange(8.0).reshape(2, 4)
+    prefix = "base_model.model.model.layers.0.self_attn"
+    tensors = {
+        f"{prefix}.q_proj.lora_A.weight": shared,
+        f"{prefix}.q_proj.lora_B.weight": torch.ones(4, 2),
+        f"{prefix}.k_proj.lora_A.weight": shared,
+        f"{prefix}.k_proj.lora_B.weight": torch.ones(2, 4).t(),
+    }
+    options = lora_mod.LoRAOptions(rank=2, alpha=4.0)
+    with tempfile.TemporaryDirectory() as tmpdir:
+      nested = Path(tmpdir) / "runs" / "lora_adapter" / "step-3"
+      out = lora_mod.save_peft_adapter(
+          nested, tensors, options=options, base_model_name_or_path="/w"
+      )
+      self.assertEqual(out, nested)
+      self.assertIsInstance(out, Path)
+      raw = (out / "adapter_config.json").read_text()
+      config = json.loads(raw)
+      self.assertEqual(raw, json.dumps(config, indent=2))  # no newline at end
+      self.assertEqual(
+          list(config),
+          [
+              "peft_type",
+              "task_type",
+              "r",
+              "lora_alpha",
+              "lora_dropout",
+              "bias",
+              "target_modules",
+              "base_model_name_or_path",
+              "fan_in_fan_out",
+              "inference_mode",
+          ],
+      )
+      self.assertEqual(
+          config,
+          {
+              "peft_type": "LORA",
+              "task_type": "CAUSAL_LM",
+              "r": 2,
+              "lora_alpha": 4.0,
+              "lora_dropout": 0.0,
+              "bias": "none",
+              "target_modules": ["k_proj", "q_proj"],
+              "base_model_name_or_path": "/w",
+              "fan_in_fan_out": False,
+              "inference_mode": True,
+          },
+      )
+      saved = load_file(str(out / "adapter_model.safetensors"))
+      self.assertEqual(set(saved), set(tensors))
+      for key, value in tensors.items():
+        self.assertTrue(torch.equal(saved[key], value), key)
+      again = lora_mod.save_peft_adapter(str(nested), tensors, options=options)
+      self.assertEqual(again, nested)  # an existing folder is fine
+      config = json.loads((again / "adapter_config.json").read_text())
+      self.assertEqual(config["base_model_name_or_path"], "")
 
 
 class LowBitOptimizerTest(unittest.TestCase):
@@ -304,6 +459,37 @@ class LowBitOptimizerTest(unittest.TestCase):
       adamw_config(lr=1e-3, name="SGD")
     plain = adamw_config(lr=1e-3)
     self.assertNotIsInstance(plain, PostTrainingOptimizersContainer.Config)
+
+
+class LowBitFactoryTest(unittest.TestCase):
+  """The optimizer builders that ``lowbit_factory`` returns (torchao)."""
+
+  def test_torch_switches_are_dropped(self):
+    from torchtitan.experiments.tpu.post_training import optimizers
+
+    build = optimizers.lowbit_factory("AdamW8bit")
+    param = torch.nn.Parameter(torch.zeros(64, 80))
+    optimizer = build([param], lr=1e-3, fused=None, foreach=False)
+    self.assertEqual(type(optimizer).__name__, "AdamW8bitStep")
+    self.assertFalse(optimizer.bf16_stochastic_round)
+
+  def test_bf16_rounding_is_on_by_default(self):
+    from torchtitan.experiments.tpu.post_training import optimizers
+
+    build = optimizers.lowbit_factory("AdamWBf16")
+    param = torch.nn.Parameter(torch.zeros(16, dtype=torch.bfloat16))
+    self.assertTrue(build([param], lr=1e-3).bf16_stochastic_round)
+    plain = build([param], lr=1e-3, bf16_stochastic_round=False, foreach=True)
+    self.assertFalse(plain.bf16_stochastic_round)
+    self.assertEqual(type(plain).__name__, "_AdamWStep")
+
+  def test_unknown_name_or_backend(self):
+    from torchtitan.experiments.tpu.post_training import optimizers
+
+    with self.assertRaises(ValueError):
+      optimizers.lowbit_factory("AdamW8bit", backend="xla")
+    with self.assertRaises(NotImplementedError):
+      optimizers.lowbit_factory("Lion")
 
 
 if __name__ == "__main__":

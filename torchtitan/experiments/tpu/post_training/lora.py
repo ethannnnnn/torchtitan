@@ -68,21 +68,28 @@ PROJECTION_NAMES: dict[str, tuple[str, ...]] = {
 }
 
 
+# Module-path part of target_regex: a dotted path through an attention
+# module and any submodules, up to the projection name.
+_ATTENTION_PATH = r"(?:^|.*\.)(?:attention|self_attn|attn)(?:\.[^.]+)*\."
+
+
 def target_regex(projections: tuple[str, ...] = ("q", "k", "v", "o")) -> str:
-  """Full-path regex for the given logical attention projections."""
-  names: list[str] = []
-  for projection in projections:
-    if projection not in PROJECTION_NAMES:
-      raise ValueError(
-          f"unknown projection {projection!r}; use {sorted(PROJECTION_NAMES)}"
-      )
-    names.extend(PROJECTION_NAMES[projection])
-  if {"q", "k", "v"} <= set(projections):
-    names.extend(PROJECTION_NAMES["qkv"])
-  alternatives = "|".join(sorted(set(names)))
-  return (
-      rf"(?:^|.*\.)(?:attention|self_attn|attn)(?:\.[^.]+)*\.(?:{alternatives})"
-  )
+  """Full-path pattern for the attention projections in ``projections``
+  (keys of ``PROJECTION_NAMES``); the fused ``wqkv`` names join once q, k
+  and v are all requested."""
+  wanted = tuple(projections)
+  try:
+    groups = [PROJECTION_NAMES[key] for key in wanted]
+  except KeyError as unknown:
+    raise ValueError(
+        "unknown LoRA projection {!r}; known ones: {}".format(
+            unknown.args[0], sorted(PROJECTION_NAMES)
+        )
+    ) from None
+  if {"q", "k", "v"}.issubset(wanted):
+    groups.append(PROJECTION_NAMES["qkv"])
+  alternatives = "|".join(sorted(set().union(*groups)))
+  return f"{_ATTENTION_PATH}(?:{alternatives})"
 
 
 @dataclass(frozen=True)
@@ -193,43 +200,60 @@ def lora_prefixes(state: dict[str, Any]) -> list[str]:
   )
 
 
+def _adapter_updates(
+    state: dict[str, Any],
+    prefix: str,
+    fused_layouts: dict[str, FusedLayout],
+) -> list[tuple[str, torch.Tensor]]:
+  """``(base weight key, float32 B @ A)`` for the adapter at ``prefix``; a
+  fused ``wqkv`` adapter gives its q, k and v rows for ``wq`` / ``wk`` /
+  ``wv``."""
+  b_key = "{}.{}".format(prefix, LORA_B)
+  if b_key not in state:
+    raise KeyError("LoRA adapter {} has lora_a but no lora_b".format(prefix))
+  product = state[b_key].float() @ state["{}.{}".format(prefix, LORA_A)].float()
+  layout = fused_layouts.get(prefix)
+  if layout is None:
+    return [(prefix + ".weight", product)]
+  module = prefix[: -len("wqkv")]
+  return [
+      (module + name + ".weight", rows)
+      for name, rows in zip(("wq", "wk", "wv"), layout.split_rows(product))
+  ]
+
+
+def _merge_obstacle(
+    merged: dict[str, Any], key: str, update: torch.Tensor
+) -> Exception | None:
+  """Why ``update`` cannot be folded into ``merged[key]``; None if it can."""
+  if key not in merged:
+    return KeyError("no base weight {} for its LoRA adapter".format(key))
+  if tuple(merged[key].shape) != tuple(update.shape):
+    return ValueError(
+        "base weight {} has shape {}, its LoRA update {}".format(
+            key, tuple(merged[key].shape), tuple(update.shape)
+        )
+    )
+  return None
+
+
 def merge_lora_state_dict(
     state: dict[str, Any],
     scaling: float,
     fused_layouts: dict[str, FusedLayout] | None = None,
 ) -> dict[str, Any]:
-  """Base weights with ``W + scaling * B @ A`` folded in; adapter keys dropped.
-
-  A fused ``wqkv`` adapter (listed in ``fused_layouts``) is split into the
-  ``wq`` / ``wk`` / ``wv`` weights its module saves. Computed in float32 and
-  cast back to each base weight's dtype; works on meta tensors too.
-  """
-  fused_layouts = fused_layouts or {}
-  base, lora = split_lora_state_dict(state)
-  merged = dict(base)
+  """Base weights with every adapter folded in, ``W + scaling * B @ A``
+  computed in float32 and stored in ``W``'s dtype. Adapter keys are left out;
+  meta tensors work (shapes only)."""
+  layouts = fused_layouts or {}
+  merged = {key: value for key, value in state.items() if not is_lora_key(key)}
   for prefix in lora_prefixes(state):
-    a = lora[f"{prefix}.{LORA_A}"]
-    b = lora.get(f"{prefix}.{LORA_B}")
-    if b is None:
-      raise KeyError(f"adapter {prefix} lacks lora_b")
-    delta = torch.matmul(b.to(torch.float32), a.to(torch.float32))
-    if prefix in fused_layouts:
-      parent = prefix[: -len("wqkv")]
-      parts = zip(("wq", "wk", "wv"), fused_layouts[prefix].split_rows(delta))
-    else:
-      parts = [(None, delta)]
-    for name, part in parts:
-      weight_key = (
-          f"{prefix}.weight" if name is None else f"{parent}{name}.weight"
-      )
-      if weight_key not in base:
-        raise KeyError(f"adapter {prefix} has no base weight {weight_key}")
-      w = base[weight_key]
-      if tuple(part.shape) != tuple(w.shape):
-        raise ValueError(
-            f"adapter delta {tuple(part.shape)} does not match {weight_key} {tuple(w.shape)}"
-        )
-      merged[weight_key] = (w.to(torch.float32) + scaling * part).to(w.dtype)
+    for key, update in _adapter_updates(state, prefix, layouts):
+      obstacle = _merge_obstacle(merged, key, update)
+      if obstacle is not None:
+        raise obstacle
+      weight = merged[key]
+      merged[key] = (weight.float() + scaling * update).to(weight.dtype)
   return merged
 
 
@@ -259,14 +283,14 @@ def lora_state_dict_adapter(
       base, _ = split_lora_state_dict(state_dict)
       return super().to_hf(base)
 
-    def to_hf_for_export(self, state_dict: dict[str, Any]) -> dict[str, Any]:
+    def to_hf_for_export(self, model_state: dict[str, Any]) -> dict[str, Any]:
+      """Hugging Face weights with the adapters folded in."""
       merged = merge_lora_state_dict(
-          state_dict, self.lora_scaling, self.lora_fused_layouts
+          model_state, self.lora_scaling, self.lora_fused_layouts
       )
-      parent = super()
-      if hasattr(parent, "to_hf_for_export"):
-        return parent.to_hf_for_export(merged)
-      return parent.to_hf(merged)
+      if hasattr(inner_cls, "to_hf_for_export"):
+        return super().to_hf_for_export(merged)
+      return super().to_hf(merged)
 
     def to_hf_base(self, state_dict: dict[str, Any]) -> dict[str, Any]:
       return super().to_hf(state_dict)
@@ -379,12 +403,14 @@ def peft_adapter_state_dict(
     hf_module_map: Callable[[str], str] | None = None,
     fused_layouts: dict[str, FusedLayout] | None = None,
 ) -> dict[str, torch.Tensor]:
-  """Adapter tensors in the PEFT layout (``base_model.model.<module>.lora_A``).
+  """Adapter tensors under PEFT names,
+  ``base_model.model.<hf module>.lora_A.weight`` and ``.lora_B.weight``.
 
-  With an ``adapter``, module names and lora_b row layouts come from the
-  model's own state-dict adapter; a fused ``wqkv`` adapter becomes three
-  adapters (q, k, v) that share lora_A. ``hf_module_map`` renames without
-  re-laying rows (only for adapters that rename keys and nothing else).
+  With ``adapter``, every lora_B goes through the key mapping of the base
+  weight it adapts, which decides its Hugging Face module name and the order
+  of its rows. A fused ``wqkv`` adapter comes out as q, k and v adapters with
+  one shared lora_A. ``hf_module_map`` only renames modules and keeps the rows
+  as they are; it suits adapters whose mapping is a pure rename.
   """
   if adapter is not None and fused_layouts is None:
     fused_layouts = getattr(adapter, "lora_fused_layouts", None)
@@ -424,32 +450,37 @@ def save_peft_adapter(
     options: LoRAOptions,
     base_model_name_or_path: str = "",
 ) -> Path:
-  """``adapter_model.safetensors`` plus ``adapter_config.json``."""
+  """Write a PEFT LoRA adapter folder (``adapter_model.safetensors`` and
+  ``adapter_config.json``) and return it.
+
+  ``tensors`` carry PEFT names (``peft_adapter_state_dict``). Each one is
+  stored as its own contiguous CPU copy, since the q, k and v adapters of a
+  fused projection share one lora_A tensor.
+  """
+  import os
+
   from safetensors.torch import save_file
 
-  out = Path(out_dir)
-  out.mkdir(parents=True, exist_ok=True)
-  # clone(): fused q / k / v adapters share one lora_A tensor.
-  save_file(
-      {k: v.detach().cpu().clone().contiguous() for k, v in tensors.items()},
-      str(out / "adapter_model.safetensors"),
+  os.makedirs(out_dir, exist_ok=True)
+  folder = Path(out_dir)
+  owned = {
+      name: value.detach().cpu().clone().contiguous()
+      for name, value in tensors.items()
+  }
+  save_file(owned, str(folder / "adapter_model.safetensors"))
+  adapter_config = {
+      "peft_type": "LORA",
+      "task_type": "CAUSAL_LM",
+      "r": options.rank,
+      "lora_alpha": options.alpha,
+      "lora_dropout": 0.0,
+      "bias": "none",
+      "target_modules": sorted({name.split(".")[-3] for name in tensors}),
+      "base_model_name_or_path": base_model_name_or_path,
+      "fan_in_fan_out": False,
+      "inference_mode": True,
+  }
+  (folder / "adapter_config.json").write_text(
+      json.dumps(adapter_config, indent=2)
   )
-  modules = sorted({k.split(".")[-3] for k in tensors})
-  (out / "adapter_config.json").write_text(
-      json.dumps(
-          {
-              "peft_type": "LORA",
-              "task_type": "CAUSAL_LM",
-              "r": options.rank,
-              "lora_alpha": options.alpha,
-              "lora_dropout": 0.0,
-              "bias": "none",
-              "target_modules": modules,
-              "base_model_name_or_path": base_model_name_or_path,
-              "fan_in_fan_out": False,
-              "inference_mode": True,
-          },
-          indent=2,
-      )
-  )
-  return out
+  return folder

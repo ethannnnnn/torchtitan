@@ -18,8 +18,8 @@ Runs a LoRA SFT recipe of ``cpu_recipes`` through ``sft_train`` with
   token count;
 * every checkpoint step is saved.
 
-The TPU Qwen3.5 debug model needs ``SPARK_TEST_ASSETS`` (a Muse Spark
-tokenizer with its chat template); its reference forward uses the same
+Both cases render the records with the Muse Spark chat template found in
+``SPARK_TEST_ASSETS``. The debug case compares with a freshly built
 TorchTitan model loaded from the same Hugging Face weights. With the Muse
 Spark TPU package installed and the public tiny Muse Spark checkpoint in
 ``SPARK_TEST_ASSETS``, a second case compares with ``transformers``'
@@ -34,7 +34,7 @@ import pathlib
 import tempfile
 import unittest
 
-ASSETS = os.environ.get("SPARK_TEST_ASSETS", "")
+ASSETS = os.getenv("SPARK_TEST_ASSETS", "")
 
 
 def _has_tiny_checkpoint() -> bool:
@@ -143,14 +143,15 @@ class SFTValidationTest(unittest.TestCase):
     from torchtitan.experiments.tpu.post_training.tests import smoke_common
     from torchtitan.experiments.tpu.unflatten_shim import set_unflatten_seq_len
 
-    with tempfile.TemporaryDirectory() as tmp:
-      work = pathlib.Path(tmp)
+    with tempfile.TemporaryDirectory() as tmpdir:
+      work = pathlib.Path(tmpdir)
       val_lines = _write_data(work)
-      assets = work / "assets"
-      initial = smoke_common.make_debug_checkpoint(assets, pathlib.Path(ASSETS))
-      # LoRA with TorchTitan's full saves: no extra checkpoint support needed.
+      weights = work / "debug-hf"
+      initial = smoke_common.make_debug_checkpoint(
+          weights, pathlib.Path(ASSETS)
+      )
       dump = _train(
-          work, "sft_debug_lora_smoke", assets, pathlib.Path(ASSETS), []
+          work, "sft_debug_lora_smoke", weights, pathlib.Path(ASSETS), []
       )
       for step in (1, 2):
         self.assertTrue((dump / "checkpoint" / f"step-{step}").is_dir(), step)
@@ -188,8 +189,8 @@ class SFTValidationTest(unittest.TestCase):
     ):  # pragma: no cover - depends on the installed transformers
       self.skipTest("needs transformers with MuseSpark (5.20.0 or newer)")
 
-    with tempfile.TemporaryDirectory() as tmp:
-      work = pathlib.Path(tmp)
+    with tempfile.TemporaryDirectory() as tmpdir:
+      work = pathlib.Path(tmpdir)
       val_lines = _write_data(work)
       dump = _train(
           work,

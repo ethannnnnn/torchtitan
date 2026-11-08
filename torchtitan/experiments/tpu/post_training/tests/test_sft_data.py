@@ -26,7 +26,7 @@ from torchtitan.components.loss import IGNORE_INDEX
 from torchtitan.experiments.tpu.post_training import chat_template as ct
 from torchtitan.experiments.tpu.post_training import sft_data
 
-ASSETS = os.environ.get("SPARK_TEST_ASSETS", "")
+ASSETS = os.getenv("SPARK_TEST_ASSETS", "")
 
 CONVERSATIONS = [
     [
@@ -106,7 +106,10 @@ class PackingTest(unittest.TestCase):
         positions[1, 11:].tolist(), list(range(5, 10))
     )  # pad continues
     self.assertEqual(int(batch["padding_mask"].sum()), 5)
-    self.assertEqual(batch["num_valid_tokens"], 8)
+    self.assertEqual(
+        batch["num_valid_tokens"],
+        sum(doc.num_valid for row in placed for doc in row),
+    )
     labels = batch["labels"].view(2, 16)
     self.assertTrue((labels[1, 11:] == IGNORE_INDEX).all())
     # A document's last position never predicts the next document's first token.
@@ -177,11 +180,266 @@ class MicrobatchHookTest(unittest.TestCase):
 
     class FixedCount:
 
-      def num_microbatches_per_step(self) -> int:
+      def accumulation_steps(self) -> int:
         return 3
 
     self.assertIsInstance(FixedCount(), MicrobatchesPerStep)
     self.assertNotIsInstance(object(), MicrobatchesPerStep)
+
+
+class _WordTokenizer:
+  """Recording stand-in for a Hugging Face tokenizer: one token per word.
+
+  The template writes ``<role> content`` for each message and ``<assistant>``
+  as the generation prompt. With ``sections`` its source carries
+  ``{% generation %}`` blocks, and ``apply_chat_template(tokenize=True)``
+  returns a mask over each assistant turn, header included. With ``bare``,
+  ``__call__`` returns an id tuple instead of a dict.
+  """
+
+  eos_token_id = 2
+  all_special_tokens = ["<eos>"]
+
+  def __init__(self, *, sections=False, bare=False):
+    reply = "{{ m.role }} {{ m.content }}"
+    if sections:
+      reply = "{% generation %}" + reply + "{% endgeneration %}"
+    self.chat_template = (
+        "{% for m in messages %}{% if m.role == 'assistant' %}" + reply
+        + "{% else %}{{ m.role }} {{ m.content }}{% endif %}{% endfor %}"
+        "{{ current_date }}"
+    )
+    self.bare = bare
+    self.calls = []
+    self.vocab = {}
+
+  def _ids(self, words):
+    return [self.vocab.setdefault(word, 10 + len(self.vocab)) for word in words]
+
+  def _turns(self, conversation, add_generation_prompt):
+    turns = [
+        (m["role"] == "assistant", ["<%s>" % m["role"], *m["content"].split()])
+        for m in conversation
+    ]
+    if add_generation_prompt:
+      turns.append((False, ["<assistant>"]))
+    return turns
+
+  def apply_chat_template(self, conversation, **kwargs):
+    self.calls.append(("apply_chat_template", conversation, kwargs))
+    turns = self._turns(conversation, kwargs.get("add_generation_prompt"))
+    if not kwargs.get("tokenize"):
+      return "".join(" ".join(words) + " " for _, words in turns)
+    ids, mask = [], []
+    for trained, words in turns:
+      ids += self._ids(words)
+      mask += [trained] * len(words)
+    return {"input_ids": ids, "assistant_masks": mask}
+
+  def __call__(self, text, **kwargs):
+    self.calls.append(("__call__", text, kwargs))
+    ids = self._ids(text.split())
+    return tuple(ids) if self.bare else {"input_ids": ids}
+
+  def decode(self, ids, **kwargs):
+    self.calls.append(("decode", ids, kwargs))
+    words = {value: word for word, value in self.vocab.items()}
+    return " ".join(words[i] for i in ids)
+
+
+class ChatTemplateCallTest(unittest.TestCase):
+  """The exact Hugging Face calls of ``chat_template``, on ``_WordTokenizer``."""
+
+  CHAT = (
+      types.MappingProxyType({"role": "system", "content": "Be brief."}),
+      {"role": "user", "content": "Two plus two?"},
+      {"role": "assistant", "content": "Four.", "reasoning_content": "Sum."},
+      {"role": "user", "content": "And three?"},
+      {"role": "assistant", "content": "Five."},
+  )
+  OPTIONS = ct.ChatTemplateOptions()
+
+  @staticmethod
+  def _trained_words(tok, rendered):
+    words = {value: word for word, value in tok.vocab.items()}
+    pairs = zip(rendered.input_ids, rendered.assistant_mask)
+    return [words[token] for token, keep in pairs if keep]
+
+  @staticmethod
+  def _template_calls(tok):
+    return [call for call in tok.calls if call[0] == "apply_chat_template"]
+
+  def test_text_render(self):
+    tok = _WordTokenizer()
+    text = ct.render_text(
+        tok, self.CHAT[:2], self.OPTIONS, add_generation_prompt=True
+    )
+    self.assertEqual(text, "<system> Be brief. <user> Two plus two? <assistant> ")
+    ((name, conversation, kwargs),) = tok.calls
+    self.assertEqual(name, "apply_chat_template")
+    self.assertEqual(
+        kwargs,
+        {"add_generation_prompt": True, "tokenize": False, "current_date": None},
+    )
+    self.assertIs(type(conversation), list)
+    self.assertEqual([type(m) for m in conversation], [dict, dict])
+    self.assertEqual(conversation, [dict(m) for m in self.CHAT[:2]])
+    self.assertIsNot(conversation[1], self.CHAT[1])
+    thinking = self.OPTIONS.with_extra(enable_thinking=False)
+    self.assertEqual(dict(thinking.extra), {"enable_thinking": False})
+    ct.render_text(tok, self.CHAT, thinking, add_generation_prompt=False)
+    # The options' extra pairs arrive untouched next to the explicit keywords.
+    explicit = {"add_generation_prompt": False, "tokenize": False}
+    self.assertEqual(
+        tok.calls[-1][2],
+        {**explicit, "current_date": None, **dict(thinking.extra)},
+    )
+    clash = self.OPTIONS.with_extra(tokenize=True)
+    with self.assertRaises(TypeError):
+      ct.render_text(tok, self.CHAT, clash, add_generation_prompt=False)
+
+  def test_encoding(self):
+    for bare in (False, True):
+      with self.subTest(bare=bare):
+        tok = _WordTokenizer(bare=bare)
+        ids = ct.encode_rendered(tok, "<user> hi <assistant> ")
+        self.assertEqual(ids, [10, 11, 12])
+        self.assertEqual(set(map(type, ids)), {int})  # plain ints only
+        self.assertEqual(
+            tok.calls,
+            [("__call__", "<user> hi <assistant> ", {"add_special_tokens": False})],
+        )
+
+  def test_prompt_ids(self):
+    tok = _WordTokenizer()
+    ids = ct.render_prompt_ids(tok, list(self.CHAT[:2]), self.OPTIONS)
+    self.assertEqual(
+        [call[0] for call in tok.calls], ["apply_chat_template", "__call__"]
+    )
+    self.assertIs(tok.calls[0][2]["add_generation_prompt"], True)
+    self.assertEqual(len(ids), 8)  # <system> Be brief. <user> ... <assistant>
+    self.assertEqual(ids[-1], tok.vocab["<assistant>"])
+
+  def test_generation_sections(self):
+    tok = _WordTokenizer(sections=True)
+    chat = ct.render_chat(tok, self.CHAT, self.OPTIONS)  # "auto" finds sections
+    masked = [c for c in self._template_calls(tok) if c[2].get("tokenize")]
+    ((_, conversation, kwargs),) = masked
+    self.assertEqual(
+        kwargs,
+        {
+            "tokenize": True,
+            "return_dict": True,
+            "return_assistant_tokens_mask": True,
+            "current_date": None,
+        },
+    )
+    self.assertEqual(conversation, [dict(m) for m in self.CHAT])
+    self.assertEqual(self._trained_words(tok, chat), ["Four.", "Five."])
+    headed = ct.render_chat(
+        tok, self.CHAT, self.OPTIONS, train_on_generation_prompt=True
+    )
+    self.assertEqual(headed.input_ids, chat.input_ids)
+    self.assertEqual(
+        self._trained_words(tok, headed),
+        ["<assistant>", "Four.", "<assistant>", "Five."],
+    )
+    for train in (False, True):
+      with self.subTest(train_on_generation_prompt=train):
+        renders = [
+            ct.render_chat(
+                tok,
+                self.CHAT,
+                self.OPTIONS,
+                mask_mode=mode,
+                train_on_generation_prompt=train,
+            )
+            for mode in ("prefix", "generation")
+        ]
+        self.assertEqual(renders[0].input_ids, renders[1].input_ids)
+        self.assertEqual(renders[0].assistant_mask, renders[1].assistant_mask)
+
+  def test_auto_without_sections_renders_prefixes(self):
+    tok = _WordTokenizer()
+    chat = ct.render_chat(tok, list(self.CHAT), self.OPTIONS)
+    self.assertEqual(self._trained_words(tok, chat), ["Four.", "Five."])
+    # The whole conversation first, then per reply the prefix that ends with
+    # the generation prompt and the one that ends with the reply.
+    self.assertEqual(
+        [
+            (len(conversation), kwargs["add_generation_prompt"])
+            for _, conversation, kwargs in self._template_calls(tok)
+        ],
+        [(5, False), (2, True), (3, False), (4, True), (5, False)],
+    )
+
+  def test_errors(self):
+    tok = _WordTokenizer()
+    with self.assertRaises(ValueError):
+      ct.render_chat(tok, self.CHAT, self.OPTIONS, mask_mode="assistant")
+    self.assertEqual(tok.calls, [])  # refused before any tokenizer call
+    effort = ct.ChatTemplateOptions(reasoning_effort="low")
+    with self.assertRaises(ValueError):  # this template has no such switch
+      ct.render_text(tok, self.CHAT, effort, add_generation_prompt=True)
+
+    class Drifting(_WordTokenizer):
+      """Renders that end with the generation prompt spell it differently."""
+
+      def apply_chat_template(self, conversation, **kwargs):
+        text = super().apply_chat_template(conversation, **kwargs)
+        if kwargs.get("add_generation_prompt"):
+          return text.replace("<assistant>", "<reply>")
+        return text
+
+    with self.assertRaises(ValueError):
+      ct.render_chat(Drifting(), self.CHAT, self.OPTIONS, mask_mode="prefix")
+
+    class ShortMask(_WordTokenizer):
+      """The assistant mask comes back one entry short."""
+
+      def apply_chat_template(self, conversation, **kwargs):
+        out = super().apply_chat_template(conversation, **kwargs)
+        if kwargs.get("tokenize"):
+          out["assistant_masks"] = out["assistant_masks"][:-1]
+        return out
+
+    with self.assertRaises(ValueError):
+      ct.render_chat(ShortMask(sections=True), self.CHAT, self.OPTIONS)
+
+  def test_with_extra(self):
+    base = ct.ChatTemplateOptions(
+        reasoning_effort="low", extra=(("b", 1), ("a", 2))
+    )
+    merged = base.with_extra(c=3, a=4)
+    self.assertEqual(merged.extra, (("a", 4), ("b", 1), ("c", 3)))
+    self.assertEqual(merged.reasoning_effort, "low")
+    self.assertEqual(base.extra, (("b", 1), ("a", 2)))  # unchanged
+    self.assertEqual(base.with_extra().extra, (("a", 2), ("b", 1)))
+
+  def test_stop_token_ids(self):
+    tok = _WordTokenizer()
+    with tempfile.TemporaryDirectory() as tmpdir:
+      config = Path(tmpdir, "generation_config.json")
+      for value, want in ((7, [7]), ([5, "6"], [5, 6]), ([], [2]), ("x", [2])):
+        with self.subTest(eos_token_id=value):
+          config.write_text(json.dumps({"eos_token_id": value}))
+          self.assertEqual(ct.stop_token_ids(tmpdir, tok), want)
+      config.write_text("{}")
+      self.assertEqual(ct.stop_token_ids(Path(tmpdir), tok), [2])
+      missing = os.path.join(tmpdir, "absent")
+      self.assertEqual(ct.stop_token_ids(missing, tok), [2])
+    self.assertEqual(ct.stop_token_ids(None, tok), [2])
+    tok.eos_token_id = None
+    with self.assertRaises(ValueError):
+      ct.stop_token_ids(None, tok)
+
+  def test_decode_final_answer(self):
+    tok = _WordTokenizer()
+    ids = tok._ids(["plain", "answer", "<eos>"])
+    parsed = ct.decode_final_answer(tok, tuple(ids))
+    self.assertEqual(tok.calls, [("decode", ids, {"skip_special_tokens": False})])
+    self.assertIs(type(tok.calls[0][1]), list)
+    self.assertEqual((parsed.final_text, parsed.structured), ("plain answer", False))
 
 
 @unittest.skipUnless(ASSETS, "SPARK_TEST_ASSETS is not set")
@@ -307,17 +565,15 @@ class ChatSFTDataLoaderTest(unittest.TestCase):
     )
 
   def setUp(self):
-    self.tmp = tempfile.TemporaryDirectory()
-    rows = [{"messages": CONVERSATIONS[i % 3]} for i in range(12)]
-    rows[5]["messages"] = [
-        {"role": "user", "content": "x " * 700},
-        {"role": "assistant", "content": "too long"},
+    holder = tempfile.TemporaryDirectory()
+    self.addCleanup(holder.cleanup)
+    self.path = os.path.join(holder.name, "conversations.jsonl")
+    overlong = [
+        {"role": "user", "content": "word " * 700},
+        {"role": "assistant", "content": "Too long for one row."},
     ]
-    self.path = str(Path(self.tmp.name) / "sft.jsonl")
-    _write_jsonl(rows, self.path)
-
-  def tearDown(self):
-    self.tmp.cleanup()
+    records = [{"messages": chat} for chat in CONVERSATIONS * 4 + [overlong]]
+    _write_jsonl(records, self.path)
 
   def test_batches(self):
     loader = self._loader(self.path)
@@ -327,8 +583,8 @@ class ChatSFTDataLoaderTest(unittest.TestCase):
         batch["num_valid_tokens"], int((batch["labels"] != IGNORE_INDEX).sum())
     )
     self.assertGreater(batch["num_valid_tokens"], 0)
-    starts = (batch["positions"].view(2, 512) == 0).sum(dim=1)
-    self.assertTrue((starts <= 3).all())
+    per_row = (batch["positions"].reshape(2, -1) == 0).sum(dim=1).tolist()
+    self.assertTrue(all(1 <= starts <= 3 for starts in per_row), per_row)
     self.assertEqual(loader.max_num_documents, 6)
     for _ in range(8):
       next(iter(loader))
@@ -347,25 +603,28 @@ class ChatSFTDataLoaderTest(unittest.TestCase):
     self.assertEqual([e["microbatch"] for e in loader.batch_log], [1, 2, 3])
     for entry, batch in zip(loader.batch_log, batches):
       self.assertEqual(entry["sha256"], sft_data.batch_fingerprint(batch))
-      # One document per position reset outside the padding.
-      starts = int(((batch["positions"] == 0) & ~batch["padding_mask"]).sum())
-      self.assertEqual(len(entry["docs"]), starts)
+      resets = batch["positions"] == 0
+      real_tokens = ~batch["padding_mask"]
+      self.assertEqual(len(entry["docs"]), int((resets & real_tokens).sum()))
 
   def test_resume_reproduces_batches(self):
-    loader = self._loader(self.path)
-    it = iter(loader)
+    def batch_key(batch):
+      return (
+          sft_data.batch_fingerprint(batch),
+          batch["padding_mask"].tolist(),
+          batch["num_valid_tokens"],
+      )
+
+    uninterrupted = self._loader(self.path)
+    stream = iter(uninterrupted)
     for _ in range(3):
-      next(it)
-    state = loader.state_dict()
-    expected = [next(it) for _ in range(4)]
+      next(stream)
+    saved = uninterrupted.state_dict()
+    expected = [batch_key(next(stream)) for _ in range(4)]
     resumed = self._loader(self.path)
-    resumed.load_state_dict(state)
-    rit = iter(resumed)
-    for want in expected:
-      got = next(rit)
-      for key in ("input", "labels", "positions", "padding_mask"):
-        self.assertTrue(torch.equal(want[key], got[key]), key)
-      self.assertEqual(want["num_valid_tokens"], got["num_valid_tokens"])
+    resumed.load_state_dict(saved)
+    again = iter(resumed)
+    self.assertEqual([batch_key(next(again)) for _ in range(4)], expected)
 
   def test_state_dict_schema(self):
     loader = self._loader(self.path, rank=1, world=2)
@@ -395,14 +654,35 @@ class ChatSFTDataLoaderTest(unittest.TestCase):
     with self.assertRaises(ValueError):
       loader.load_state_dict(dict(state, dp_world_size=2))
 
-  def test_microbatch_hook(self):
+  def test_accumulation_steps_hook(self):
     from torchtitan.experiments.tpu.post_training.sft_train import (
         MicrobatchesPerStep,
     )
 
     loader = self._loader(self.path, microbatches_per_step=3)
     self.assertIsInstance(loader, MicrobatchesPerStep)
-    self.assertEqual(loader.num_microbatches_per_step(), 3)
+    before = loader.state_dict()
+    self.assertEqual([loader.accumulation_steps() for _ in range(3)], [3] * 3)
+    self.assertEqual(loader.state_dict(), before)  # asking changes nothing
+
+  def test_rejected_state_keeps_position(self):
+    loader, twin = self._loader(self.path), self._loader(self.path)
+    next(iter(loader))
+    next(iter(twin))
+    state = loader.state_dict()
+    rejected = {
+        "version": dict(state, version=3),
+        "data-parallel size": dict(state, dp_world_size=4),
+        "rank entry": {k: v for k, v in state.items() if k != "dp_rank_0"},
+    }
+    for label, bad in rejected.items():
+      with self.subTest(label), self.assertRaises(ValueError):
+        loader.load_state_dict(bad)
+      self.assertEqual(loader.state_dict(), state)
+    self.assertEqual(
+        sft_data.batch_fingerprint(next(iter(loader))),
+        sft_data.batch_fingerprint(next(iter(twin))),
+    )
 
 
 if __name__ == "__main__":
