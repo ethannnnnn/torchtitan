@@ -211,6 +211,15 @@ def _inter_chunk_recurrence(
   ``unbind`` is one ``stack`` of the same per-chunk gradients, without the
   additions of zeros.
 
+  Only the two matmuls that read or update the state run in the loop. The
+  intra-chunk term ``qk[:, :, i] @ v_new`` does not feed the state, so it runs
+  after the loop for all chunks at once, as one batched matmul of ``qk`` with
+  the stacked ``v_new``. ``qk`` is then never unbound, and its gradient is that
+  matmul's gradient instead of a ``stack`` of ``num_chunks`` per-chunk
+  gradients (which XLA on TPU lays out with the chunk axis minor-most, at a
+  few GB/s). Each chunk's product and sum are the ones the loop computed, so
+  the output and the gradients are unchanged.
+
   Args:
     wq: ``(bs, n_heads, num_chunks, 2 * chunk, key_head_dim)``: the UT
       transform's ``W`` in rows ``[:chunk]`` and the state-decayed queries in
@@ -230,15 +239,18 @@ def _inter_chunk_recurrence(
   state = torch.zeros(
       bs, n_heads, wq.shape[-1], d_v, dtype=wq.dtype, device=wq.device
   )
-  wq_c, u_c, qk_c = wq.unbind(2), u.unbind(2), qk.unbind(2)
+  wq_c, u_c = wq.unbind(2), u.unbind(2)
   k_decayed_t_c, chunk_decay_c = k_decayed_t.unbind(2), chunk_decay.unbind(2)
-  outs = []
+  inter, v_new_c = [], []
   for i in range(num_chunks):
     wq_state = wq_c[i] @ state
     v_new = u_c[i] - wq_state[..., :chunk, :]
-    outs.append(wq_state[..., chunk:, :] + qk_c[i] @ v_new)
+    inter.append(wq_state[..., chunk:, :])
+    v_new_c.append(v_new)
     state = state * chunk_decay_c[i] + k_decayed_t_c[i] @ v_new
-  return torch.stack(outs, dim=2)
+  # The intra-chunk term of every chunk in one batched matmul: `qk` is used
+  # whole, so its gradient is one batched matmul too.
+  return torch.stack(inter, dim=2) + qk @ torch.stack(v_new_c, dim=2)
 
 
 def chunked_gated_delta(

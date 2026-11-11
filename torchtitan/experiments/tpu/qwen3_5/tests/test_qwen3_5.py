@@ -7,8 +7,10 @@ Covers:
    controls), for dense, MoE, and MoE with ``TpuGroupedExpertsConverter``;
    plus the adapter round trip.
 2. ``chunked_gated_delta`` against the exact per-token recurrence, also with
-   packed documents, and bitwise against its inter-chunk loop indexing every
-   chunk, whose backward writes a full-size buffer per chunk; and the
+   packed documents, and bitwise against its earlier inter-chunk loops (one
+   indexing every chunk, whose backward writes a full-size buffer per chunk,
+   and one taking ``qk`` per chunk, whose backward stacks the per-chunk ``qk``
+   gradients); and the
    slice-based causal convolution's backward against autograd of ``conv1d``,
    also with packed documents, and in bf16 against the accuracy of the
    autograd it replaces.
@@ -115,6 +117,34 @@ def _indexed_inter_chunk_recurrence(
     v_new = u[:, :, i] - wq_state[..., :chunk, :]
     outs.append(wq_state[..., chunk:, :] + qk[:, :, i] @ v_new)
     state = state * chunk_decay[:, :, i] + k_decayed_t[:, :, i] @ v_new
+  return torch.stack(outs, dim=2)
+
+
+def _unbind_inter_chunk_recurrence(
+    wq: torch.Tensor,
+    u: torch.Tensor,
+    qk: torch.Tensor,
+    k_decayed_t: torch.Tensor,
+    chunk_decay: torch.Tensor,
+) -> torch.Tensor:
+  """``gated_delta._inter_chunk_recurrence`` with ``qk @ v_new`` in the loop.
+
+  The loop as it was before the intra-chunk term moved after it: every chunk
+  takes ``qk`` from one ``unbind``, so ``qk``'s gradient is a ``stack`` of
+  ``num_chunks`` per-chunk gradients.
+  """
+  bs, n_heads, num_chunks, chunk, d_v = u.shape
+  state = torch.zeros(
+      bs, n_heads, wq.shape[-1], d_v, dtype=wq.dtype, device=wq.device
+  )
+  wq_c, u_c, qk_c = wq.unbind(2), u.unbind(2), qk.unbind(2)
+  k_decayed_t_c, chunk_decay_c = k_decayed_t.unbind(2), chunk_decay.unbind(2)
+  outs = []
+  for i in range(num_chunks):
+    wq_state = wq_c[i] @ state
+    v_new = u_c[i] - wq_state[..., :chunk, :]
+    outs.append(wq_state[..., chunk:, :] + qk_c[i] @ v_new)
+    state = state * chunk_decay_c[i] + k_decayed_t_c[i] @ v_new
   return torch.stack(outs, dim=2)
 
 
@@ -674,19 +704,53 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
         )
 
   @parameterized.named_parameters(
-      dict(testcase_name="_fp32", dtype=torch.float32, packed=False),
-      dict(testcase_name="_fp32_packed", dtype=torch.float32, packed=True),
-      dict(testcase_name="_bf16_packed", dtype=torch.bfloat16, packed=True),
+      dict(
+          testcase_name="_fp32",
+          dtype=torch.float32,
+          packed=False,
+          reference=_indexed_inter_chunk_recurrence,
+      ),
+      dict(
+          testcase_name="_fp32_packed",
+          dtype=torch.float32,
+          packed=True,
+          reference=_indexed_inter_chunk_recurrence,
+      ),
+      dict(
+          testcase_name="_bf16_packed",
+          dtype=torch.bfloat16,
+          packed=True,
+          reference=_indexed_inter_chunk_recurrence,
+      ),
+      dict(
+          testcase_name="_fp32_unbind_loop",
+          dtype=torch.float32,
+          packed=False,
+          reference=_unbind_inter_chunk_recurrence,
+      ),
+      dict(
+          testcase_name="_fp32_packed_unbind_loop",
+          dtype=torch.float32,
+          packed=True,
+          reference=_unbind_inter_chunk_recurrence,
+      ),
+      dict(
+          testcase_name="_bf16_packed_unbind_loop",
+          dtype=torch.bfloat16,
+          packed=True,
+          reference=_unbind_inter_chunk_recurrence,
+      ),
   )
   def test_chunked_gated_delta_matches_indexed_loop_bitwise(
-      self, dtype: torch.dtype, packed: bool
+      self, dtype: torch.dtype, packed: bool, reference
   ):
-    """Tests that taking the chunks from ``unbind`` changes no bit.
+    """Tests that the inter-chunk loop's rewrites change no bit.
 
     The forward and all five input gradients of ``chunked_gated_delta`` must
-    have the same bit patterns as with the inter-chunk loop indexing every
-    chunk (``_indexed_inter_chunk_recurrence``). Runs on CPU with one thread,
-    where the kernels themselves are deterministic.
+    have the same bit patterns as with the earlier forms of the inter-chunk
+    loop: indexing every chunk (``_indexed_inter_chunk_recurrence``) and taking
+    ``qk`` per chunk inside the loop (``_unbind_inter_chunk_recurrence``). Runs
+    on CPU with one thread, where the kernels themselves are deterministic.
     """
     num_threads = torch.get_num_threads()
     torch.set_num_threads(1)
@@ -714,7 +778,7 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
     with mock.patch.object(
         gated_delta,
         "_inter_chunk_recurrence",
-        wraps=_indexed_inter_chunk_recurrence,
+        wraps=reference,
     ) as indexed:
       indexed_results = forward_and_grads()
     indexed.assert_called_once()
@@ -730,7 +794,7 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
               actual.contiguous().view(torch.uint8),
               expected.contiguous().view(torch.uint8),
           ),
-          msg=f"{name} differs from the indexed loop's",
+          msg=f"{name} differs from {reference.__name__}'s",
       )
 
   def test_chunked_gated_delta_backward_avoids_select_backward(self):
@@ -796,6 +860,53 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
         self.assertGreaterEqual(num_selects, 3 * (seq_len // chunk_size))
         self.assertGreaterEqual(num_selects_2x, 2 * num_selects)
         self.assertGreaterEqual(num_bytes_2x, 4 * num_bytes)
+
+  def test_chunked_gated_delta_backward_has_no_qk_gradient_stack(self):
+    """Tests that the backward stacks no per-chunk ``(chunk, chunk)`` gradients.
+
+    ``qk @ stack(v_new)`` after the loop makes ``qk``'s gradient one batched
+    matmul. With ``qk`` taken per chunk inside the loop, its gradient is a
+    ``stack`` of ``num_chunks`` per-chunk gradients, which XLA on TPU lays out
+    with the chunk axis minor-most.
+    """
+    n_heads, d_k, d_v, chunk_size, seq_len = 2, 8, 4, 16, 64
+    num_chunks = seq_len // chunk_size
+
+    def qk_gradient_stacks(recurrence):
+      """Stacks / concatenations of ``num_chunks`` ``(chunk, chunk)`` blocks."""
+      leaves = tuple(
+          x.requires_grad_()
+          for x in _gated_delta_inputs(1, seq_len, n_heads, d_k, d_v)
+      )
+      grad = torch.randn(1, seq_len, n_heads, d_v)
+
+      def grads(q, k, v, g, beta, grad_in):
+        out = gated_delta.chunked_gated_delta(
+            q, k, v, g, beta, chunk_size=chunk_size
+        )
+        return torch.autograd.grad(out, (q, k, v, g, beta), grad_in)
+
+      with mock.patch.object(
+          gated_delta, "_inter_chunk_recurrence", recurrence
+      ):
+        graph = make_fx(grads)(*leaves, grad).graph
+      want = (num_chunks, chunk_size, chunk_size)
+      return sum(
+          1
+          for node in graph.nodes
+          if node.op == "call_function"
+          and node.target
+          in (torch.ops.aten.stack.default, torch.ops.aten.cat.default)
+          and len(node.args[0]) == num_chunks
+          and tuple(node.meta["val"].shape[-3:]) == want
+      )
+
+    batched = gated_delta._inter_chunk_recurrence  # pylint: disable=protected-access
+    self.assertEqual(qk_gradient_stacks(batched), 0)
+    # Negative control: the loop that takes `qk` per chunk stacks its gradient.
+    self.assertGreaterEqual(
+        qk_gradient_stacks(_unbind_inter_chunk_recurrence), 1
+    )
 
   @parameterized.named_parameters(
       # Documents start mid-chunk and at chunk starts (16 and 48 with 16-token
