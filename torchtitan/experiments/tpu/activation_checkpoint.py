@@ -21,6 +21,10 @@ _SAVED_COLLECTIVES = frozenset({
     torch.ops._c10d_functional.reduce_scatter_tensor.default,
 })
 
+# Also saved: the GatedDeltaNet chunk loop's stacked states and values (its
+# backward reads them instead of re-running the loop).
+_SAVED_STACKS = frozenset({torch.ops.aten.stack.default})
+
 
 def _op_name(op) -> str:
   """Qualified name of an OpOverload, however this torch build spells it."""
@@ -50,6 +54,9 @@ class TPUSelectiveAC(SelectiveAC):
 
   Recomputing each collective together with its wait avoids both, at the cost
   of running those collectives again in backward (and saving fewer tensors).
+  It also saves the outputs of ``aten.stack``: the GatedDeltaNet chunk loop
+  (``qwen3_5/gated_delta.py``) stacks the states it enters each chunk with,
+  and its custom backward reads them instead of re-running the loop.
   The gemma4 recipes use this policy; TPU context parallelism switches plain
   ``SelectiveAC`` to it (``tpu_selective_ac_config``).
 
@@ -57,7 +64,7 @@ class TPUSelectiveAC(SelectiveAC):
   tensor.
 
   Three flags tune the save set further; all off (the default) is the policy
-  above, unchanged, and every combination composes:
+  above, and every combination composes:
 
   - ``recompute_bmm``: recompute ``aten.bmm`` outputs instead of saving them.
     A Python loop of small batched matmuls (the XLA GatedDeltaNet chunk
@@ -98,7 +105,7 @@ class TPUSelectiveAC(SelectiveAC):
         if getattr(config, "save_triangular_solve", False)
         else None
     )
-    save_ops = super().get_save_ops() - _SAVED_COLLECTIVES
+    save_ops = (super().get_save_ops() - _SAVED_COLLECTIVES) | _SAVED_STACKS
     if getattr(config, "recompute_bmm", False):
       save_ops.discard(torch.ops.aten.bmm.default)
     if gdn_solve is not None:

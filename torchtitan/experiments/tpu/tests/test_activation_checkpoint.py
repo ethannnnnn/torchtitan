@@ -140,12 +140,17 @@ class TPUSelectiveACFlagsTest(parameterized.TestCase):
     for flag in _FLAGS:
       self.assertIs(getattr(config, flag), False, msg=flag)
 
-  def test_flags_off_is_the_unchanged_policy(self):
-    """All flags off: core ``SelectiveAC``'s save set minus the collectives."""
+  def test_flags_off_is_core_minus_collectives_plus_stacks(self):
+    """All flags off: core's save set minus the collectives, plus stacks.
+
+    ``aten.stack`` is saved for the GatedDeltaNet chunk loop, whose custom
+    backward reads the stacked states instead of re-running the loop.
+    """
     off = _save_ops()
     core = SelectiveAC(SelectiveAC.Config()).get_save_ops()
     self.assertIs(type(off), set)
-    self.assertEqual(off, core - _COLLECTIVES)
+    stacks = {torch.ops.aten.stack.default}
+    self.assertEqual(off, (core - _COLLECTIVES) | stacks)
     self.assertIn(torch.ops.aten.bmm.default, off)
     self.assertNotIn(_SPLASH_FWD, off)
 
