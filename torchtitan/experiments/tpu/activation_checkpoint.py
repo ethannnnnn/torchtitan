@@ -1,6 +1,7 @@
 """Activation-checkpoint policies for the TPU lane."""
 
 from dataclasses import dataclass, fields
+import importlib
 from typing import Any
 
 import torch
@@ -8,6 +9,11 @@ from torchtitan.distributed.activation_checkpoint import SelectiveAC
 
 
 _PALLAS_ATTENTION_FWD_MARKER = "splash_attn_fwd"
+
+# The GatedDeltaNet UT transform's solve (``qwen3_5/gated_delta.py`` registers
+# it on import).
+_GDN_SOLVE_OP = "torchtitan_tpu::gdn_unit_solve_triangular"
+_GDN_SOLVE_MODULE = "torchtitan.experiments.tpu.qwen3_5.gated_delta"
 
 # The collectives in core SelectiveAC's default save set.
 _SAVED_COLLECTIVES = frozenset({
@@ -50,8 +56,8 @@ class TPUSelectiveAC(SelectiveAC):
   TODO: Save the collectives again once torch-tpu accepts a wait on a saved
   tensor.
 
-  Two flags tune the save set further; both off (the default) is the policy
-  above, unchanged, and they compose:
+  Three flags tune the save set further; all off (the default) is the policy
+  above, unchanged, and every combination composes:
 
   - ``recompute_bmm``: recompute ``aten.bmm`` outputs instead of saving them.
     A Python loop of small batched matmuls (the XLA GatedDeltaNet chunk
@@ -60,6 +66,13 @@ class TPUSelectiveAC(SelectiveAC):
   - ``save_pallas_attention``: also save the Pallas splash-attention forward
     (output + logsumexp, matched by name as in ``AttentionSavingSelectiveAC``),
     so backward does not re-run the forward kernel.
+  - ``save_triangular_solve``: also save the GatedDeltaNet UT transform's
+    triangular solve (``torchtitan_tpu::gdn_unit_solve_triangular``) instead of
+    re-running it. Never ``aten.linalg_solve_triangular``: a saved tensor goes
+    from the compiled forward to the compiled backward with the real kernel's
+    strides, the backward is compiled for its fake strides, and aten's meta
+    kernel (column-major) and torch-tpu's kernel (row-major) disagree; the
+    custom op's fake and real strides agree.
 
   Saving or recomputing an op runs the same op on the same inputs, so the
   values do not change.
@@ -73,14 +86,34 @@ class TPUSelectiveAC(SelectiveAC):
     save_pallas_attention: bool = False
     """Also save the Pallas splash-attention forward (output + logsumexp)."""
 
+    save_triangular_solve: bool = False
+    """Also save the GatedDeltaNet UT-transform solve (a custom op)."""
+
   def get_save_ops(self) -> set:
     config = self.config
+    # Resolve the solve op first: registering it imports gated_delta.py, which
+    # registers ops of its own that the default save set may list.
+    gdn_solve = (
+        _gdn_solve_op()
+        if getattr(config, "save_triangular_solve", False)
+        else None
+    )
     save_ops = super().get_save_ops() - _SAVED_COLLECTIVES
     if getattr(config, "recompute_bmm", False):
       save_ops.discard(torch.ops.aten.bmm.default)
+    if gdn_solve is not None:
+      save_ops.add(gdn_solve)
     if getattr(config, "save_pallas_attention", False):
       save_ops = _SaveOpsIncludingPallasAttention(save_ops)
     return save_ops
+
+
+def _gdn_solve_op():
+  """The GatedDeltaNet UT-transform solve op, registering it if needed."""
+  namespace, name = _GDN_SOLVE_OP.split("::")
+  if not hasattr(getattr(torch.ops, namespace), name):
+    importlib.import_module(_GDN_SOLVE_MODULE)
+  return getattr(getattr(torch.ops, namespace), name).default
 
 
 def tpu_selective_ac_config(ac_config: Any) -> Any:
