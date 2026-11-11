@@ -687,7 +687,11 @@ class WorkaroundsTest(parameterized.TestCase):
     act.wait.assert_called_once_with()
 
   def test_tpu_selective_ac_recomputes_saved_collectives(self):
-    """TPUSelectiveAC is core SelectiveAC minus the collectives core saves."""
+    """TPUSelectiveAC is core SelectiveAC minus the collectives core saves.
+
+    It also saves ``aten.stack`` for the GatedDeltaNet chunk loop, whose
+    custom backward reads the stacked states instead of re-running the loop.
+    """
     from torchtitan.distributed.activation_checkpoint import FullAC, SelectiveAC
     from torchtitan.experiments.tpu.activation_checkpoint import (
         TPUSelectiveAC,
@@ -701,8 +705,10 @@ class WorkaroundsTest(parameterized.TestCase):
     }
     core_ops = SelectiveAC.Config().build().get_save_ops()
     self.assertLessEqual(collectives, core_ops)
+    stacks = {torch.ops.aten.stack.default}
     self.assertEqual(
-        TPUSelectiveAC.Config().build().get_save_ops(), core_ops - collectives
+        TPUSelectiveAC.Config().build().get_save_ops(),
+        (core_ops - collectives) | stacks,
     )
 
     # CP parallelize functions switch plain SelectiveAC (keeping its fields)
